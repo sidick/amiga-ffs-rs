@@ -309,15 +309,15 @@ it under a real Kickstart 3.1.
 
 ## Milestone 3 — mutate
 
-**Landed, but for one leg of the differential suite.** Wave 1 — the
-allocator and the validator's repair half, the two pieces everything else
-in this milestone stands on; wave 2 — create, delete, rename and
-set-metadata in volumes this crate did not write, through `Mutator`; wave
-3 — file write, append and truncate, the ranged read that shares their
-chain machinery, and the crash sweep over all of it. The one box still
-open is the differential mutation suite's *guest* half, which needs a
-Copperline fixture pipeline rather than more filesystem code, and is the
-same remaining leg as milestone 1's.
+**Landed.** Wave 1 — the allocator and the validator's repair half, the
+two pieces everything else in this milestone stands on; wave 2 — create,
+delete, rename and set-metadata in volumes this crate did not write,
+through `Mutator`; wave 3 — file write, append and truncate, the ranged
+read that shares their chain machinery, and the crash sweep over all of
+it. The differential mutation suite closed last, guest leg included: the
+ROM's own FFS and this crate's `Mutator` applying the same operations to
+copies of the same volume, and agreeing about everything either can
+observe.
 
 - [x] **Allocator**: bitmap-based block allocation with the volume's
       own policy quirks documented as discovered. `src/allocator.rs`,
@@ -658,7 +658,7 @@ same remaining leg as milestone 1's.
       about — *every file still reachable still reads every one of its
       bytes*, which is the header-block-as-single-commit rule saying that
       a file's length and its extent are never caught disagreeing.
-- [ ] **Differential mutation tests**: same operation sequence applied
+- [x] **Differential mutation tests**: same operation sequence applied
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
       don't-care fields — dates, allocation order).
@@ -680,9 +680,25 @@ same remaining leg as milestone 1's.
       two predicted ones and no others: allocation order (this crate
       scans forward from a hint, xdftool from the bottom of the bitmap)
       and dates (the caller's to supply here, the wall clock's there).
-      What remains is the same exercise against a guest's own FFS
-      handler under Copperline, which is the milestone-1 differential
-      box's remaining leg too and needs the same fixture pipeline.
+      **The guest leg is done.** A deterministic Copperline run boots
+      Kickstart 3.1 + Workbench 3.1 with a writable copy of a volume
+      this crate built in df1 (`write_protected = false` — inserted
+      images default protected, and the guest says so in a requester),
+      and an AmigaShell script performs makedir, copy, rename, a
+      delete that frees an extension chain, and a fresh-file write
+      through the ROM's own FFS. Two closures follow: this crate reads
+      the guest-mutated image back with `validate()` clean — the ROM's
+      allocator, renamer and freer produce a volume we certify — and
+      `examples/guest-replay.rs` replays the identical five operations
+      through `Mutator` on the pristine copy and compares the two
+      volumes logically: tree, kinds, sizes and content hashes agree
+      entry for entry, with dates and block placement the two
+      documented don't-cares. Not in `cargo test` — it needs a ROM and
+      an emulator — but reproducible from the two examples plus the
+      scripted invocation, deterministically, which is what Copperline
+      is for. The AROS `afs.handler` variant of the same exercise
+      remains under the milestone-1 differential box with the amibake
+      fixture pipeline.
 - [x] **Validator repair**: the write-side half of `validate()`, doing
       what the ROM disk-validator does. `Volume::repair()` in
       `src/repair.rs`, and the first consumer of the allocator.
