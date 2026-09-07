@@ -334,13 +334,13 @@ impl<E> Report<E> {
 /// size with a hash table's constant on top. At 2 GB and 512-byte blocks
 /// this is 512 KB, which is the memory bound the validator is willing to
 /// spend.
-struct Reached {
+pub(crate) struct Reached {
     words: Vec<u32>,
-    count: u64,
+    pub(crate) count: u64,
 }
 
 impl Reached {
-    fn new(block_count: u64) -> Self {
+    pub(crate) fn new(block_count: u64) -> Self {
         Self {
             words: vec![0u32; (block_count / 32 + 1) as usize],
             count: 0,
@@ -360,7 +360,7 @@ impl Reached {
         }
     }
 
-    fn get(&self, lba: u64) -> bool {
+    pub(crate) fn get(&self, lba: u64) -> bool {
         let (w, b) = ((lba / 32) as usize, lba % 32);
         self.words.get(w).map_or(false, |word| word >> b & 1 == 1)
     }
@@ -377,6 +377,24 @@ impl<S: BlockSource> Volume<S> {
     /// with whatever else is reachable.
     pub fn validate(&mut self) -> Report<S::Error> {
         let mut report = Report::default();
+        let mut reached = self.walk_reachable(&mut report);
+        self.validate_bitmap(&mut reached, &mut report);
+        report.summary.reachable = reached.count;
+        report
+    }
+
+    /// The tree walk alone: everything reachable from the root, recorded
+    /// in a bitset, with what did not add up appended to `report`.
+    ///
+    /// Split out of [`Volume::validate`] because
+    /// [`repair`](crate::repair) needs the identical walk and must not
+    /// have a second copy of it: the set of blocks a repair marks
+    /// allocated is *defined* as the set this returns, and a rebuild
+    /// computed from a slightly different walk than the validator's would
+    /// produce a volume that validates worse than it started. The bitmap
+    /// is deliberately not touched here — a repair is about to replace
+    /// it, and the validator compares against it afterwards.
+    pub(crate) fn walk_reachable(&mut self, report: &mut Report<S::Error>) -> Reached {
         let block_count = self.block_count();
         let mut reached = Reached::new(block_count);
 
@@ -389,12 +407,9 @@ impl<S: BlockSource> Volume<S> {
         // of this process's stack depth.
         let mut queue = vec![root];
         while let Some(dir) = queue.pop() {
-            self.validate_dir(dir, &mut reached, &mut report, &mut queue);
+            self.validate_dir(dir, &mut reached, report, &mut queue);
         }
-
-        self.validate_bitmap(&mut reached, &mut report);
-        report.summary.reachable = reached.count;
-        report
+        reached
     }
 
     fn validate_dir(

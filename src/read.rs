@@ -857,6 +857,24 @@ impl<S: crate::BlockSource> Volume<S> {
         })
     }
 
+    /// Re-read and re-parse the root block.
+    ///
+    /// The cached [`RootBlock`] is a parse of the bytes as they were at
+    /// open time, and every read path here trusts it — the hash table
+    /// most of all. Anything that *writes* the root (a repair rewriting
+    /// its bitmap pointers, a mutator changing a hash slot) has therefore
+    /// invalidated it, and this is how it says so. Deliberately not
+    /// automatic: an open volume is a read-side object, and reloading
+    /// after every write would put a read of the root in front of every
+    /// operation that could not have changed it.
+    pub(crate) fn reload_root(&mut self) -> Result<(), Error<S::Error>> {
+        let lba = self.root.lba;
+        self.read_raw(lba)?;
+        verify_root_block(&self.buf, lba)?;
+        self.root = parse_root(&self.buf, lba, self.variant);
+        Ok(())
+    }
+
     /// Blocks reserved at the front of the volume, before the bitmap's
     /// first bit and before anything the filesystem allocates.
     ///

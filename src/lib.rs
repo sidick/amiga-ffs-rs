@@ -39,8 +39,11 @@
 //! easily-inverted conventions stated), [`validate`] (the whole-volume
 //! walk that reports rather than refuses), [`mod@format`] (creating a
 //! volume: boot block, root and bitmap, every variant, every block size)
-//! and [`populate`] (filling one: directories, files, metadata, and a
-//! host directory tree under `std`).
+//! [`populate`] (filling one: directories, files, metadata, and a
+//! host directory tree under `std`), [`allocator`] (block allocation
+//! against a volume that already has something in it, with the
+//! mark-then-use ordering in the types) and [`repair`] (rebuilding a
+//! bitmap from the same walk [`validate`] performs).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -56,15 +59,25 @@
 //! files, comments, dates, protection, every name layout, OFS and FFS
 //! data blocks, extension blocks and `DOS\4`/`DOS\5` dircaches — with
 //! `populate::populate_from_tree` turning a host directory into an image
-//! in one call under the `std` feature. What is *not* here: **mutating**
-//! a volume that already has something in it. Deleting, renaming,
-//! truncating and appending are milestone 3, and [`Populator`] is
+//! in one call under the `std` feature.
+//!
+//! Milestone 3 (mutate) is in progress, and its foundation is here:
+//! [`Allocator`] hands out blocks from an existing volume's own bitmap —
+//! refusing one that is mid-update, tracking dirty pages, and making the
+//! crash ordering visible in the types ([`Allocation::block`] to write a
+//! block, [`Allocator::reference`] to point at one, and it refuses until
+//! the bitmap page is on the disk) — and [`Volume::repair`] rebuilds a
+//! damaged bitmap from the reachability walk, adding allocation and never
+//! removing it. What is still *not* here: creating, deleting and renaming
+//! entries in an existing volume, and writing or truncating a file's data.
+//! Those are the waves that consume the allocator, and [`Populator`] stays
 //! deliberately shaped so that it never has to do any of them.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
+pub mod allocator;
 pub mod bitmap;
 pub mod dircache;
 pub mod file;
@@ -73,6 +86,7 @@ pub mod layout;
 pub mod meta;
 pub mod populate;
 pub mod read;
+pub mod repair;
 pub mod validate;
 
 pub use layout::{
@@ -85,11 +99,13 @@ pub use read::{
     DateStamp, DostypeSource, Entry, EntryKind, Error, RootBlock, Volume, DEFAULT_RESERVED,
 };
 
+pub use allocator::{AllocError, Allocation, Allocator};
 pub use bitmap::Bitmap;
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
 pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
-pub use populate::{BlockMedium, Metadata, PopulateError, Populator};
+pub use populate::{Metadata, PopulateError, Populator};
+pub use repair::{Action, RepairOptions, RepairReport};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.
@@ -166,6 +182,28 @@ pub trait BlockSink {
         None
     }
 }
+
+/// The transport error of a type that both reads and writes.
+///
+/// [`BlockSource`] and [`BlockSink`] each name their own error type, and
+/// everything that mutates a volume needs both traits — so it requires
+/// them to be the *same* type. Every real backend that does both (a file,
+/// an image in memory, a partition on a device) reports its failures one
+/// way; two error types would put a `Read`/`Write` split through every
+/// signature in the write half for a distinction no backend actually
+/// makes.
+pub type Transport<S> = <S as BlockSource>::Error;
+
+/// A type that can be written as well as read: it reads and writes the
+/// same medium and fails the same way doing either.
+///
+/// The bound every mutating entry point takes. [`Populator`] introduced
+/// it, and [`Allocator`] and [`repair`] share it — which is why it lives
+/// here beside the two traits it composes rather than in whichever module
+/// happened to need it first.
+pub trait BlockMedium: BlockSource + BlockSink<Error = <Self as BlockSource>::Error> {}
+
+impl<T> BlockMedium for T where T: BlockSource + BlockSink<Error = <T as BlockSource>::Error> {}
 
 /// Read a big-endian u32 at byte offset `off`.
 #[inline]

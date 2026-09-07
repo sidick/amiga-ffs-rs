@@ -96,23 +96,13 @@ use crate::format::{
 use crate::layout::*;
 use crate::read::{DateStamp, EntryKind};
 use crate::{be32, checksum_compute, hash_table_size, name_hash, names_equal};
-use crate::{BlockSink, BlockSource, Variant, MAX_NAME_CLASSIC, MAX_NAME_LONG};
+use crate::{BlockSource, Variant, MAX_NAME_CLASSIC, MAX_NAME_LONG};
 
-/// The transport error of a type that both reads and writes.
-///
-/// [`BlockSource`] and [`BlockSink`] each name their own error type, and
-/// this module needs both traits — so it requires them to be the *same*
-/// type. Every real backend that does both (a file, an image in memory, a
-/// partition on a device) reports its failures one way; two error types
-/// would put a `Read`/`Write` split through every signature here for a
-/// distinction no backend actually makes.
-pub type Transport<S> = <S as BlockSource>::Error;
-
-/// A type that can be populated: it reads and writes the same medium and
-/// fails the same way doing either.
-pub trait BlockMedium: BlockSource + BlockSink<Error = <Self as BlockSource>::Error> {}
-
-impl<T> BlockMedium for T where T: BlockSource + BlockSink<Error = <T as BlockSource>::Error> {}
+// The two names this module used to define, and which the rest of the
+// write side now shares: they moved to the crate root when the allocator
+// and the repairer turned out to want exactly the same bound, and are
+// re-exported here so `populate::BlockMedium` keeps meaning what it did.
+pub use crate::{BlockMedium, Transport};
 
 // ---------------------------------------------------------------------------
 // Errors

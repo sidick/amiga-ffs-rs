@@ -309,10 +309,70 @@ it under a real Kickstart 3.1.
 
 ## Milestone 3 — mutate
 
-Gated on the milestone-1 validator and differential suite.
+**In progress.** Wave 1 — the allocator and the validator's repair half,
+the two pieces everything else in this milestone stands on — is landed;
+waves 2 (create/delete/rename) and 3 (file write/append/truncate) consume
+them.
 
-- [ ] **Allocator**: bitmap-based block allocation with the volume's
-      own policy quirks documented as discovered.
+- [x] **Allocator**: bitmap-based block allocation with the volume's
+      own policy quirks documented as discovered. `src/allocator.rs`,
+      over `S: BlockMedium` (which moved to the crate root, since the
+      allocator and the repairer want the same bound `Populator` defined).
+
+      **The policy is first fit from a hint, forward, wrapping once**, and
+      the hintless form rotates a cursor so consecutive calls climb rather
+      than rescanning the same full region. That is behaviourally what the
+      shipping implementations do. Linux's `affs` (`fs/affs/bitmap.c`, GPL
+      — read to describe, never copied) takes a *goal* from the caller,
+      defaults it to the volume's first allocatable block, scans forward
+      within the goal's bitmap page, moves to the next page when it is
+      full, and wraps to page zero before giving up; it additionally
+      pre-allocates a run of consecutive free bits within the goal's
+      longword, which is a performance trick with no on-disk consequence
+      and is deliberately *not* copied here (a run handed out and not used
+      would have to be given back or leaked, and one call marking exactly
+      one block is what makes the ordering rule below statable). xdftool,
+      observed rather than read, scans from the *bottom* every time: three
+      files on a `DOS\1` ADF filled 866..902, and after deleting the
+      middle one and writing another it filled the freed 873..879 and
+      882..883 before touching anything higher — first fit with the hint
+      pinned to zero. All of these are correct; the difference is locality,
+      nothing on disk records which was used, and what the tests assert is
+      only the three things that are not a choice: never hand out an
+      allocated block, never hand one out twice, never hand out anything
+      outside `reserved..block_count`.
+
+      **The crash ordering is in the types, not only in the docs.**
+      `allocate()` returns an `Allocation`, not a block number.
+      `Allocation::block()` is the LBA to write the block's *own contents*
+      at — always safe, because nothing reaches it — and
+      `Allocator::reference()` is the LBA that may go into somebody else's
+      pointer, which **refuses** (`AllocError::NotDurable`) until the
+      bitmap page carrying the bit has been flushed. Between them sits
+      `flush()`, which writes only the dirty pages (one dirty flag per
+      page; a flag is cleared only after its write returns, so an
+      interrupted flush leaves the rest queued) with the checksum in
+      longword 0. Freeing cannot be enforced the same way — this code
+      cannot see the caller's metadata write — so `free()` is documented
+      as the second half of an unlink and refuses the one error it *can*
+      see, a double free. `mark_bitmap_invalid`/`mark_bitmap_valid` are
+      the session's bookends, the second stamping LNFS `NumBlocksUsed`
+      and the flag last.
+
+      A volume whose `bitmap_flag` is 0 is refused outright
+      (`AllocError::BitmapInvalid`): those bits are whatever an
+      interrupted update left, and rebuilding them is repair's job, not
+      an allocator's guess.
+
+      Tested by fill-and-free to exhaustion (every free block once, then
+      all of them back), hint and wrap behaviour, double free and
+      not-covered refusals, a 4000-step seeded interleave of
+      alloc/free/flush cross-checked against a model `HashSet` *and*
+      against the bits actually written, a write-counting sink proving a
+      flush writes one block per dirty page and nothing on a second call,
+      and a crash sweep that stops the medium after every prefix of a
+      session's writes: the damage is always leak-shaped (`OrphanBlock`
+      allowed) and `ReachableButFree` never appears.
 - [ ] **Create/delete/rename** in existing volumes: hash-chain
       insertion/removal under both fold tables, dircache invalidation
       (`DOS\4`/`5`: update or clear, never leave stale).
@@ -325,19 +385,56 @@ Gated on the milestone-1 validator and differential suite.
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
       don't-care fields — dates, allocation order).
-- [ ] **Validator repair**: the write-side half of `validate()`, doing
-      what the ROM disk-validator does — rebuild the bitmap from the
-      reachability walk (which `validate()` already performs and
-      `pack_bits` already serialises), write fresh pages, stamp
-      `bm_flag` valid; optionally sever the unfixable (a corrupt chain
-      truncated at the last good link, orphans left leaked — leaks are
-      the recoverable direction). First consumer of the allocator after
-      the mutators themselves, and a prerequisite for resize, which
-      must rebuild the bitmap rather than hand FFS an invalid flag the
-      way AmiPart does. Repair only ever *adds* allocation and only
-      ever removes reachability — the two directions `validate()`
-      already distinguishes — so a repaired volume can be worse than a
-      healthy one but never worse than the damaged one it started as.
+- [x] **Validator repair**: the write-side half of `validate()`, doing
+      what the ROM disk-validator does. `Volume::repair()` in
+      `src/repair.rs`, and the first consumer of the allocator.
+
+      The walk is *the same walk*: `validate()`'s tree pass was factored
+      out as `walk_reachable()` and both call it, because the bitmap a
+      repair writes is **defined** as the set that walk returns, and a
+      second implementation of it would be a second answer. The bitmap is
+      then rebuilt as the **union** of that walk and the old bits, the
+      pages written fresh, the extension blocks and the root's pointers
+      rewritten, and `bm_flag` stamped −1 in a write of its own, last —
+      with `bm_flag = 0` written *first*, so every intermediate state is
+      the honest "my bitmap is mid-update" one. Pages and extension blocks
+      whose pointers name nothing usable (zero, out of range, a duplicate,
+      or a block the tree itself is using) are replaced with freshly
+      allocated ones; a page whose checksum does not balance is rebuilt
+      from the walk alone and *said so* (`Action::PageUnreadable`), since
+      that is the one place allocation cannot be preserved.
+
+      **Repair only ever adds allocation and only ever removes
+      reachability**, and both halves are asserted by the tests. The
+      union is why: an orphan stays allocated (`Action::LeakKept`) rather
+      than being freed the way the ROM validator frees it, because
+      freeing a block the walk did not reach is only safe if the walk was
+      complete — and a walk over a damaged volume is exactly where it is
+      not, since one unreadable directory block hides its whole subtree
+      and every file in it looks like a leak. The same reasoning is why an
+      invalid bitmap is still *read*: its bits cannot be believed when
+      they say "free", but a bit saying "allocated" is either true or a
+      leak, and taking it at its word is conservative either way.
+      Severing is opt-in (`RepairOptions { sever }`, default off) and
+      narrow: only what the ordinary reader has *proved* it cannot
+      follow — a header block that will not parse, a chain that revisits a
+      block, a comment pointer whose block will not read as this entry's
+      comment — cut by writing 0 into the slot or the previous entry's
+      chain longword. The entries behind the cut stay on the disk and stay
+      allocated: leaked, not freed. `repair()` returns a report of typed
+      `Action`s mirroring the `Finding`s they answer.
+
+      Tested against each damage separately — a cleared bit
+      (`ReachableButFree` → allocated, and the volume back to byte-exactly
+      what it was), a stale bit (`OrphanBlock` kept, invariant asserted),
+      `bm_flag` zeroed, a page whose checksum is gone, a page pointer
+      clobbered three ways, and a scribbled header with `sever` on and off
+      — plus the whole matrix of eight variants × {512, 1024, 4096}, a
+      crash sweep over the repair's own writes, and a differential leg
+      where xdftool lists, reads every byte of, and *writes into* a volume
+      this crate repaired. A prerequisite for resize, which must rebuild
+      the bitmap rather than hand FFS an invalid flag the way AmiPart
+      does.
 
 ## In scope, not scheduled
 

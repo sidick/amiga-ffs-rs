@@ -186,6 +186,18 @@ impl Bitmap {
         self.reserved + self.covered_count() >= self.block_count
     }
 
+    /// The bits exactly as they came off the disk: **1 = free**,
+    /// LSB-first within each longword, `bits[0]` bit 0 being block
+    /// [`Bitmap::first_block`].
+    ///
+    /// Raw rather than inverted, because the one consumer that wants them
+    /// whole is [`Allocator`](crate::allocator::Allocator), which writes them
+    /// back — and a representation that changed sense between reading and
+    /// writing is the inversion bug this module exists to prevent.
+    pub fn words(&self) -> &[u32] {
+        &self.bits
+    }
+
     /// The bitmap blocks themselves, in page order. They are allocated
     /// blocks like any other — and a validator that forgets to count them
     /// reachable reports every one as an orphan.

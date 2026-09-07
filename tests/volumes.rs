@@ -22,6 +22,9 @@ pub enum MemError {
     BadBufferLen { got: usize, want: usize },
     /// Read past the end of the image.
     OutOfRange { lba: u64, blocks: u64 },
+    /// The medium stopped accepting writes: what a crash looks like from
+    /// inside the crate, injected by [`MemDisk::fail_after`].
+    Crashed { lba: u64 },
 }
 
 impl std::fmt::Display for MemError {
@@ -29,6 +32,7 @@ impl std::fmt::Display for MemError {
         match self {
             Self::BadBufferLen { got, want } => write!(f, "buffer of {got} bytes, want {want}"),
             Self::OutOfRange { lba, blocks } => write!(f, "lba {lba} of {blocks}"),
+            Self::Crashed { lba } => write!(f, "the medium died writing lba {lba}"),
         }
     }
 }
@@ -38,6 +42,15 @@ impl std::error::Error for MemError {}
 pub struct MemDisk {
     bs: usize,
     data: Vec<u8>,
+    /// Every block written since the log was last cleared, in order —
+    /// so a test can assert *which* blocks a flush touched, not merely
+    /// that the result is right.
+    writes: Vec<u64>,
+    /// Refuse every write after this many. A crash, made deterministic:
+    /// stepping it from 0 upward replays every prefix of a write
+    /// sequence, which is the only way to check a crash-ordering claim
+    /// at every point rather than at one convenient one.
+    fail_after: Option<usize>,
 }
 
 impl BlockSource for MemDisk {
@@ -82,6 +95,12 @@ impl BlockSink for MemDisk {
     }
 
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), MemError> {
+        if let Some(n) = self.fail_after {
+            if self.writes.len() >= n {
+                return Err(MemError::Crashed { lba });
+            }
+        }
+        self.writes.push(lba);
         if buf.len() != self.bs {
             return Err(MemError::BadBufferLen {
                 got: buf.len(),
@@ -108,6 +127,8 @@ impl MemDisk {
         Self {
             bs,
             data: vec![0u8; bs * nblocks as usize],
+            writes: Vec::new(),
+            fail_after: None,
         }
     }
 
@@ -117,6 +138,8 @@ impl MemDisk {
         Self {
             bs,
             data: vec![byte; bs * nblocks as usize],
+            writes: Vec::new(),
+            fail_after: None,
         }
     }
 
@@ -134,6 +157,21 @@ impl MemDisk {
     pub fn poke_block(&mut self, lba: u64, buf: &[u8]) {
         let off = lba as usize * self.bs;
         self.data[off..off + self.bs].copy_from_slice(buf);
+    }
+
+    /// The blocks written since the last [`MemDisk::clear_log`], in
+    /// order.
+    pub fn write_log(&self) -> &[u64] {
+        &self.writes
+    }
+
+    pub fn clear_log(&mut self) {
+        self.writes.clear();
+    }
+
+    /// Start refusing writes once `n` more have been accepted.
+    pub fn fail_after(&mut self, n: usize) {
+        self.fail_after = Some(self.writes.len() + n);
     }
 }
 
@@ -656,6 +694,8 @@ impl Builder {
         MemDisk {
             bs: self.bs,
             data: self.data,
+            writes: Vec::new(),
+            fail_after: None,
         }
     }
 
@@ -663,6 +703,8 @@ impl Builder {
         MemDisk {
             bs: self.bs,
             data: self.data,
+            writes: Vec::new(),
+            fail_after: None,
         }
     }
 }
@@ -3732,4 +3774,721 @@ fn a_host_timestamp_maps_onto_the_amigados_epoch() {
         datestamp_from_system_time(UNIX_EPOCH - Duration::from_secs(86_400)),
         DateStamp::default()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The allocator
+// ---------------------------------------------------------------------------
+
+/// A small populated volume to allocate against: three files and a
+/// directory, so the bitmap has a plausible mix of used and free.
+fn allocatable(variant: Variant, bs: usize, nblocks: u64) -> Volume<MemDisk> {
+    populated(variant, bs, nblocks, allocatable_tree)
+}
+
+/// The tree itself, so a test that wants one more entry in it does not
+/// have to restate the three that everything else asserts on.
+fn allocatable_tree(pop: &mut Populator<MemDisk>) {
+    let meta = amiga_ffs::Metadata::new();
+    let root = pop.root_lba();
+    let dir = pop.create_dir(root, b"Devs", &meta).unwrap();
+    pop.create_file(dir, b"system-configuration", &meta, &pattern(232))
+        .unwrap();
+    pop.create_file(root, b"Payload", &meta, &pattern(9000))
+        .unwrap();
+    pop.create_file(root, b"Small", &meta, b"hello").unwrap();
+}
+
+/// Set or clear one bitmap bit behind the volume's back, re-checksumming
+/// the page at longword 0. Damage a repair is then asked to undo.
+fn poke_bitmap_bit(disk: &mut MemDisk, pages: &[u64], reserved: u64, lba: u64, free: bool) {
+    let bs = BlockSource::block_size(disk);
+    let per_page = bitmap_bits_per_block(bs);
+    let bit = lba - reserved;
+    let page = pages[(bit / per_page) as usize];
+    let within = bit % per_page;
+    let mut buf = disk.block(page).to_vec();
+    let off = OFF_BITMAP_BITS + (within / 32) as usize * 4;
+    let mut w = be32(&buf, off);
+    if free {
+        w |= 1 << (within % 32);
+    } else {
+        w &= !(1 << (within % 32));
+    }
+    buf[off..off + 4].copy_from_slice(&w.to_be_bytes());
+    buf[0..4].copy_from_slice(&0u32.to_be_bytes());
+    let ck = checksum_compute(&buf, BITMAP_CHECKSUM_INDEX);
+    buf[0..4].copy_from_slice(&ck.to_be_bytes());
+    disk.poke_block(page, &buf);
+}
+
+/// Every block the bitmap marks allocated, as a set — for the two
+/// directional invariants, which are statements about sets.
+fn allocated_set(vol: &mut Volume<MemDisk>) -> std::collections::HashSet<u64> {
+    vol.read_bitmap().unwrap().allocated().collect()
+}
+
+#[test]
+fn an_allocator_refuses_a_volume_whose_bitmap_is_mid_update() {
+    // The state an interrupted populate leaves: the bits on disk are
+    // whatever the interruption left, and acting on them hands out blocks
+    // a file is using. Rebuilding them is repair's job, and the refusal
+    // says so rather than guessing.
+    let nblocks = 1760;
+    let disk = MemDisk::blank(512, nblocks);
+    let opts = FormatOptions::new(Variant::FfsIntl, nblocks, b"Interrupted");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    pop.create_file(root, b"Half", &amiga_ffs::Metadata::new(), &pattern(5000))
+        .unwrap();
+    let disk = pop.abandon();
+
+    let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    assert!(matches!(
+        Allocator::load(&mut vol),
+        Err(AllocError::BitmapInvalid)
+    ));
+}
+
+#[test]
+fn the_allocator_hands_out_every_free_block_exactly_once_and_then_says_full() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let before = allocated_set(&mut vol);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    let free = alloc.blocks_free();
+    assert_eq!(alloc.blocks_used(), before.len() as u64);
+
+    let mut got: Vec<u64> = Vec::new();
+    loop {
+        match alloc.allocate() {
+            Ok(a) => got.push(a.block()),
+            Err(AllocError::VolumeFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(got.len() as u64, free, "every free block, and no more");
+    assert_eq!(alloc.blocks_free(), 0);
+
+    let seen: std::collections::HashSet<u64> = got.iter().copied().collect();
+    assert_eq!(seen.len(), got.len(), "no block handed out twice");
+    for lba in &got {
+        assert!(
+            (2..1760).contains(lba),
+            "block {lba} is outside the volume's allocatable range"
+        );
+        assert!(
+            !before.contains(lba),
+            "block {lba} was already allocated when it was handed out"
+        );
+    }
+
+    // ...and back again: freeing everything restores the count exactly,
+    // and freeing one of them a second time is refused.
+    for lba in &got {
+        alloc.free(*lba).unwrap();
+    }
+    assert_eq!(alloc.blocks_free(), free);
+    assert!(matches!(
+        alloc.free(got[0]),
+        Err(AllocError::DoubleFree { lba }) if lba == got[0]
+    ));
+    // The boot blocks and anything past the end have no bit at all, which
+    // is a different refusal from "already free".
+    for lba in [0, 1, 1760, 9999] {
+        assert!(matches!(
+            alloc.free(lba),
+            Err(AllocError::NotCovered { .. })
+        ));
+    }
+}
+
+#[test]
+fn allocation_scans_forward_from_the_hint_and_wraps_once() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let before = allocated_set(&mut vol);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+
+    // A hint lands on the first free block at or above it...
+    for hint in [2u64, 500, 900, 1500] {
+        let want = (hint..1760).find(|b| !before.contains(b)).unwrap();
+        let a = alloc.allocate_near(hint).unwrap();
+        assert_eq!(a.block(), want, "hint {hint}");
+        alloc.free(a.block()).unwrap();
+    }
+
+    // ...and a hint past the end of the volume is a preference, not an
+    // error: the scan wraps to the first allocatable block.
+    let a = alloc.allocate_near(9_999).unwrap();
+    assert_eq!(a.block(), (2..1760).find(|b| !before.contains(b)).unwrap());
+
+    // The hintless form rotates: consecutive calls climb rather than
+    // rescanning the same region, which is the locality a file's data
+    // blocks want.
+    let mut last = a.block();
+    for _ in 0..20 {
+        let n = alloc.allocate().unwrap().block();
+        assert!(n > last, "{n} follows {last}");
+        last = n;
+    }
+}
+
+#[test]
+fn a_new_block_may_not_be_pointed_at_until_its_bitmap_page_is_on_the_disk() {
+    // The mark-then-use rule, as a return type. `block()` is always
+    // available -- writing the block's own contents is safe, because
+    // nothing reaches it -- and `reference()` is what a hash slot or a
+    // data-pointer table has to be filled from.
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    let a = alloc.allocate().unwrap();
+    assert!(a.block() >= 2);
+    assert!(matches!(
+        alloc.reference(&a),
+        Err(AllocError::NotDurable { lba }) if lba == a.block()
+    ));
+    assert_eq!(alloc.dirty_pages(), 1);
+    alloc.flush(vol.source_mut()).unwrap();
+    assert_eq!(alloc.dirty_pages(), 0);
+    assert_eq!(alloc.reference(&a).unwrap(), a.block());
+}
+
+#[test]
+fn a_flush_writes_only_the_pages_that_changed() {
+    // Five bitmap pages at 512 bytes: 4064 blocks each.
+    let nblocks = 20_000;
+    let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+    let pages = vol.read_bitmap().unwrap().pages().to_vec();
+    assert_eq!(pages.len(), 5, "the volume is big enough for the test");
+
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    // Three allocations inside one page, and one deliberately inside
+    // another: two pages dirty, not four.
+    for _ in 0..3 {
+        alloc.allocate().unwrap();
+    }
+    let far = alloc.allocate_near(15_000).unwrap();
+    assert_eq!(alloc.dirty_pages(), 2);
+
+    vol.source_mut().clear_log();
+    assert_eq!(alloc.flush(vol.source_mut()).unwrap(), 2);
+    let written = vol.source_mut().write_log().to_vec();
+    assert_eq!(written.len(), 2, "one write per dirty page: {written:?}");
+    assert!(written.iter().all(|b| pages.contains(b)));
+    assert!(written.contains(&pages[(far.block() - 2) as usize / 4064]));
+
+    // And nothing at all the second time: a flush with no edits is not a
+    // rewrite of the bitmap.
+    vol.source_mut().clear_log();
+    assert_eq!(alloc.flush(vol.source_mut()).unwrap(), 0);
+    assert!(vol.source_mut().write_log().is_empty());
+}
+
+#[test]
+fn allocation_never_disagrees_with_a_model_of_the_same_bitmap() {
+    // The property the whole module exists for, cross-checked against a
+    // set the test keeps itself: interleave allocations, frees and
+    // flushes from a seeded generator, and after every step assert the
+    // allocator has never handed out a block the model already holds.
+    // The disk is compared at the end too, because an allocator that is
+    // right in memory and writes the bits inverted is the exact failure
+    // the bitmap module's four conventions are about.
+    let nblocks = 20_000;
+    let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+    let mut model: std::collections::HashSet<u64> = allocated_set(&mut vol);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    let mut mine: Vec<u64> = Vec::new();
+    let mut rng = Rng::new(0xA11C_0DE5);
+
+    for step in 0..4000 {
+        match rng.below(10) {
+            0..=5 => {
+                let a = if rng.below(2) == 0 {
+                    alloc.allocate().unwrap()
+                } else {
+                    alloc
+                        .allocate_near(2 + rng.below(nblocks as usize) as u64)
+                        .unwrap()
+                };
+                let lba = a.block();
+                assert!(
+                    model.insert(lba),
+                    "step {step}: block {lba} handed out while already allocated"
+                );
+                assert!((2..nblocks).contains(&lba), "step {step}: block {lba}");
+                mine.push(lba);
+            }
+            6..=8 => {
+                if mine.is_empty() {
+                    continue;
+                }
+                let i = rng.below(mine.len());
+                let lba = mine.swap_remove(i);
+                alloc.free(lba).unwrap();
+                assert!(model.remove(&lba));
+            }
+            _ => {
+                alloc.flush(vol.source_mut()).unwrap();
+            }
+        }
+        assert_eq!(alloc.blocks_used(), model.len() as u64, "step {step}");
+    }
+
+    alloc.flush(vol.source_mut()).unwrap();
+    let on_disk = allocated_set(&mut vol);
+    assert_eq!(on_disk, model, "the bits that were written are the model");
+}
+
+/// One allocation session, as a caller with the discipline would write
+/// it: mark, flush, then use — the block's contents only, since nothing
+/// in wave 1 chains anything into a directory.
+fn allocation_session(vol: &mut Volume<MemDisk>) -> Result<Vec<u64>, AllocError<MemError>> {
+    let mut alloc = Allocator::load(vol)?;
+    let mut got = Vec::new();
+    for _ in 0..6 {
+        got.push(alloc.allocate()?);
+    }
+    alloc.flush(vol.source_mut())?;
+    let bs = vol.block_size();
+    let mut out = Vec::new();
+    for a in &got {
+        let lba = alloc.reference(a)?;
+        let buf = vec![0x5Au8; bs];
+        vol.source_mut()
+            .write_block(lba, &buf)
+            .map_err(AllocError::Io)?;
+        out.push(lba);
+    }
+    Ok(out)
+}
+
+#[test]
+fn an_interrupted_allocation_session_leaks_and_never_double_allocates() {
+    // The crash-shape claim, checked at every point rather than at one:
+    // stop the medium after n writes for every n the session takes, and
+    // the damage must always be leak-shaped. `OrphanBlock` is allowed --
+    // a block marked allocated that nothing reaches is space lost and
+    // nothing worse. `ReachableButFree` is not, ever: it is the state in
+    // which the next allocation hands a block to a second owner.
+    let nblocks = 1760;
+    let total = {
+        let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+        vol.source_mut().clear_log();
+        allocation_session(&mut vol).unwrap();
+        vol.source_mut().write_log().len()
+    };
+    assert!(
+        total >= 7,
+        "the session writes a bitmap page and six blocks"
+    );
+
+    let mut crashed = 0;
+    for n in 0..=total {
+        let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+        vol.source_mut().fail_after(n);
+        if allocation_session(&mut vol).is_err() {
+            crashed += 1;
+        }
+
+        let disk = vol.into_inner();
+        let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+        let report = vol.validate();
+        for finding in &report.findings {
+            assert!(
+                matches!(finding, Finding::OrphanBlock { .. }),
+                "crash after {n} writes left {finding}"
+            );
+        }
+        assert_eq!(report.summary.reachable_but_free, 0, "crash after {n}");
+
+        // ...and the volume that was there before is untouched: an
+        // allocator that scribbles on a file it was supposed to avoid
+        // would show up here and nowhere else.
+        let root = vol.root_lba();
+        let payload = vol.lookup(root, b"Payload").unwrap().unwrap();
+        assert_eq!(vol.read_file(payload.lba).unwrap(), pattern(9000));
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+// ---------------------------------------------------------------------------
+// repair()
+// ---------------------------------------------------------------------------
+
+/// The two statements a repair must always be able to make, whatever it
+/// was handed: it added allocation and removed none, and nothing is
+/// reachable-but-free afterwards.
+fn assert_repair_invariants(
+    before: &std::collections::HashSet<u64>,
+    after: &std::collections::HashSet<u64>,
+    report: &Report<MemError>,
+) {
+    for lba in before {
+        assert!(
+            after.contains(lba),
+            "block {lba} was allocated before the repair and is not after: \
+             a repair may only ever add allocation"
+        );
+    }
+    assert_eq!(
+        report.summary.reachable_but_free, 0,
+        "a repaired volume never leaves a block in use marked free"
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::BitmapInvalid | Finding::BitmapIncomplete { .. })),
+        "{:?}",
+        report.findings
+    );
+}
+
+/// Every file of [`allocatable`]'s tree, read back byte for byte.
+fn assert_tree_intact(vol: &mut Volume<MemDisk>) {
+    let root = vol.root_lba();
+    let payload = vol.lookup(root, b"Payload").unwrap().expect("Payload");
+    assert_eq!(vol.read_file(payload.lba).unwrap(), pattern(9000));
+    let small = vol.lookup(root, b"Small").unwrap().expect("Small");
+    assert_eq!(vol.read_file(small.lba).unwrap(), b"hello");
+    let devs = vol.lookup(root, b"Devs").unwrap().expect("Devs").lba;
+    let cfg = vol
+        .lookup(devs, b"system-configuration")
+        .unwrap()
+        .expect("system-configuration");
+    assert_eq!(vol.read_file(cfg.lba).unwrap(), pattern(232));
+}
+
+#[test]
+fn repair_allocates_a_block_that_was_in_use_and_marked_free() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let pages = vol.read_bitmap().unwrap().pages().to_vec();
+    let root = vol.root_lba();
+    let victim = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+    let before = allocated_set(&mut vol);
+
+    let mut disk = vol.into_inner();
+    poke_bitmap_bit(&mut disk, &pages, 2, victim, true);
+    let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+    assert_eq!(vol.validate().summary.reachable_but_free, 1);
+
+    let done = vol.repair(&RepairOptions::new()).unwrap();
+    assert_eq!(done.allocated, 1);
+    assert!(done.actions.contains(&Action::Allocated { lba: victim }));
+    assert_eq!(done.leaked, 0);
+    assert_eq!(done.pages_written, pages.len() as u64);
+
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    let after = allocated_set(&mut vol);
+    assert_repair_invariants(&before, &after, &report);
+    assert_eq!(after, before, "the volume is back to exactly what it was");
+    assert_tree_intact(&mut vol);
+}
+
+#[test]
+fn repair_keeps_a_leak_rather_than_freeing_it() {
+    // The direction the ROM validator takes and this one does not, and
+    // the reason: a block the walk did not reach is only *proved* free if
+    // the walk was complete, which on a damaged volume is exactly what it
+    // is not.
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let pages = vol.read_bitmap().unwrap().pages().to_vec();
+    let stray = vol.read_bitmap().unwrap().free().next().unwrap();
+    let before = allocated_set(&mut vol);
+
+    let mut disk = vol.into_inner();
+    poke_bitmap_bit(&mut disk, &pages, 2, stray, false);
+    let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+    let before_damaged = allocated_set(&mut vol);
+    assert_eq!(vol.validate().summary.orphans, 1);
+
+    let done = vol.repair(&RepairOptions::new()).unwrap();
+    assert_eq!(done.leaked, 1);
+    assert!(done.actions.contains(&Action::LeakKept { lba: stray }));
+    assert_eq!(done.allocated, 0);
+
+    let report = vol.validate();
+    assert_eq!(report.summary.orphans, 1, "the leak is still a leak");
+    let after = allocated_set(&mut vol);
+    assert_repair_invariants(&before_damaged, &after, &report);
+    assert!(after.contains(&stray));
+    assert!(before.is_subset(&after));
+    assert_tree_intact(&mut vol);
+}
+
+#[test]
+fn repair_stamps_a_mid_update_bitmap_valid_again() {
+    // The abandoned populate from the allocator tests above: a volume
+    // that says "do not allocate from me" and has no other damage. After
+    // a repair it validates clean and the allocator will load it.
+    let nblocks = 1760;
+    let disk = MemDisk::blank(512, nblocks);
+    let opts = FormatOptions::new(Variant::FfsIntlDircache, nblocks, b"Interrupted");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    pop.create_file(root, b"Half", &amiga_ffs::Metadata::new(), &pattern(5000))
+        .unwrap();
+    let disk = pop.abandon();
+
+    let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    assert!(!vol.read_bitmap().unwrap().valid());
+    let done = vol.repair(&RepairOptions::new()).unwrap();
+    // Nothing on this volume was ever marked allocated, so every block the
+    // walk reaches is a correction.
+    assert!(done.allocated > 5, "{done:?}");
+    assert_eq!(done.leaked, 0);
+
+    assert!(vol.read_bitmap().unwrap().valid());
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    let root = vol.root_lba();
+    let half = vol.lookup(root, b"Half").unwrap().unwrap().lba;
+    assert_eq!(vol.read_file(half).unwrap(), pattern(5000));
+    assert!(Allocator::load(&mut vol).is_ok());
+}
+
+#[test]
+fn repair_replaces_a_bitmap_page_it_cannot_use() {
+    for damage in ["zero", "outside", "in-use"] {
+        let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+        let old_page = vol.read_bitmap().unwrap().pages()[0];
+        let root_lba = vol.root_lba();
+        let payload = {
+            let root = vol.root_lba();
+            vol.lookup(root, b"Payload").unwrap().unwrap().lba
+        };
+        let before = allocated_set(&mut vol);
+
+        // Clobber the root's one bitmap page pointer, three ways: gone,
+        // out of the volume, and naming a block a file is using.
+        let mut disk = vol.into_inner();
+        let mut root_block = disk.block(root_lba).to_vec();
+        let value: u32 = match damage {
+            "zero" => 0,
+            "outside" => 9_999,
+            _ => payload as u32,
+        };
+        root_block[tail(512, TL_BITMAP_PAGES)..tail(512, TL_BITMAP_PAGES) + 4]
+            .copy_from_slice(&value.to_be_bytes());
+        let ck = checksum_compute(&root_block, CHECKSUM_INDEX);
+        root_block[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&ck.to_be_bytes());
+        disk.poke_block(root_lba, &root_block);
+
+        let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+        let done = vol.repair(&RepairOptions::new()).unwrap();
+        assert_eq!(done.blocks_replaced, 1, "{damage}");
+        assert!(
+            done.actions
+                .iter()
+                .any(|a| matches!(a, Action::PageReplaced { index: 0, was, .. } if *was == value)),
+            "{damage}: {:?}",
+            done.actions
+        );
+
+        let report = vol.validate();
+        let after = allocated_set(&mut vol);
+        assert_repair_invariants(&before, &after, &report);
+        assert_tree_intact(&mut vol);
+        // Wherever the replacement landed, the volume's own bitmap now
+        // names it, it is not the pointer that was rejected, and it is
+        // marked allocated like any other block in use. (It frequently
+        // *is* the old page block: with the pointer gone, nothing said
+        // that block was in use, so the scan is free to reuse it -- which
+        // is the best outcome available and not a hazard, because a
+        // bitmap page is exactly the block whose contents are about to be
+        // overwritten anyway.)
+        let new_page = vol.read_bitmap().unwrap().pages()[0];
+        assert_ne!(new_page as u32, value, "{damage}");
+        assert!(after.contains(&new_page), "{damage}");
+        let _ = old_page;
+    }
+}
+
+#[test]
+fn repair_rewrites_a_bitmap_page_whose_checksum_is_gone() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let page = vol.read_bitmap().unwrap().pages()[0];
+    let before = allocated_set(&mut vol);
+
+    let mut disk = vol.into_inner();
+    let mut buf = disk.block(page).to_vec();
+    buf[16] ^= 0xFF;
+    disk.poke_block(page, &buf);
+    let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+    assert!(vol.read_bitmap().is_err(), "the page no longer sums");
+
+    let done = vol.repair(&RepairOptions::new()).unwrap();
+    assert!(
+        done.actions.contains(&Action::PageUnreadable { lba: page }),
+        "{:?}",
+        done.actions
+    );
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    let after = allocated_set(&mut vol);
+    // Every block that is *reachable* comes back; the page's bits could
+    // not be read, so anything allocated and unreachable in its region is
+    // gone with it -- which is why the action names the page.
+    assert_eq!(after, before);
+    assert_tree_intact(&mut vol);
+}
+
+#[test]
+fn severing_is_opt_in_and_cuts_only_what_will_not_read() {
+    // A file header block scribbled over: the entry cannot be parsed, so
+    // its whole chain position is unusable. By default the repair leaves
+    // it -- a recovery tool wants to see the dangling link -- and under
+    // `sever` the chain is truncated at the last good link and the blocks
+    // behind it are leaked, not freed.
+    let build = || {
+        let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+            allocatable_tree(pop);
+            pop.create_file(
+                pop.root_lba(),
+                b"Doomed",
+                &amiga_ffs::Metadata::new(),
+                b"gone",
+            )
+            .unwrap();
+        });
+        // A victim alone in its hash slot, so the cut cannot take an
+        // innocent entry with it: nothing chains to it and nothing chains
+        // off it.
+        let root = vol.root_lba();
+        let entries = vol.read_dir(root).unwrap();
+        let doomed = entries
+            .iter()
+            .find(|e| e.name == b"Doomed")
+            .expect("Doomed")
+            .clone();
+        assert_eq!(doomed.hash_chain, 0, "Doomed is the end of its chain");
+        assert!(
+            !entries.iter().any(|e| e.hash_chain as u64 == doomed.lba),
+            "Doomed is the head of its chain"
+        );
+        let mut disk = vol.into_inner();
+        disk.poke_block(doomed.lba, &vec![0u8; 512]);
+        (Volume::open_with(disk, None, 1760, 2).unwrap(), doomed.lba)
+    };
+
+    let (mut vol, victim) = build();
+    let damaged = vol.validate();
+    assert!(damaged
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Unreadable { lba, .. } if *lba == victim)));
+
+    let done = vol.repair(&RepairOptions::new()).unwrap();
+    assert_eq!(done.severed, 0, "severing is opt-in");
+    assert!(vol
+        .validate()
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Unreadable { lba, .. } if *lba == victim)));
+
+    let (mut vol, victim) = build();
+    let before = allocated_set(&mut vol);
+    let done = vol.repair(&RepairOptions::new().sever(true)).unwrap();
+    assert_eq!(done.severed, 1);
+    assert!(
+        done.actions
+            .iter()
+            .any(|a| matches!(a, Action::ChainTruncated { dropped, .. } if *dropped == victim)),
+        "{:?}",
+        done.actions
+    );
+
+    let report = vol.validate();
+    let after = allocated_set(&mut vol);
+    assert_repair_invariants(&before, &after, &report);
+    // What remains is leaks and nothing else: the severed header and the
+    // blocks it owned are still marked allocated, which is the direction
+    // that can be recovered.
+    for finding in &report.findings {
+        assert!(
+            matches!(finding, Finding::OrphanBlock { .. }),
+            "after severing: {finding}"
+        );
+    }
+    assert!(
+        after.contains(&victim),
+        "the severed block is leaked, not freed"
+    );
+    let root = vol.root_lba();
+    assert!(vol.lookup(root, b"Doomed").unwrap().is_none());
+    assert_tree_intact(&mut vol);
+}
+
+#[test]
+fn repair_is_clean_on_every_variant_and_block_size() {
+    // The bitmap arithmetic changes with the block size and the dircache
+    // adds a block per directory, so the matrix is the test.
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 1024, 4096] {
+            let nblocks = 1_800_000 / bs as u64;
+            let mut vol = allocatable(variant, bs, nblocks);
+            let pages = vol.read_bitmap().unwrap().pages().to_vec();
+            let before = allocated_set(&mut vol);
+            let root = vol.root_lba();
+            let victim = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+
+            let mut disk = vol.into_inner();
+            poke_bitmap_bit(&mut disk, &pages, 2, victim, true);
+            let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+            vol.repair(&RepairOptions::new()).unwrap();
+
+            let report = vol.validate();
+            assert!(
+                report.is_clean(),
+                "{variant:?} @{bs}: {:?}",
+                report.findings
+            );
+            let after = allocated_set(&mut vol);
+            assert_repair_invariants(&before, &after, &report);
+            assert_eq!(after, before, "{variant:?} @{bs}");
+            assert_tree_intact(&mut vol);
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_repair_leaves_a_volume_that_refuses_to_be_allocated_from() {
+    // The same crash sweep as the allocator's, over the repair itself:
+    // whatever prefix of its writes lands, the result must never claim a
+    // valid bitmap it has not finished writing.
+    let nblocks = 1760;
+    let total = {
+        let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+        vol.source_mut().clear_log();
+        vol.repair(&RepairOptions::new()).unwrap();
+        vol.source_mut().write_log().len()
+    };
+
+    for n in 0..total {
+        let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+        let pages = vol.read_bitmap().unwrap().pages().to_vec();
+        let root = vol.root_lba();
+        let victim = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+        let mut disk = vol.into_inner();
+        poke_bitmap_bit(&mut disk, &pages, 2, victim, true);
+        let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+
+        vol.source_mut().fail_after(n);
+        let _ = vol.repair(&RepairOptions::new());
+
+        let disk = vol.into_inner();
+        let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+        let bitmap_claims_valid = vol.read_bitmap().map(|b| b.valid()).unwrap_or(false);
+        if bitmap_claims_valid {
+            // Either the repair never started or it finished: both are
+            // states in which the bitmap may be trusted, so it must not
+            // be lying about a block in use.
+            assert_eq!(
+                vol.validate().summary.reachable_but_free,
+                if n == 0 { 1 } else { 0 },
+                "crash after {n} writes"
+            );
+        }
+        assert_tree_intact(&mut vol);
+    }
 }

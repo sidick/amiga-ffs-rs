@@ -867,3 +867,91 @@ fn the_oracles_free_space_accounting_agrees_with_the_populators() {
     assert_eq!(bm.allocated_count() + 2, used, "\n{info}");
     assert!(vol.validate().is_clean());
 }
+
+/// A volume this crate *repaired* is still a volume the other
+/// implementation can mount, list, read and write.
+///
+/// The strongest available statement about `repair()`: the bitmap it
+/// rebuilds is not merely one this crate agrees with — an allocator that
+/// shares no code with it allocates out of the same bits and the result
+/// still reads back here.
+#[test]
+fn xdftool_accepts_a_volume_this_crate_repaired() {
+    let argv = oracle!();
+    let scratch = Scratch::new("repaired");
+    let image = populate_adf(&scratch, Variant::FfsIntl, "Repaired", "repaired.adf");
+
+    // Damage it in both directions at once: a block a file is using
+    // marked free (the dangerous finding) and a free block marked in use
+    // (the recoverable one).
+    let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+    let root = vol.root_lba();
+    let victim = vol.lookup(root, "big.dat".as_bytes()).unwrap().unwrap().lba;
+    let bitmap = vol.read_bitmap().unwrap();
+    let page = bitmap.pages()[0];
+    let stray = bitmap.free().next().unwrap();
+    let mut buf = vol.source_mut().block(page).to_vec();
+    for (lba, free) in [(victim, true), (stray, false)] {
+        let bit = (lba - 2) as usize;
+        let off = 4 + (bit / 32) * 4;
+        let mut w = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        if free {
+            w |= 1 << (bit % 32);
+        } else {
+            w &= !(1 << (bit % 32));
+        }
+        buf[off..off + 4].copy_from_slice(&w.to_be_bytes());
+    }
+    buf[0..4].copy_from_slice(&0u32.to_be_bytes());
+    let ck = amiga_ffs::checksum_compute(&buf, amiga_ffs::layout::BITMAP_CHECKSUM_INDEX);
+    buf[0..4].copy_from_slice(&ck.to_be_bytes());
+    vol.source_mut().write_block(page, &buf).unwrap();
+
+    let mut vol = Volume::open(vol.into_inner(), None).unwrap();
+    assert_eq!(vol.validate().summary.reachable_but_free, 1);
+    let done = vol.repair(&RepairOptions::new()).expect("repair");
+    assert_eq!(done.allocated, 1);
+    assert_eq!(done.leaked, 1, "the stale bit stays a leak, by design");
+    assert!(vol.validate().summary.reachable_but_free == 0);
+    vol.into_inner().save(&image);
+
+    // ...and now the oracle's turn.
+    let path = image.to_str().unwrap();
+    let listing = run(&argv, &[path, "list"]);
+    for (file, bytes) in fixture_files(false) {
+        assert!(
+            listing.contains(file.rsplit('/').next().unwrap()),
+            "{file} missing after repair:\n{listing}"
+        );
+        let back = scratch.path("back");
+        run(&argv, &[path, "read", &file, back.to_str().unwrap()]);
+        assert_eq!(std::fs::read(&back).unwrap(), bytes, "{file} after repair");
+        let _ = std::fs::remove_file(&back);
+    }
+
+    // Writing into it allocates from the bitmap the repair laid down.
+    let host = scratch.path("payload");
+    let payload = pattern(6000);
+    std::fs::write(&host, &payload).unwrap();
+    run(
+        &argv,
+        &[path, "write", host.to_str().unwrap(), "AfterRepair"],
+    );
+    let back = scratch.path("added");
+    run(
+        &argv,
+        &[path, "read", "AfterRepair", back.to_str().unwrap()],
+    );
+    assert_eq!(std::fs::read(&back).unwrap(), payload);
+
+    let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+    let report = vol.validate();
+    // The one deliberate leftover is the leak the repair kept on purpose;
+    // xdftool may or may not have allocated it back.
+    for finding in &report.findings {
+        assert!(
+            matches!(finding, Finding::OrphanBlock { lba } if *lba == stray),
+            "after repair and an oracle write: {finding}"
+        );
+    }
+}
