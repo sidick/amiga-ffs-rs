@@ -37,8 +37,10 @@
 //! calendar conversion), [`dircache`] (`DOS\4`/`DOS\5` cache blocks, read
 //! and marked advisory), [`bitmap`] (the allocation bitmap, with its four
 //! easily-inverted conventions stated), [`validate`] (the whole-volume
-//! walk that reports rather than refuses) and [`mod@format`] (creating a
-//! volume: boot block, root and bitmap, every variant, every block size).
+//! walk that reports rather than refuses), [`mod@format`] (creating a
+//! volume: boot block, root and bitmap, every variant, every block size)
+//! and [`populate`] (filling one: directories, files, metadata, and a
+//! host directory tree under `std`).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -46,13 +48,18 @@
 //! *mostly* works. Everything above them is pointer-following, and every
 //! pointer is range-checked and every chain refuses to revisit a block.
 //!
-//! Milestone 1 (read) is complete, and the first half of milestone 2 with
+//! Milestone 1 (read) is complete, and milestone 2's creation side with
 //! it: [`BlockSink`] is the write seam (a second trait, not a bound on
-//! [`BlockSource`] — read-only sources are the common case) and
+//! [`BlockSource`] — read-only sources are the common case),
 //! [`format`](format()) creates a fresh, empty, valid volume of any
-//! variant at any block size, boot block, root and bitmap alike. What is
-//! *not* here yet: populating a volume from a tree, and mutating one that
-//! already has something in it.
+//! variant at any block size, and [`Populator`] fills one — directories,
+//! files, comments, dates, protection, every name layout, OFS and FFS
+//! data blocks, extension blocks and `DOS\4`/`DOS\5` dircaches — with
+//! `populate::populate_from_tree` turning a host directory into an image
+//! in one call under the `std` feature. What is *not* here: **mutating**
+//! a volume that already has something in it. Deleting, renaming,
+//! truncating and appending are milestone 3, and [`Populator`] is
+//! deliberately shaped so that it never has to do any of them.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -64,6 +71,7 @@ pub mod file;
 pub mod format;
 pub mod layout;
 pub mod meta;
+pub mod populate;
 pub mod read;
 pub mod validate;
 
@@ -81,6 +89,7 @@ pub use bitmap::Bitmap;
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
 pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
+pub use populate::{BlockMedium, Metadata, PopulateError, Populator};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.

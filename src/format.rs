@@ -565,47 +565,74 @@ fn plan<E>(
     })
 }
 
-/// A volume name AmigaDOS can address: non-empty, at most 30 bytes, and
-/// free of the two path-syntax characters and of control codes.
-fn check_name<E>(name: &[u8]) -> Result<(), FormatError<E>> {
+/// What is wrong with a name, before anyone has decided whose error type
+/// it belongs in.
+///
+/// The rule is one rule — the volume name and a directory entry's name
+/// are checked identically, differing only in the maximum — so it lives
+/// in one place and both [`FormatError`] and
+/// [`crate::populate::PopulateError`] lift it into their own variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameProblem {
+    Empty,
+    TooLong { len: usize, max: usize },
+    InvalidByte { byte: u8, index: usize },
+}
+
+/// A name AmigaDOS can address: non-empty, at most `max` bytes, and free
+/// of the two path-syntax characters and of control codes.
+///
+/// `max` is [`MAX_NAME_CLASSIC`] for a volume name on *every* variant
+/// (the root's name field did not move on LNFS) and for a directory entry
+/// on `DOS\0`–`DOS\5`; [`crate::MAX_NAME_LONG`] for an entry on
+/// `DOS\6`/`DOS\7`.
+pub(crate) fn check_name_bytes(name: &[u8], max: usize) -> Result<(), NameProblem> {
     if name.is_empty() {
-        return Err(FormatError::NameEmpty);
+        return Err(NameProblem::Empty);
     }
-    if name.len() > MAX_NAME_CLASSIC {
-        return Err(FormatError::NameTooLong {
+    if name.len() > max {
+        return Err(NameProblem::TooLong {
             len: name.len(),
-            max: MAX_NAME_CLASSIC,
+            max,
         });
     }
     for (index, &byte) in name.iter().enumerate() {
         // Latin-1 above 0x7F is a name character and stays one; only the
         // two C0 ranges and the path separators are refused.
         if byte == b':' || byte == b'/' || byte < 0x20 || (0x7F..=0x9F).contains(&byte) {
-            return Err(FormatError::NameInvalidByte { byte, index });
+            return Err(NameProblem::InvalidByte { byte, index });
         }
     }
     Ok(())
+}
+
+fn check_name<E>(name: &[u8]) -> Result<(), FormatError<E>> {
+    check_name_bytes(name, MAX_NAME_CLASSIC).map_err(|p| match p {
+        NameProblem::Empty => FormatError::NameEmpty,
+        NameProblem::TooLong { len, max } => FormatError::NameTooLong { len, max },
+        NameProblem::InvalidByte { byte, index } => FormatError::NameInvalidByte { byte, index },
+    })
 }
 
 fn put<S: BlockSink>(sink: &mut S, lba: u64, buf: &[u8]) -> Result<(), FormatError<S::Error>> {
     sink.write_block(lba, buf).map_err(FormatError::Io)
 }
 
-fn div_ceil(a: u64, b: u64) -> u64 {
+pub(crate) fn div_ceil(a: u64, b: u64) -> u64 {
     a / b + u64::from(a % b != 0)
 }
 
-fn wr32(block: &mut [u8], off: usize, v: u32) {
+pub(crate) fn wr32(block: &mut [u8], off: usize, v: u32) {
     block[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
-fn wr_date(block: &mut [u8], off: usize, d: DateStamp) {
+pub(crate) fn wr_date(block: &mut [u8], off: usize, d: DateStamp) {
     wr32(block, off, d.days);
     wr32(block, off + 4, d.mins);
     wr32(block, off + 8, d.ticks);
 }
 
-fn wr_bcpl(block: &mut [u8], off: usize, s: &[u8]) {
+pub(crate) fn wr_bcpl(block: &mut [u8], off: usize, s: &[u8]) {
     block[off] = s.len() as u8;
     block[off + 1..off + 1 + s.len()].copy_from_slice(s);
 }

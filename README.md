@@ -24,16 +24,29 @@ bitmap, and a `validate()` that walks the whole volume and *reports*
 rather than refusing, so a damaged volume still yields everything still
 reachable.
 
-**Creating a volume works** (milestone 2, wave 1): `BlockSink` is the
-write seam — a second trait, so a read-only source is never asked for a
+**Creating a volume works** (milestone 2): `BlockSink` is the write seam
+— a second trait, so a read-only source is never asked for a
 `write_block` it cannot have — and `format()` lays down a fresh, empty,
 valid volume of any variant at any block size: boot block, root, bitmap
 with its extension blocks, and the empty dircache block a `DOS\4`/`DOS\5`
 root carries from birth. xdftool mounts what it writes.
 
-Populating a volume from a host tree, allocating from the bitmap and
-mutating directories are the rest of milestone 2 and milestone 3; see
-`PLAN.md`.
+**Filling one works too**: `Populator` creates directories and files with
+their metadata — every name layout, comments including the `T_COMMENT`
+overflow block, OFS and FFS data blocks, `T_LIST` extension blocks and
+`DOS\4`/`DOS\5` dircache maintenance — and `populate_from_tree()` turns a
+host directory into an image in one call. xdftool lists, reads back and
+writes into what it produces, on all eight variants.
+
+```rust
+let disk = /* anything that is both a BlockSource and a BlockSink */;
+let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"Workbench");
+let disk = amiga_ffs::populate::populate_from_tree(disk, &opts, Path::new("./tree"))?;
+```
+
+`Populator` is append-only, over a volume this crate just formatted;
+**mutating** a volume that already has something in it — delete, rename,
+truncate, append — is milestone 3. See `PLAN.md`.
 
 ## Why this exists
 

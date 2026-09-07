@@ -311,13 +311,45 @@ pub fn pack_bits(
     // end of the volume are left as.
     let mut words = vec![u32::MAX; pages * words_per_page];
     for &lba in allocated {
-        if lba < reserved {
-            continue;
-        }
-        let i = lba - reserved;
-        if let Some(w) = words.get_mut((i / 32) as usize) {
-            *w &= !(1u32 << (i % 32));
+        clear(&mut words, reserved, lba);
+    }
+    words
+}
+
+/// The same packing, from *ranges* of allocated blocks rather than a list.
+///
+/// A populator allocates with a cursor, so what it has in hand at the end
+/// is two runs — the format's own metadata and everything handed out
+/// since — not a list. Enumerating a 2 GB volume's four million allocated
+/// blocks into a `Vec` just to set their bits would cost 32 MB to say
+/// what two `Range`s already say. Overlapping ranges are fine: clearing a
+/// bit twice clears it once.
+pub fn pack_ranges(
+    reserved: u64,
+    block_count: u64,
+    ranges: &[core::ops::Range<u64>],
+    block_size: usize,
+) -> Vec<u32> {
+    let words_per_page = (block_size - OFF_BITMAP_BITS) / 4;
+    let per_page = bitmap_bits_per_block(block_size);
+    let need = block_count.saturating_sub(reserved);
+    let pages = (need / per_page + u64::from(need % per_page != 0)) as usize;
+    let mut words = vec![u32::MAX; pages * words_per_page];
+    for range in ranges {
+        for lba in range.start.max(reserved)..range.end.min(block_count) {
+            clear(&mut words, reserved, lba);
         }
     }
     words
+}
+
+/// Mark one block allocated: clear its bit, because **1 is free**.
+fn clear(words: &mut [u32], reserved: u64, lba: u64) {
+    if lba < reserved {
+        return;
+    }
+    let i = lba - reserved;
+    if let Some(w) = words.get_mut((i / 32) as usize) {
+        *w &= !(1u32 << (i % 32));
+    }
 }

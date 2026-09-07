@@ -128,13 +128,14 @@ of the differential suite that need more than `cargo test` can reach.
 
 ## Milestone 2 — create
 
-**In progress.** Write code with nothing to corrupt: format a fresh volume,
-populate from a host tree, read it straight back. The API Copperline (dynamic
-OFS/FFS drives from directories) and amibake (dir→hdf) actually want.
+**Landed but for the guest-mount proof.** Write code with nothing to
+corrupt: format a fresh volume, populate from a host tree, read it straight
+back. The API Copperline (dynamic OFS/FFS drives from directories) and
+amibake (dir→hdf) actually want.
 
-Wave 1 — the seam, `format()` and CI — is landed. What remains is
-populating a volume that formatting left empty, and the round-trip and
-fuzz work that only has a target once it can be populated.
+Wave 1 was the seam, `format()` and CI; wave 2 is `Populator`, the
+round-trip property tests and the fuzzers. The one box still open needs a
+real ROM, which no `cargo test` can reach.
 
 - [x] **`BlockSink`** mirroring `BlockSource` — the shape amiga-rdb has
       already settled on, adopted verbatim: a *second* trait, not a
@@ -163,12 +164,72 @@ fuzz work that only has a target once it can be populated.
       `DOS\1` and a `DOS\3` ADF this crate formatted, and the two
       implementations' fresh images agree longword for longword bar the
       dates and the root's longword −4.
-- [ ] **Populate from tree**: files, directories, metadata mapping
-      (host mtime → ticks, mode → protection bits), name validation
-      per variant (30 vs 107 bytes, Latin-1, no `:`/`/`).
-- [ ] **Round-trip property tests**: create → read back → tree-equal,
-      for every variant × block size; then create → xdftool reads it →
-      trees match — the independent-implementation proof.
+- [x] **Populate from tree**: `Populator` in `src/populate.rs`, and
+      `populate_from_tree()` on top of it under `std`. Files, directories,
+      protection/comment/date/owner, both name layouts (with the
+      `T_COMMENT` overflow block when a long LNFS name crowds the comment
+      out), OFS and FFS data blocks, `T_LIST` extension blocks, and
+      `DOS\4`/`DOS\5` dircache maintenance. Name validation is
+      `format()`'s own `check_name_bytes`, generalised over the maximum
+      rather than reimplemented — 30 bytes classic, 107 LNFS, Latin-1, no
+      `:`/`/`, no control codes.
+
+      Three decisions worth stating. **The allocator is a cursor**, not a
+      bitmap search: a populator is constructed from the `FormatLayout`
+      the format returned, so the used set is *known* rather than
+      discovered, allocation walks upward from block `reserved` (using the
+      half of the volume that lives *below* the root, which an
+      after-the-root cursor would throw away) stepping over the format's
+      one contiguous run, and the bitmap is written **once** at
+      `finish()`. Nothing here ever decides whether a block on disk is
+      free, so nothing here can decide it wrongly — which is precisely the
+      discipline M3 has to acquire and this milestone gets to skip.
+      **The session is honest about being unfinished**: construction
+      clears the root's `bitmap_flag`, so an interrupted or `abandon()`ed
+      populate leaves a volume saying "my bitmap is mid-update" rather
+      than one claiming blocks are free while files use them; `finish()`
+      restores it last, after the pages it describes are down. **Entries
+      go in at the head of their hash chain**, which is what the oracle
+      does: three names hashing to slot 54 written in order to a `DOS\3`
+      ADF by xdftool come back newest-first, and this crate reproduces
+      that order exactly. Dircache records are appended in creation order
+      into a chain that spills at block boundaries, as xdftool's do, with
+      the one difference that the record's secondary-type byte is filled
+      in where xdftool leaves it zero — strictly more information, and a
+      validator reads a zero there as "not recorded" either way.
+
+      Host metadata maps as documented on `protection_from_metadata`: the
+      owner nibble *denies*, so `u+r`/`u+w`/`u+x` **clear** the R/W/E
+      bits; the D bit is always clear because POSIX governs deletion by
+      the directory's write bit and there is nothing per-file to map; the
+      group and other nibbles grant in the normal sense and are mapped
+      straight through; archive/script/pure/hidden stay clear because they
+      are facts about a backup, a Shell and an Amiga that the host does
+      not have; and the owner longword is **not** derived from the host
+      uid/gid, because truncating one into a 16-bit muFS UID would invent
+      an owner. Names are converted from UTF-8 to Latin-1 where every
+      character fits and refused by name where one does not.
+- [x] **Round-trip property tests**: `tests/volumes.rs` builds a seeded
+      pseudo-random tree (a xorshift written out rather than a dependency
+      taken) for **every variant × {512, 1024, 4096}** — varying depth,
+      name length including past 30 bytes on LNFS and Latin-1 bytes only
+      the intl table folds, file sizes from 0 to ~100 KB so a header's
+      pointer table is crossed where the arithmetic says it must be,
+      comments up to and past what fits beside a name, and random
+      protection/owner/date — writes it, reads it back and compares
+      *every* field, then validates with zero findings. Names are compared
+      byte for byte rather than under the fold table, because case is
+      preserved on disk and a writer that upper-cased what it stored would
+      still pass every lookup.
+
+      The differential leg is in `tests/differential.rs` and runs the
+      other way: this crate populates the fixture tree on all eight
+      variants, xdftool lists it, reads every byte of every file back out
+      (including the one that crosses an extension block), *writes a new
+      file into it* — allocating from the bitmap `finish()` laid down and
+      chaining into a hash table this crate filled — and the result still
+      validates here, dircache agreement included. Same skip-if-absent
+      rule as the rest of that file.
 - [ ] **Guest-mount proof**: an image created here boots/mounts under a
       real Amiga ROM (the consumer that cannot be argued with).
 - [x] **CI**: stable + MSRV 1.63, `--no-default-features`, clippy
@@ -179,13 +240,54 @@ fuzz work that only has a target once it can be populated.
       runs exactly the commands this repository is checked with locally
       — nothing in it is a check the working tree does not already pass.
       **It has not had a live run**: the workflow lands with the code and
-      the first push is its first execution.
-- [ ] **Fuzzing**: parse arbitrary volumes without panic — the hash
-      chains and name lengths specifically, and now also
-      format-then-read round trips with arbitrary trees. In this
-      milestone because the writer gives the fuzzer its second target:
-      not just "does hostile input crash the reader" but "can any tree
-      the writer accepts produce a volume the reader refuses".
+      the first push is its first execution. Wave 2 adds a nightly
+      `cargo fuzz build` job — see the fuzzing box for why it builds and
+      does not run.
+- [x] **Fuzzing**: `fuzz/`, cargo-fuzz, nightly-only, with its own
+      `[workspace]` so `cargo test`, `cargo clippy --all-targets` and the
+      MSRV build never see it. Two targets, because the writer gives the
+      fuzzer a second question:
+
+      - `fuzz_read` takes arbitrary bytes as a volume, opens it, walks
+        every directory, resolves every link, streams every file, reads
+        every comment, dircache, soft link and bitmap, and validates —
+        and must never panic, hang or OOM. Files are read with
+        `read_file_with` and never `read_file`: the convenient form
+        allocates `byte_size` bytes and `byte_size` comes off the disk,
+        which is a documented footgun rather than a bug, and a fuzzer
+        that tripped it would be reporting the documentation. The walk
+        carries its own visited set, because `read_dir` refuses a cycle
+        *within* one directory and a cycle across two is only visible to
+        the walker. The image is capped at 256 KB: the bugs live in block
+        contents, not in block counts.
+      - `fuzz_roundtrip` reads the input as a little tree program and
+        asserts the property this milestone is for — **any tree the
+        writer accepts reads back identical**. `DuplicateName` and
+        `VolumeFull` are skipped because they are the writer working;
+        every other error is a failure, since they are all statements
+        about a caller's input and this caller's input has been made
+        legal by construction.
+
+      Sixty seconds each on the seed corpus: 248 843 runs of `fuzz_read`
+      (958 edges covered) and 42 005 of `fuzz_roundtrip` (1268), no
+      crashes, no timeouts, no OOMs, nothing in `artifacts/`. Nothing
+      needed fixing — which is a statement about the read side's existing
+      chain guards and length clamps rather than about the fuzzer, and
+      the corpus is kept so the next change to either side starts from
+      here rather than from noise. The seed corpus is **generated,
+      not committed** — `cargo run --example seed-corpus` writes one
+      populated volume per variant per block size — for the same reason
+      no ADF is checked into `tests/`: a binary blob in a repository is a
+      thing nobody can review, and one that drifts out of step with the
+      writer that made it is worse than no seed at all.
+
+      CI **builds** the targets on nightly and does not run them. A CI job
+      is the wrong place to find a fuzz bug (a minute of libFuzzer proves
+      nothing; an hour on every push is somebody else's electricity) and
+      exactly the right place to catch the harnesses rotting, which is
+      what happens to code that lives outside the workspace and is
+      therefore never compiled by `cargo test`. The same job runs the
+      corpus generator, so that stays honest too.
 
 ## Milestone 3 — mutate
 

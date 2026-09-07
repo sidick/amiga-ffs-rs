@@ -79,6 +79,30 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Build the fuzz targets, do not run them. A CI job is the wrong place
+  # to *find* a fuzz bug -- sixty seconds of libFuzzer proves nothing and
+  # sixty minutes on every push is somebody else's electricity -- but it
+  # is exactly the right place to catch the targets rotting, which is what
+  # happens to fuzz harnesses that live outside the workspace and are
+  # therefore never compiled by `cargo test`. Nightly is confined to this
+  # job; `fuzz/` has its own `[workspace]`, so nothing here touches the
+  # MSRV or `--no-default-features` builds above.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: ". -> target\nfuzz -> target"
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+      # The seed corpus is generated, never committed -- a checked-in disk
+      # image is a blob nobody can review -- so this also proves the
+      # generator still runs.
+      - run: cargo run --example seed-corpus -- fuzz/corpus/fuzz_read
+
   # The differential suite skips itself when xdftool is absent, so this
   # job exists to make sure it is *not* absent somewhere. It is the only
   # leg that can catch a mistake this crate and its own test builder

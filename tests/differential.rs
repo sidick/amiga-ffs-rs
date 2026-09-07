@@ -63,6 +63,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use amiga_ffs::populate::Populator;
 use amiga_ffs::*;
 
 // ---------------------------------------------------------------------------
@@ -730,4 +731,139 @@ fn our_format_and_the_oracles_agree_block_for_block() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The other direction again: a tree this crate *populated*, read by the oracle
+// ---------------------------------------------------------------------------
+
+/// Build the fixture tree with this crate's own writer and save it.
+///
+/// The same tree `build_image` asks xdftool for, so the two directions
+/// are comparable: same directories, same files, same 40 000-byte file
+/// that must cross an extension block on every variant.
+fn populate_adf(scratch: &Scratch, variant: Variant, label: &str, name: &str) -> PathBuf {
+    let disk = ImageDisk::blank(ADF_BLOCKS);
+    let opts = FormatOptions::new(variant, ADF_BLOCKS, label.as_bytes());
+    let mut pop = Populator::new(disk, &opts).expect("populate");
+    let root = pop.root_lba();
+
+    let meta = Metadata::new();
+    let mut dirs: Vec<(String, u64)> = vec![(String::new(), root)];
+    for dir in FIXTURE_DIRS {
+        let (parent, leaf) = match dir.rsplit_once('/') {
+            Some((p, l)) => (p.to_string(), l),
+            None => (String::new(), dir),
+        };
+        let parent_lba = dirs.iter().find(|(p, _)| *p == parent).expect("parent").1;
+        let lba = pop
+            .create_dir(parent_lba, leaf.as_bytes(), &meta)
+            .expect("create_dir");
+        dirs.push((dir.to_string(), lba));
+    }
+    for (path, bytes) in fixture_files(variant.has_long_names()) {
+        let (parent, leaf) = match path.rsplit_once('/') {
+            Some((p, l)) => (p.to_string(), l),
+            None => (String::new(), path.as_str()),
+        };
+        let parent_lba = dirs.iter().find(|(p, _)| *p == parent).expect("parent").1;
+        pop.create_file(parent_lba, leaf.as_bytes(), &meta, &bytes)
+            .expect("create_file");
+    }
+
+    let disk = pop.finish().expect("finish");
+    let out = scratch.path(name);
+    disk.save(&out);
+    out
+}
+
+#[test]
+fn xdftool_reads_back_a_tree_this_crate_populated() {
+    let argv = oracle!();
+    let scratch = Scratch::new("populated");
+
+    for byte in 0u32..=7 {
+        let variant = Variant::from_dostype(0x444F_5300 | byte).unwrap();
+        let image = populate_adf(&scratch, variant, "Written", &format!("ours{byte}.adf"));
+        let path = image.to_str().unwrap();
+
+        // The listing: an implementation sharing no code with this one
+        // walks our hash chains, our extension blocks and (on DOS\4 and
+        // DOS\5) our dircaches, and finds every name.
+        let listing = run(&argv, &[path, "list"]);
+        for dir in FIXTURE_DIRS {
+            let leaf = dir.rsplit('/').next().unwrap();
+            assert!(
+                listing.contains(leaf),
+                "{variant:?}: xdftool did not list {dir}:\n{listing}"
+            );
+        }
+
+        // Every byte of every file, back out through the oracle's reader.
+        // This is the claim the round-trip tests structurally cannot make:
+        // the bytes are checked by code that did not write them.
+        for (file, bytes) in fixture_files(variant.has_long_names()) {
+            assert!(
+                listing.contains(file.rsplit('/').next().unwrap()),
+                "{variant:?}: {file} missing from:\n{listing}"
+            );
+            let back = scratch.path("back");
+            run(&argv, &[path, "read", &file, back.to_str().unwrap()]);
+            assert_eq!(
+                std::fs::read(&back).unwrap(),
+                bytes,
+                "{variant:?}: xdftool read {file} differently"
+            );
+            let _ = std::fs::remove_file(&back);
+        }
+
+        // And the oracle can still *write* into it: it allocates from the
+        // bitmap `finish()` laid down and chains into a hash table we
+        // filled, which is the strongest statement about both.
+        let host = scratch.path("payload");
+        let payload = pattern(9000);
+        std::fs::write(&host, &payload).unwrap();
+        run(&argv, &[path, "write", host.to_str().unwrap(), "Added"]);
+        let back = scratch.path("added");
+        run(&argv, &[path, "read", "Added", back.to_str().unwrap()]);
+        assert_eq!(std::fs::read(&back).unwrap(), payload, "{variant:?}");
+
+        // ...and the result still validates through this crate, dircache
+        // agreement included.
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after xdftool added a file: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn the_oracles_free_space_accounting_agrees_with_the_populators() {
+    let argv = oracle!();
+    let scratch = Scratch::new("accounting");
+    let image = populate_adf(&scratch, Variant::FfsIntl, "Counted", "counted.adf");
+
+    let info = run(&argv, &[image.to_str().unwrap(), "info"]);
+    let used: u64 = info
+        .split_whitespace()
+        .skip_while(|w| *w != "used:")
+        .nth(1)
+        .expect("a used count")
+        .parse()
+        .expect("a number");
+
+    let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+    let bm = vol.read_bitmap().unwrap();
+    assert!(bm.valid(), "finish() restores the bitmap flag");
+    // The two boot blocks are used but have no bit, which is why the
+    // difference is exactly two and not zero.
+    assert_eq!(bm.allocated_count() + 2, used, "\n{info}");
+    assert!(vol.validate().is_clean());
 }

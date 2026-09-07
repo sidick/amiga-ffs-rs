@@ -2907,3 +2907,829 @@ fn a_formatted_volume_is_the_shape_the_oracle_writes() {
         .collect();
     assert_eq!(clear, vec![880, 881]);
 }
+
+// ---------------------------------------------------------------------------
+// Populating
+// ---------------------------------------------------------------------------
+
+/// A seeded xorshift64*, so every tree below is the same tree on every
+/// machine and a failure names a case somebody can reproduce.
+///
+/// No dependency, on purpose: a crate whose selling point is having none
+/// does not acquire one for a test's random numbers, and a generator
+/// whose sequence is fixed here is a generator that cannot change under a
+/// `cargo update`.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform enough in `0..n` for generating test data.
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// The tree a round trip is checked against: what was asked for, kept
+/// separately from what the volume then contains.
+#[derive(Debug, Clone)]
+enum Node {
+    Dir {
+        name: Vec<u8>,
+        meta: OwnedMeta,
+        children: Vec<Node>,
+    },
+    File {
+        name: Vec<u8>,
+        meta: OwnedMeta,
+        data: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct OwnedMeta {
+    protection: u32,
+    comment: Vec<u8>,
+    date: DateStamp,
+    owner: u32,
+}
+
+impl OwnedMeta {
+    fn borrow(&self) -> amiga_ffs::Metadata<'_> {
+        amiga_ffs::Metadata::new()
+            .protection(self.protection)
+            .comment(&self.comment)
+            .date(self.date)
+            .owner(self.owner)
+    }
+}
+
+impl Node {
+    fn name(&self) -> &[u8] {
+        match self {
+            Self::Dir { name, .. } | Self::File { name, .. } => name,
+        }
+    }
+}
+
+/// Every byte a name may legally hold, including the Latin-1 half that
+/// only the intl fold table folds — which is exactly where a volume
+/// written with the wrong `toupper` stops finding its own files.
+const NAME_ALPHABET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .-_\xE9\xC9\xE0\xFF\xDF";
+
+fn random_name(rng: &mut Rng, max: usize, used: &[Vec<u8>], fold: fn(u8) -> u8) -> Vec<u8> {
+    loop {
+        // Weighted towards short names, but reaching the variant's limit
+        // often enough to matter: on LNFS that means names past 30, the
+        // ones a classic-offset writer cannot store at all.
+        let len = 1 + rng.below(max);
+        let name: Vec<u8> = (0..len)
+            .map(|_| NAME_ALPHABET[rng.below(NAME_ALPHABET.len())])
+            .collect();
+        // A trailing space is legal on disk but not worth the argument;
+        // duplicates under the volume's own fold are refused by the
+        // writer, so the generator must not produce them.
+        if name.last() == Some(&b' ') || name.first() == Some(&b' ') {
+            continue;
+        }
+        if used.iter().any(|u| names_equal(u, &name, fold)) {
+            continue;
+        }
+        return name;
+    }
+}
+
+fn random_meta(rng: &mut Rng, max_comment: usize) -> OwnedMeta {
+    let clen = rng.below(max_comment + 1);
+    OwnedMeta {
+        // The whole longword, group and other nibbles included: they are
+        // first-class on every variant here, so a writer that dropped
+        // them would be caught.
+        protection: rng.next() as u32 & 0x00FF_FFFF,
+        comment: (0..clen)
+            .map(|_| NAME_ALPHABET[rng.below(NAME_ALPHABET.len())])
+            .collect(),
+        date: DateStamp {
+            days: (rng.below(20_000)) as u32,
+            mins: (rng.below(1440)) as u32,
+            ticks: (rng.below(3000)) as u32,
+        },
+        owner: rng.next() as u32,
+    }
+}
+
+/// Grow a tree with a byte budget, so the same generator produces a tree
+/// that fits at 512 bytes a block and at 4096.
+fn random_tree(rng: &mut Rng, variant: Variant, depth: usize, budget: &mut usize) -> Vec<Node> {
+    let max_name = if variant.has_long_names() {
+        MAX_NAME_LONG
+    } else {
+        MAX_NAME_CLASSIC
+    };
+    let fold = variant.fold();
+    let mut used: Vec<Vec<u8>> = Vec::new();
+    let mut out = Vec::new();
+    let count = 1 + rng.below(if depth == 0 { 6 } else { 4 });
+    for _ in 0..count {
+        let name = random_name(rng, max_name, &used, fold);
+        used.push(name.clone());
+        let meta = random_meta(rng, COMMENT_MAX);
+        if depth < 3 && rng.below(3) == 0 {
+            let children = random_tree(rng, variant, depth + 1, budget);
+            out.push(Node::Dir {
+                name,
+                meta,
+                children,
+            });
+        } else {
+            // Sizes reaching ~100 KB: enough to cross an extension block
+            // at 512 and 1024 bytes a block, and to include the empty
+            // file and the one-byte file that are their own edge cases.
+            let want = match rng.below(8) {
+                0 => 0,
+                1 => 1,
+                2 => 1 + rng.below(600),
+                3..=5 => rng.below(20_000),
+                _ => 40_000 + rng.below(60_000),
+            };
+            let len = want.min(*budget);
+            *budget -= len;
+            out.push(Node::File {
+                name,
+                meta,
+                data: pattern(len),
+            });
+        }
+    }
+    out
+}
+
+fn write_tree<S: amiga_ffs::BlockMedium>(pop: &mut Populator<S>, dir: u64, nodes: &[Node])
+where
+    amiga_ffs::populate::Transport<S>: std::fmt::Debug,
+{
+    for node in nodes {
+        match node {
+            Node::Dir {
+                name,
+                meta,
+                children,
+            } => {
+                let lba = pop
+                    .create_dir(dir, name, &meta.borrow())
+                    .unwrap_or_else(|e| panic!("create_dir {:?}: {e:?}", Latin1(name)));
+                write_tree(pop, lba, children);
+            }
+            Node::File { name, meta, data } => {
+                pop.create_file(dir, name, &meta.borrow(), data)
+                    .unwrap_or_else(|e| panic!("create_file {:?}: {e:?}", Latin1(name)));
+            }
+        }
+    }
+}
+
+/// Latin-1 bytes in a panic message, escaped rather than lossily decoded.
+struct Latin1<'a>(&'a [u8]);
+
+impl std::fmt::Debug for Latin1<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", String::from_utf8_lossy(self.0))
+    }
+}
+
+/// Read the tree back and compare it, field by field, to what was asked
+/// for. Names are compared **byte for byte**, not under the fold table:
+/// case is preserved on disk, and a writer that upper-cased what it
+/// stored would still pass every lookup.
+fn check_tree(vol: &mut Volume<MemDisk>, dir: u64, nodes: &[Node], path: &str) {
+    let listed = vol.read_dir(dir).expect("read_dir");
+    assert_eq!(
+        listed.len(),
+        nodes.len(),
+        "{path}: entry count ({:?} vs asked for {:?})",
+        listed.iter().map(|e| Latin1(&e.name)).collect::<Vec<_>>(),
+        nodes.iter().map(|n| Latin1(n.name())).collect::<Vec<_>>()
+    );
+
+    for node in nodes {
+        let name = node.name();
+        let entry = vol
+            .lookup(dir, name)
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{path}: {:?} not found by hash lookup", Latin1(name)));
+        assert_eq!(entry.name, name, "{path}: name is not case-preserved");
+        assert_eq!(entry.parent as u64, dir, "{path}/{:?}", Latin1(name));
+
+        let (meta, kind) = match node {
+            Node::Dir { meta, .. } => (meta, EntryKind::Directory),
+            Node::File { meta, .. } => (meta, EntryKind::File),
+        };
+        assert_eq!(entry.kind, kind, "{path}/{:?}", Latin1(name));
+        assert_eq!(
+            entry.protection,
+            meta.protection,
+            "{path}/{:?} protection",
+            Latin1(name)
+        );
+        assert_eq!(entry.owner, meta.owner, "{path}/{:?} owner", Latin1(name));
+        assert_eq!(entry.date, meta.date, "{path}/{:?} date", Latin1(name));
+        // Through `comment()`, which is the only accessor that is right
+        // in both places a comment can live -- an empty inline comment on
+        // an LNFS volume does not mean there isn't one.
+        assert_eq!(
+            vol.comment(&entry).expect("comment"),
+            meta.comment,
+            "{path}/{:?} comment",
+            Latin1(name)
+        );
+
+        let sub = format!("{path}/{}", String::from_utf8_lossy(name));
+        match node {
+            Node::Dir { children, .. } => check_tree(vol, entry.lba, children, &sub),
+            Node::File { data, .. } => {
+                assert_eq!(entry.byte_size as usize, data.len(), "{sub} size");
+                assert_eq!(&vol.read_file(entry.lba).expect("read_file"), data, "{sub}");
+            }
+        }
+    }
+}
+
+fn biggest_file(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            Node::Dir { children, .. } => biggest_file(children),
+            Node::File { data, .. } => data.len(),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn count_nodes(nodes: &[Node]) -> (u64, u64) {
+    let (mut dirs, mut files) = (0, 0);
+    for node in nodes {
+        match node {
+            Node::Dir { children, .. } => {
+                dirs += 1;
+                let (d, f) = count_nodes(children);
+                dirs += d;
+                files += f;
+            }
+            Node::File { .. } => files += 1,
+        }
+    }
+    (dirs, files)
+}
+
+/// The property this whole milestone is for: for every variant at every
+/// block size, a tree written by this crate reads back identical and the
+/// volume validates with zero findings.
+#[test]
+fn a_populated_volume_round_trips_on_every_variant_and_block_size() {
+    for (v, variant) in ALL_VARIANTS.into_iter().enumerate() {
+        for (b, bs) in [512usize, 1024, 4096].into_iter().enumerate() {
+            // 8 MB of volume whatever the block size, so a 100 KB file is
+            // never the thing that runs it out of space.
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut rng = Rng::new(0x5EED_0000 + (v * 16 + b) as u64);
+            let mut budget = 700_000usize;
+            let tree = random_tree(&mut rng, variant, 0, &mut budget);
+
+            let disk = MemDisk::filled(bs, nblocks, 0xA5);
+            let opts = FormatOptions::new(variant, nblocks, b"Populated");
+            let mut pop = Populator::new(disk, &opts).expect("populate");
+            let root = pop.root_lba();
+            write_tree(&mut pop, root, &tree);
+            let used = pop.blocks_used();
+            let disk = pop.finish().expect("finish");
+
+            let mut vol = Volume::open_with(disk, None, nblocks, 2).expect("open");
+            assert_eq!(vol.variant(), variant);
+            check_tree(&mut vol, root, &tree, "");
+
+            let report = vol.validate();
+            assert!(
+                report.is_clean(),
+                "{variant:?} @{bs}: {:#?}",
+                report
+                    .findings
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+            );
+            let (dirs, files) = count_nodes(&tree);
+            let s = report.summary;
+            assert_eq!(s.directories, dirs + 1, "{variant:?} @{bs}");
+            assert_eq!(s.files, files, "{variant:?} @{bs}");
+            // Reachable, allocated and the populator's own count are three
+            // independent tallies of the same fact.
+            assert_eq!(s.reachable, s.allocated, "{variant:?} @{bs}");
+            assert_eq!(s.allocated, used, "{variant:?} @{bs}");
+            assert_eq!(s.orphans, 0);
+            assert_eq!(s.reachable_but_free, 0);
+            assert_eq!(
+                s.dircache_blocks > 0,
+                variant.has_dircache(),
+                "{variant:?} @{bs}"
+            );
+            // Extension blocks appear exactly when a file outgrows one
+            // header's pointer table -- 36 KB of FFS data at 512 bytes a
+            // block, 3.9 MB at 4096 -- so the assertion is the arithmetic,
+            // not a constant. It is here rather than at a fixed block size
+            // because "the writer never needed an extension block" is the
+            // way this test would silently stop testing them.
+            let table_span = hash_table_size(bs) as usize * data_payload_size(bs, variant.is_ffs());
+            assert_eq!(
+                s.extension_blocks >= 1,
+                biggest_file(&tree) > table_span,
+                "{variant:?} @{bs}: {} extension blocks for a {}-byte file, table span {table_span}",
+                s.extension_blocks,
+                biggest_file(&tree)
+            );
+
+            // And the bitmap the single `finish()` pass wrote is valid
+            // again -- the flag was 0 for the whole session.
+            let bm = vol.read_bitmap().unwrap();
+            assert!(bm.valid());
+            assert!(bm.covers_whole_volume());
+            assert_eq!(bm.allocated_count(), used);
+        }
+    }
+}
+
+/// While a populator is running the volume says so: the bitmap flag is 0,
+/// which is what stops anything else allocating out from under it.
+#[test]
+fn an_unfinished_populate_leaves_the_bitmap_marked_untrustworthy() {
+    let nblocks = 1760;
+    let disk = MemDisk::blank(512, nblocks);
+    let opts = FormatOptions::new(Variant::FfsIntl, nblocks, b"Interrupted");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    pop.create_file(root, b"Half", &amiga_ffs::Metadata::new(), &pattern(5000))
+        .unwrap();
+    // Abandoned, not finished: what an interrupted image build leaves.
+    let disk = pop.abandon();
+
+    let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    let bm = vol.read_bitmap().unwrap();
+    assert!(
+        !bm.valid(),
+        "an interrupted populate must not claim a valid bitmap"
+    );
+    // The file itself is entirely there -- the data went down before
+    // anything pointed at it, and the header before the parent's slot.
+    let half = vol.lookup(root, b"Half").unwrap().unwrap().lba;
+    assert_eq!(vol.read_file(half).unwrap(), pattern(5000));
+    let report = vol.validate();
+    // The one finding is the flag itself; the allocated/free comparison
+    // that would otherwise produce noise is skipped, because comparing a
+    // trustworthy walk against an untrusted bitmap means nothing.
+    assert_eq!(
+        report.findings.len(),
+        1,
+        "{:#?}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(report.findings[0], Finding::BitmapInvalid));
+}
+
+/// A helper for the targeted cases below: a small volume, populated by a
+/// closure, finished, and reopened.
+fn populated(
+    variant: Variant,
+    bs: usize,
+    nblocks: u64,
+    build: impl FnOnce(&mut Populator<MemDisk>),
+) -> Volume<MemDisk> {
+    let disk = MemDisk::filled(bs, nblocks, 0xA5);
+    let opts = FormatOptions::new(variant, nblocks, b"Target");
+    let mut pop = Populator::new(disk, &opts).expect("format");
+    build(&mut pop);
+    let disk = pop.finish().expect("finish");
+    Volume::open_with(disk, None, nblocks, 2).expect("open")
+}
+
+/// Head insertion, matching the oracle. Three names that hash to the same
+/// slot, written in order: xdftool's `DOS\3` ADF has the *last* one in the
+/// root's hash slot and the first at the end of the chain, and so does
+/// this crate's.
+#[test]
+fn a_new_entry_goes_in_at_the_head_of_its_chain_as_the_oracle_does() {
+    // AAA, AEU and AFH all hash to slot 54 of a 72-slot table.
+    let t = hash_table_size(512);
+    for n in [&b"AAA"[..], b"AEU", b"AFH"] {
+        assert_eq!(name_hash(n, intl_toupper, t), 54, "{:?}", n);
+    }
+
+    let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        for name in [&b"AAA"[..], b"AEU", b"AFH"] {
+            pop.create_file(root, name, &amiga_ffs::Metadata::new(), b"a")
+                .unwrap();
+        }
+    });
+
+    let root = vol.root_lba();
+    let head = vol.root().hash_table[54];
+    let mut order = Vec::new();
+    let mut next = head;
+    while next != 0 {
+        let e = vol.entry_at(next as u64).unwrap();
+        order.push(e.name.clone());
+        next = e.hash_chain;
+    }
+    assert_eq!(
+        order,
+        vec![b"AFH".to_vec(), b"AEU".to_vec(), b"AAA".to_vec()],
+        "newest first, as xdftool's own chains come out"
+    );
+    // All three are still findable by name, which is the only thing the
+    // chain order has to preserve.
+    for name in [&b"AAA"[..], b"AEU", b"AFH"] {
+        assert!(vol.lookup(root, name).unwrap().is_some());
+    }
+    assert!(vol.validate().is_clean());
+}
+
+/// The LNFS trap, from the writing side: a name past 30 bytes goes in the
+/// merged `NaC` field, and a comment that will not fit beside it goes to
+/// its own `T_COMMENT` block with the inline copy left empty.
+#[test]
+fn an_lnfs_long_name_and_an_overflowing_comment_land_where_the_format_puts_them() {
+    let name: Vec<u8> = (0..100).map(|i| b'a' + (i % 26) as u8).collect();
+    let comment: Vec<u8> = (0..COMMENT_MAX).map(|i| b'A' + (i % 26) as u8).collect();
+    assert!(1 + name.len() + 1 + comment.len() > NAC_LEN);
+
+    let mut vol = populated(Variant::FfsIntlLongname, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        let meta = amiga_ffs::Metadata::new().comment(&comment);
+        pop.create_file(root, &name, &meta, b"contents").unwrap();
+        // A short comment beside a short name stays inline, which is the
+        // other half of the decision.
+        let meta = amiga_ffs::Metadata::new().comment(b"inline");
+        pop.create_dir(root, b"Short", &meta).unwrap();
+    });
+
+    let root = vol.root_lba();
+    let long = vol.lookup(root, &name).unwrap().expect("found by hash");
+    assert_eq!(long.name, name, "the whole 100-byte name is stored");
+    assert!(
+        long.comment.is_empty() && long.comment_block != 0,
+        "an overflowed comment leaves the inline field empty and longword -18 set"
+    );
+    assert_eq!(vol.comment(&long).unwrap(), comment);
+    assert_eq!(vol.read_file(long.lba).unwrap(), b"contents");
+
+    let short = vol.lookup(root, b"Short").unwrap().unwrap();
+    assert_eq!(short.comment, b"inline");
+    assert_eq!(short.comment_block, 0);
+    assert!(vol.validate().is_clean());
+}
+
+/// Dircache maintenance on `DOS\4`/`DOS\5`: a record per entry, spilling
+/// into a chained block, and the validator finding nothing stale.
+#[test]
+fn a_dircache_volume_gets_its_caches_written_as_it_is_populated() {
+    // Enough entries with long names and comments to need more than one
+    // cache block: at 512 bytes a block holds 488 bytes of records.
+    let count = 40;
+    let mut vol = populated(Variant::FfsIntlDircache, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        let sub = pop
+            .create_dir(root, b"Sub", &amiga_ffs::Metadata::new())
+            .unwrap();
+        for i in 0..count {
+            let name = format!("entry-number-{i:04}");
+            let meta = amiga_ffs::Metadata::new().comment(b"a comment of some length");
+            pop.create_file(root, name.as_bytes(), &meta, b"x").unwrap();
+        }
+        pop.create_file(sub, b"Nested", &amiga_ffs::Metadata::new(), b"y")
+            .unwrap();
+    });
+
+    let root = vol.root_lba();
+    let cache = vol.read_dircache(root).unwrap();
+    assert!(
+        cache.blocks.len() > 1,
+        "{} records must spill past one cache block",
+        cache.records.len()
+    );
+    assert_eq!(cache.records.len(), count + 1);
+    // A directory created here has its own cache from birth, as one
+    // xdftool creates does.
+    let sub = vol.lookup(root, b"Sub").unwrap().unwrap();
+    assert_ne!(vol.dircache_head(sub.lba).unwrap(), 0);
+    assert_eq!(vol.read_dircache(sub.lba).unwrap().records.len(), 1);
+
+    // And the whole-volume walk, which compares every record against the
+    // chains six ways, reports nothing.
+    let report = vol.validate();
+    assert!(
+        report.is_clean(),
+        "{:#?}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    );
+    // The record's type byte is filled in, where xdftool leaves it zero.
+    assert!(cache
+        .records
+        .iter()
+        .all(|r| r.entry_type == ST_FILE as i8 || r.entry_type == ST_USERDIR as i8));
+}
+
+#[test]
+fn a_duplicate_name_is_refused_under_the_volumes_own_fold_table() {
+    for (variant, second, refused) in [
+        // Classic folding is ASCII-only, so `caf\xE9` and `CAF\xC9` are
+        // different names on DOS\1 and the same name on DOS\3.
+        (Variant::Ffs, &b"CAF\xC9"[..], false),
+        (Variant::FfsIntl, &b"CAF\xC9"[..], true),
+        (Variant::Ffs, &b"CAF\xE9"[..], true),
+    ] {
+        let disk = MemDisk::blank(512, 1760);
+        let opts = FormatOptions::new(variant, 1760, b"Dupes");
+        let mut pop = Populator::new(disk, &opts).unwrap();
+        let root = pop.root_lba();
+        pop.create_dir(root, b"caf\xE9", &amiga_ffs::Metadata::new())
+            .unwrap();
+        let again = pop.create_file(root, second, &amiga_ffs::Metadata::new(), b"x");
+        assert_eq!(
+            again.is_err(),
+            refused,
+            "{variant:?} + {:?}",
+            String::from_utf8_lossy(second)
+        );
+        if refused {
+            assert!(matches!(again, Err(PopulateError::DuplicateName { .. })));
+        }
+        // Refused *before* anything was written, so the volume is still
+        // whole either way.
+        let disk = pop.finish().unwrap();
+        let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+        assert!(vol.validate().is_clean());
+    }
+}
+
+#[test]
+fn names_and_comments_are_checked_per_variant() {
+    let disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"Checked");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    let meta = amiga_ffs::Metadata::new();
+
+    assert!(matches!(
+        pop.create_dir(root, b"", &meta),
+        Err(PopulateError::NameEmpty)
+    ));
+    assert!(matches!(
+        pop.create_dir(root, &[b'x'; 31], &meta),
+        Err(PopulateError::NameTooLong { len: 31, max: 30 })
+    ));
+    for bad in [b':', b'/', 0x00, 0x0A, 0x7F] {
+        assert!(matches!(
+            pop.create_dir(root, &[b'A', bad], &meta),
+            Err(PopulateError::NameInvalidByte { index: 1, .. })
+        ));
+    }
+    // Latin-1 is a name and stays one.
+    assert!(pop.create_dir(root, b"Caf\xE9", &meta).is_ok());
+    let long = vec![b'c'; COMMENT_MAX + 1];
+    assert!(matches!(
+        pop.create_dir(
+            root,
+            b"Commented",
+            &amiga_ffs::Metadata::new().comment(&long)
+        ),
+        Err(PopulateError::CommentTooLong { max: 79, .. })
+    ));
+
+    // 107 bytes is a name on DOS\7 and not on DOS\3 -- the one limit that
+    // moves with the variant.
+    let disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::FfsIntlLongname, 1760, b"Long");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    assert!(pop.create_dir(root, &[b'x'; MAX_NAME_LONG], &meta).is_ok());
+    assert!(matches!(
+        pop.create_dir(root, &[b'y'; MAX_NAME_LONG + 1], &meta),
+        Err(PopulateError::NameTooLong { max: 107, .. })
+    ));
+}
+
+#[test]
+fn creating_in_something_that_is_not_a_directory_is_refused() {
+    let disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"NotDir");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    let file = pop
+        .create_file(root, b"File", &amiga_ffs::Metadata::new(), b"x")
+        .unwrap();
+    assert!(matches!(
+        pop.create_dir(file, b"Nope", &amiga_ffs::Metadata::new()),
+        Err(PopulateError::NotADirectory { .. })
+    ));
+    assert!(matches!(
+        pop.create_dir(9_999, b"Nope", &amiga_ffs::Metadata::new()),
+        Err(PopulateError::LbaOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn a_volume_that_runs_out_of_blocks_says_so_rather_than_writing_past_the_end() {
+    // The smallest volume that formats at all: root at 2, one bitmap page
+    // at 3, and two blocks left over.
+    let disk = MemDisk::blank(512, 6);
+    let opts = FormatOptions::new(Variant::Ffs, 6, b"Tiny");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    assert_eq!(pop.blocks_free(), 2);
+    pop.create_dir(root, b"A", &amiga_ffs::Metadata::new())
+        .unwrap();
+    assert!(matches!(
+        pop.create_file(root, b"B", &amiga_ffs::Metadata::new(), &[0u8; 600]),
+        Err(PopulateError::VolumeFull { block_count: 6 })
+    ));
+}
+
+#[test]
+fn the_allocator_uses_the_half_of_the_volume_below_the_root() {
+    // The root sits at the midpoint, so an allocator that started after
+    // it would throw away half the disk. This one starts at the first
+    // block the bitmap covers and steps over the format's own run.
+    let mut vol = populated(Variant::Ffs, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Big", &amiga_ffs::Metadata::new(), &pattern(600_000))
+            .unwrap();
+    });
+    let bm = vol.read_bitmap().unwrap();
+    let allocated: Vec<u64> = bm.allocated().collect();
+    assert_eq!(
+        allocated[0], 2,
+        "allocation starts at the first covered block"
+    );
+    assert!(
+        allocated.iter().any(|&b| b > 881),
+        "and runs past the format's own blocks"
+    );
+    assert!(vol.validate().is_clean());
+}
+
+#[test]
+fn a_deeply_nested_tree_round_trips() {
+    let depth = 40;
+    let mut vol = populated(Variant::FfsIntlDircache, 512, 1760, |pop| {
+        let mut here = pop.root_lba();
+        for i in 0..depth {
+            here = pop
+                .create_dir(
+                    here,
+                    format!("d{i}").as_bytes(),
+                    &amiga_ffs::Metadata::new(),
+                )
+                .unwrap();
+        }
+        pop.create_file(here, b"Bottom", &amiga_ffs::Metadata::new(), b"deep")
+            .unwrap();
+    });
+    let root = vol.root_lba();
+    let mut path = String::new();
+    for i in 0..depth {
+        path.push_str(&format!("d{i}/"));
+    }
+    path.push_str("Bottom");
+    let entry = vol.lookup_path(root, path.as_bytes()).unwrap().unwrap();
+    assert_eq!(vol.read_file(entry.lba).unwrap(), b"deep");
+    assert!(vol.validate().is_clean());
+}
+
+/// The `std` layer: a host directory becomes an image, with mtimes and
+/// modes mapped and non-Latin-1 names refused by name.
+#[test]
+#[cfg(feature = "std")]
+fn a_host_tree_becomes_a_volume() {
+    let dir = std::env::temp_dir().join(format!("amiga-ffs-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("S")).unwrap();
+    std::fs::write(dir.join("S/Startup-Sequence"), b"Echo \"hi\"\n").unwrap();
+    std::fs::write(dir.join("big.dat"), pattern(50_000)).unwrap();
+    std::fs::write(dir.join("empty"), b"").unwrap();
+
+    let nblocks = 1760;
+    let disk = MemDisk::blank(512, nblocks);
+    let opts = FormatOptions::new(Variant::FfsIntl, nblocks, b"FromTree");
+    let disk = amiga_ffs::populate::populate_from_tree(disk, &opts, &dir).expect("populate");
+
+    let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    let root = vol.root_lba();
+    let e = vol
+        .lookup_path(root, b"S/Startup-Sequence")
+        .unwrap()
+        .unwrap();
+    assert_eq!(vol.read_file(e.lba).unwrap(), b"Echo \"hi\"\n");
+    let e = vol.lookup(root, b"big.dat").unwrap().unwrap();
+    assert_eq!(vol.read_file(e.lba).unwrap(), pattern(50_000));
+    let e = vol.lookup(root, b"empty").unwrap().unwrap();
+    assert_eq!(e.byte_size, 0);
+    // A host mtime is not the epoch, so the mapping did something.
+    assert!(e.date.days > 17_000, "a host mtime maps to a real date");
+    assert!(vol.validate().is_clean());
+
+    // A name that is not Latin-1 is refused, and the error names the file.
+    std::fs::write(dir.join("\u{4F60}\u{597D}"), b"x").unwrap();
+    let disk = MemDisk::blank(512, nblocks);
+    let err = match amiga_ffs::populate::populate_from_tree(disk, &opts, &dir) {
+        Ok(_) => panic!("a name that is not Latin-1 must be refused"),
+        Err(e) => e,
+    };
+    match &err {
+        PopulateError::HostNameNotLatin1 { path } => {
+            assert!(path.to_string_lossy().contains('\u{4F60}'));
+        }
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The host-metadata mapping, stated as assertions rather than only as a
+/// table in the docs: the executable bit clears the E *denial*, and a
+/// missing read bit sets the R denial.
+#[test]
+#[cfg(all(unix, feature = "std"))]
+fn the_host_mode_mapping_is_the_one_documented() {
+    use amiga_ffs::meta::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("amiga-ffs-modes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m");
+    std::fs::write(&path, b"x").unwrap();
+
+    let protection = |mode: u32| {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let md = std::fs::metadata(&path).unwrap();
+        Protection::from_bits(amiga_ffs::populate::protection_from_metadata(&md))
+    };
+
+    // rw-------: the owner may read, write and delete, and not execute.
+    let p = protection(0o600);
+    assert!(p.readable() && p.writable() && p.deletable() && !p.executable());
+    assert!(!p.group_readable() && !p.other_readable());
+    // rwx------: the host's x bit *removes* the E denial.
+    assert!(protection(0o700).executable());
+    // ---------: everything denied but delete, which POSIX has no
+    // per-file bit for and which is therefore always allowed.
+    let p = protection(0o000);
+    assert!(!p.readable() && !p.writable() && !p.executable() && p.deletable());
+    // The group and other nibbles read the *normal* way round.
+    let p = protection(0o644);
+    assert!(p.group_readable() && p.other_readable());
+    assert!(!p.group_writable() && !p.other_writable());
+    assert!(!p.archived() && !p.script() && !p.pure() && !p.hidden());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn a_host_timestamp_maps_onto_the_amigados_epoch() {
+    use amiga_ffs::populate::datestamp_from_system_time;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // 1978-01-01 00:00:00 UTC is day 0.
+    let epoch =
+        UNIX_EPOCH + Duration::from_secs(amiga_ffs::meta::AMIGA_EPOCH_UNIX_DAYS as u64 * 86_400);
+    assert_eq!(datestamp_from_system_time(epoch), DateStamp::default());
+    // A second later is a second later, in ticks.
+    let d = datestamp_from_system_time(epoch + Duration::from_secs(3661));
+    assert_eq!((d.days, d.mins, d.ticks), (0, 61, 50));
+    // Anything before 1978 has no representation, and becomes the epoch
+    // rather than a wrapped number that looks like a date.
+    assert_eq!(datestamp_from_system_time(UNIX_EPOCH), DateStamp::default());
+    assert_eq!(
+        datestamp_from_system_time(UNIX_EPOCH - Duration::from_secs(86_400)),
+        DateStamp::default()
+    );
+}

@@ -1,0 +1,36 @@
+# Deliberately its own workspace. `cargo-fuzz` requires nightly and pulls
+# in `libfuzzer-sys`, and neither belongs in the dependency graph of a
+# crate whose selling points are "no dependencies" and "builds on 1.63".
+# The empty `[workspace]` table below is what keeps `cargo test`,
+# `cargo clippy --all-targets` and the MSRV build in the parent directory
+# from ever seeing this package.
+[package]
+name = "amiga-ffs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.amiga-ffs]
+path = ".."
+
+[[bin]]
+name = "fuzz_read"
+path = "fuzz_targets/fuzz_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_roundtrip"
+path = "fuzz_targets/fuzz_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
