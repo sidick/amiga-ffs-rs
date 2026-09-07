@@ -128,14 +128,14 @@ of the differential suite that need more than `cargo test` can reach.
 
 ## Milestone 2 — create
 
-**Landed but for the guest-mount proof.** Write code with nothing to
-corrupt: format a fresh volume, populate from a host tree, read it straight
-back. The API Copperline (dynamic OFS/FFS drives from directories) and
-amibake (dir→hdf) actually want.
+**Landed.** Write code with nothing to corrupt: format a fresh volume,
+populate from a host tree, read it straight back. The API Copperline
+(dynamic OFS/FFS drives from directories) and amibake (dir→hdf) actually
+want.
 
-Wave 1 was the seam, `format()` and CI; wave 2 is `Populator`, the
-round-trip property tests and the fuzzers. The one box still open needs a
-real ROM, which no `cargo test` can reach.
+Wave 1 was the seam, `format()` and CI; wave 2 `Populator`, the
+round-trip property tests and the fuzzers; the guest-mount proof closed
+it under a real Kickstart 3.1.
 
 - [x] **`BlockSink`** mirroring `BlockSource` — the shape amiga-rdb has
       already settled on, adopted verbatim: a *second* trait, not a
@@ -230,8 +230,26 @@ real ROM, which no `cargo test` can reach.
       chaining into a hash table this crate filled — and the result still
       validates here, dircache agreement included. Same skip-if-absent
       rule as the rest of that file.
-- [ ] **Guest-mount proof**: an image created here boots/mounts under a
+- [x] **Guest-mount proof**: an image created here boots/mounts under a
       real Amiga ROM (the consumer that cannot be argued with).
+      Done under Kickstart 3.1 (A1200) booting Workbench 3.1, via a
+      deterministic headless Copperline run: `examples/guest-adf.rs`
+      builds a `DOS\3` ADF (formatted and populated entirely by this
+      crate — a comment, a 40 000-byte extension-block crosser, a
+      Latin-1 `Café-Latin1` name), the volume appears on the Workbench
+      desktop by name, and an AmigaShell `list df1: all` +
+      `type df1:readme` through the ROM's own FFS handler lists every
+      entry with sizes, comment and protection intact and prints the
+      file's content — the lowercase `readme` resolving against the
+      stored `ReadMe` proving the guest's intl fold agrees with ours.
+      Mount is *not* boot: the image is deliberately non-bootable
+      (`format()` leaves the boot checksum zero, as `Format` does;
+      `Install` is a different program), so Workbench boots from df0
+      and the proof volume rides df1. Reproduce with
+      `cargo run --example guest-adf -- proof.adf` and a scripted
+      `copperline --model A1200 <KS3.1 ROM> --insert-disk-after 0 df1
+      proof.adf ...` — deterministic, so the same script yields the
+      same screenshots.
 - [x] **CI**: stable + MSRV 1.63, `--no-default-features`, clippy
       `-D warnings`, rustfmt, docs; differential job where xdftool is
       installable. Pulled into this milestone because the write side is
