@@ -128,15 +128,41 @@ of the differential suite that need more than `cargo test` can reach.
 
 ## Milestone 2 — create
 
-**Next up.** Write code with nothing to corrupt: format a fresh volume, populate
-from a host tree, read it straight back. The API Copperline (dynamic
+**In progress.** Write code with nothing to corrupt: format a fresh volume,
+populate from a host tree, read it straight back. The API Copperline (dynamic
 OFS/FFS drives from directories) and amibake (dir→hdf) actually want.
 
-- [ ] **`BlockSink`** mirroring `BlockSource` (align the shape with
-      whatever amiga-rdb settles on — same seam, same decisions).
-- [ ] **Format**: boot block (valid checksum, non-bootable is fine),
-      root block, bitmap covering the volume, for every variant and
-      block size. What `Format` does, minus the icon.
+Wave 1 — the seam, `format()` and CI — is landed. What remains is
+populating a volume that formatting left empty, and the round-trip and
+fuzz work that only has a target once it can be populated.
+
+- [x] **`BlockSink`** mirroring `BlockSource` — the shape amiga-rdb has
+      already settled on, adopted verbatim: a *second* trait, not a
+      bound on `BlockSource` and not `BlockSink: BlockSource`, because
+      read-only sources are the common case and one trait would force
+      every one of them to supply a `write_block` that can only fail at
+      runtime. `format()` takes `BlockSink` alone (it writes and never
+      reads); anything needing both says `S: BlockSource + BlockSink`,
+      which is what the test images are.
+- [x] **Format**: boot block, root block, bitmap covering the volume, for
+      every variant and block size — `format()` in `src/format.rs`, with
+      the three placement decisions each settled against an
+      xdftool-formatted image and each stated in the module docs. Bitmap
+      pages go straight after the root, extension blocks between the two;
+      `DOS\4`/`DOS\5` roots carry an empty dircache block from birth (the
+      oracle's do, so a null pointer there would be wrong), placed after
+      the bitmap rather than at the oracle's own allocator-artefact
+      position. The boot block's checksum is left **zero** by default —
+      that is what makes it non-bootable, which is what `Format` produces
+      and `Install` fixes; one that checksums over 1012 zero bytes is
+      strictly worse, because the ROM would accept it and jump in.
+      `FormatOptions::boot_checksum` opts in for a caller writing its own
+      boot code. Every variant × {512, 1024, 4096, 32768} opens, validates
+      with zero findings, and has a bitmap marking exactly the blocks the
+      layout allocated; xdftool mounts, lists, writes to and reads back a
+      `DOS\1` and a `DOS\3` ADF this crate formatted, and the two
+      implementations' fresh images agree longword for longword bar the
+      dates and the root's longword −4.
 - [ ] **Populate from tree**: files, directories, metadata mapping
       (host mtime → ticks, mode → protection bits), name validation
       per variant (30 vs 107 bytes, Latin-1, no `:`/`/`).
@@ -145,11 +171,15 @@ OFS/FFS drives from directories) and amibake (dir→hdf) actually want.
       trees match — the independent-implementation proof.
 - [ ] **Guest-mount proof**: an image created here boots/mounts under a
       real Amiga ROM (the consumer that cannot be argued with).
-- [ ] **CI**: stable + MSRV 1.63, `--no-default-features`, clippy
+- [x] **CI**: stable + MSRV 1.63, `--no-default-features`, clippy
       `-D warnings`, rustfmt, docs; differential job where xdftool is
       installable. Pulled into this milestone because the write side is
       where an untested-configuration regression starts corrupting
-      images rather than misreading them.
+      images rather than misreading them. `.github/workflows/ci.yml`
+      runs exactly the commands this repository is checked with locally
+      — nothing in it is a check the working tree does not already pass.
+      **It has not had a live run**: the workflow lands with the code and
+      the first push is its first execution.
 - [ ] **Fuzzing**: parse arbitrary volumes without panic — the hash
       chains and name lengths specifically, and now also
       format-then-read round trips with arbitrary trees. In this

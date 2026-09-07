@@ -68,11 +68,70 @@ impl BlockSource for MemDisk {
     }
 }
 
+/// The same image as a *sink*: what `format()` writes into.
+///
+/// A separate impl from [`BlockSource`], as the crate's two traits are —
+/// and this type implementing both is exactly the `S: BlockSource +
+/// BlockSink` case, so a test can format an image and then open it
+/// without moving a byte.
+impl BlockSink for MemDisk {
+    type Error = MemError;
+
+    fn block_size(&self) -> usize {
+        self.bs
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), MemError> {
+        if buf.len() != self.bs {
+            return Err(MemError::BadBufferLen {
+                got: buf.len(),
+                want: self.bs,
+            });
+        }
+        let blocks = self.data.len() as u64 / self.bs as u64;
+        if lba >= blocks {
+            return Err(MemError::OutOfRange { lba, blocks });
+        }
+        let off = lba as usize * self.bs;
+        self.data[off..off + self.bs].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn block_count(&self) -> Option<u64> {
+        Some(self.data.len() as u64 / self.bs as u64)
+    }
+}
+
 impl MemDisk {
+    /// An image of nothing: what a formatter is handed.
+    pub fn blank(bs: usize, nblocks: u64) -> Self {
+        Self {
+            bs,
+            data: vec![0u8; bs * nblocks as usize],
+        }
+    }
+
+    /// An image full of a non-zero byte, so a test can tell "the
+    /// formatter wrote this field" from "the field was already zero".
+    pub fn filled(bs: usize, nblocks: u64, byte: u8) -> Self {
+        Self {
+            bs,
+            data: vec![byte; bs * nblocks as usize],
+        }
+    }
+
+    /// Read a block back out for byte-level assertions.
+    pub fn block(&self, lba: u64) -> &[u8] {
+        let off = lba as usize * self.bs;
+        &self.data[off..off + self.bs]
+    }
+
     /// Overwrite a block after the fact — for damage a test wants to
     /// apply *after* `finish()` has fixed the checksums up, so that what
-    /// fails is the thing being tested and not a stale sum.
-    pub fn write_block(&mut self, lba: u64, buf: &[u8]) {
+    /// fails is the thing being tested and not a stale sum. Deliberately
+    /// not [`BlockSink::write_block`]: it is not a write the volume made,
+    /// and it does not check anything.
+    pub fn poke_block(&mut self, lba: u64, buf: &[u8]) {
         let off = lba as usize * self.bs;
         self.data[off..off + self.bs].copy_from_slice(buf);
     }
@@ -2019,7 +2078,7 @@ fn a_dircache_block_must_verify_structurally() {
     let mut raw = vec![0u8; 512];
     disk.read_block(dc, &mut raw).unwrap();
     raw[OFF_DIRCACHE_RECORDS_START + DC_NAME_LEN] = 255;
-    disk.write_block(dc, &raw);
+    disk.poke_block(dc, &raw);
     let mut vol = Volume::open(disk, None).unwrap();
     let e = vol.read_dircache(root);
     assert!(
@@ -2268,7 +2327,7 @@ fn validate_reports_a_leaked_block_and_a_double_allocation_separately() {
     page[0..4].copy_from_slice(&0u32.to_be_bytes());
     let ck = checksum_compute(&page, BITMAP_CHECKSUM_INDEX);
     page[0..4].copy_from_slice(&ck.to_be_bytes());
-    disk.write_block(pages[0], &page);
+    disk.poke_block(pages[0], &page);
 
     let mut vol = Volume::open(disk, None).unwrap();
     let report = vol.validate();
@@ -2341,7 +2400,7 @@ fn validate_keeps_going_past_a_corrupt_block() {
     let mut raw = vec![0u8; 512];
     disk.read_block(broken, &mut raw).unwrap();
     raw[100] ^= 0xFF;
-    disk.write_block(broken, &raw);
+    disk.poke_block(broken, &raw);
 
     let mut vol = Volume::open(disk, None).unwrap();
     let report = vol.validate();
@@ -2501,4 +2560,350 @@ fn findings_display_with_the_consequence_stated() {
         error: Error::ChainCycle { lba: 5 },
     };
     assert!(f.to_string().contains("revisits block 5"));
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+/// Every variant, for a matrix that must not quietly skip one.
+const ALL_VARIANTS: [Variant; 8] = [
+    Variant::Ofs,
+    Variant::Ffs,
+    Variant::OfsIntl,
+    Variant::FfsIntl,
+    Variant::OfsIntlDircache,
+    Variant::FfsIntlDircache,
+    Variant::OfsIntlLongname,
+    Variant::FfsIntlLongname,
+];
+
+/// Format an image and assert the thing every other assertion depends on:
+/// it opens as the variant asked for, it validates with **zero**
+/// findings, its root is empty, and the bitmap marks exactly the blocks
+/// the layout says it allocated and not one more.
+///
+/// A helper rather than a test so that every cell of the matrix below
+/// gets the same scrutiny — the failure a formatter has is never in the
+/// case somebody wrote a bespoke assertion for.
+fn format_and_check(variant: Variant, bs: usize, nblocks: u64, name: &[u8]) -> FormatLayout {
+    // Pre-filled with 0xA5: any field the formatter fails to write shows
+    // up as garbage rather than as a plausible zero.
+    let mut disk = MemDisk::filled(bs, nblocks, 0xA5);
+    let created = DateStamp {
+        days: 9000,
+        mins: 611,
+        ticks: 2999,
+    };
+    let opts = FormatOptions::new(variant, nblocks, name).created(created);
+    let layout = amiga_ffs::format(&mut disk, &opts).expect("format");
+
+    let mut vol = Volume::open_with(disk, None, nblocks, 2).expect("open");
+    assert_eq!(vol.variant(), variant, "{variant:?} @{bs}");
+    assert_eq!(vol.root().name, name, "{variant:?} @{bs}");
+    assert_eq!(vol.root_lba(), layout.root_lba);
+    assert_eq!(vol.root().bitmap_flag, -1);
+    assert_eq!(vol.root().dir_altered, created);
+    assert_eq!(vol.root().disk_altered, created);
+    assert_eq!(vol.root().disk_made, created);
+    assert_eq!(
+        vol.root().fs_type,
+        variant.has_long_names().then(|| variant.dostype()),
+        "{variant:?}: the FileSystemType longword is LNFS-only"
+    );
+    assert_eq!(
+        vol.root().blocks_used,
+        variant
+            .has_long_names()
+            .then(|| layout.blocks_used() as u32),
+        "{variant:?}: NumBlocksUsed is LNFS-only"
+    );
+
+    // An empty volume: no entries, and every hash slot zero.
+    let root = vol.root_lba();
+    assert!(vol.read_dir(root).unwrap().is_empty(), "{variant:?} @{bs}");
+    assert!(vol.root().hash_table.iter().all(|&s| s == 0));
+    assert!(vol.lookup(root, b"anything").unwrap().is_none());
+
+    // The dircache decision, asserted in both directions.
+    assert_eq!(
+        layout.dircache.is_some(),
+        variant.has_dircache(),
+        "{variant:?}: a dircache volume carries a cache from birth"
+    );
+    if variant.has_dircache() {
+        let cache = vol.read_dircache(root).unwrap();
+        assert_eq!(cache.blocks, vec![layout.dircache.unwrap()]);
+        assert!(cache.records.is_empty());
+    }
+
+    // The bitmap: allocated is exactly the layout's set, free is
+    // everything else the bitmap covers, and the counts are exact.
+    let bm = vol.read_bitmap().unwrap();
+    assert!(bm.valid());
+    assert!(bm.covers_whole_volume(), "{variant:?} @{bs}");
+    assert_eq!(bm.pages(), layout.bitmap_pages, "{variant:?} @{bs}");
+    assert_eq!(bm.ext_blocks(), layout.bitmap_ext, "{variant:?} @{bs}");
+    assert_eq!(
+        bm.allocated().collect::<Vec<_>>(),
+        layout.allocated(),
+        "{variant:?} @{bs}"
+    );
+    assert_eq!(bm.allocated_count(), layout.blocks_used());
+    assert_eq!(bm.allocated_count() + bm.free_count(), nblocks - 2);
+    for lba in 0..2 {
+        assert_eq!(bm.is_allocated(lba), None, "reserved blocks have no bit");
+    }
+
+    // And the whole-volume walk: no findings at all, which is the single
+    // statement this whole helper exists to make.
+    let report = vol.validate();
+    assert!(
+        report.is_clean(),
+        "{variant:?} @{bs}: {:#?}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    );
+    let s = report.summary;
+    assert_eq!(s.directories, 1);
+    assert_eq!(s.files, 0);
+    assert_eq!(s.reachable, layout.blocks_used());
+    assert_eq!(s.allocated, layout.blocks_used());
+    assert_eq!(s.orphans, 0);
+    assert_eq!(s.reachable_but_free, 0);
+    layout
+}
+
+#[test]
+fn every_variant_formats_at_every_block_size() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 1024, 4096] {
+            // ~900 KB of volume whatever the block size, so the bitmap is
+            // one page at 512 and still one at 4 KB.
+            let nblocks = 1_800_000 / bs as u64;
+            format_and_check(variant, bs, nblocks, b"Formatted");
+        }
+    }
+}
+
+#[test]
+fn a_32k_block_volume_formats_too() {
+    // The largest block size the format has, where the hash table is 8136
+    // slots and one bitmap page covers 262 016 blocks. Once, because the
+    // image is 16 MB of test memory.
+    format_and_check(Variant::FfsIntlLongname, 32768, 512, b"Big Blocks");
+    format_and_check(Variant::OfsIntlDircache, 32768, 512, b"Big Blocks");
+}
+
+#[test]
+fn a_volume_that_needs_bitmap_extension_blocks_gets_them() {
+    // 400 MB at 512 bytes: 202 pages, so the root's 25 pointers are not
+    // enough and two extension blocks carry the other 177. The exact
+    // layout an image xdftool formatted has.
+    let layout = format_and_check(Variant::FfsIntl, 512, 819_200, b"Extended");
+    assert_eq!(layout.bitmap_ext.len(), 2);
+    assert_eq!(layout.bitmap_pages.len(), 202);
+    assert_eq!(layout.bitmap_ext, vec![409_601, 409_602]);
+    assert_eq!(layout.bitmap_pages[0], 409_603);
+}
+
+#[test]
+fn the_smallest_possible_volume_still_formats() {
+    // Root, one bitmap page, two reserved blocks: four is the floor for a
+    // variant without a dircache, five with one.
+    format_and_check(Variant::Ffs, 512, 4, b"Tiny");
+    format_and_check(Variant::FfsIntlDircache, 512, 6, b"Tiny");
+}
+
+#[test]
+fn the_boot_block_carries_the_dostype_and_no_checksum_by_default() {
+    for variant in ALL_VARIANTS {
+        let mut disk = MemDisk::filled(512, 1760, 0xA5);
+        let opts = FormatOptions::new(variant, 1760, b"Booted");
+        let layout = amiga_ffs::format(&mut disk, &opts).unwrap();
+
+        let boot = disk.block(0);
+        assert_eq!(be32(boot, 0), variant.dostype());
+        // Deliberately zero: a boot block that checksums and holds no
+        // code is one the ROM accepts and jumps into. `Format` leaves it
+        // for `Install`, and so does xdftool.
+        assert_eq!(be32(boot, 4), 0, "{variant:?}");
+        assert_eq!(be32(boot, 8), layout.root_lba as u32);
+        assert!(boot[12..].iter().all(|&b| b == 0), "no boot code");
+        // The second reserved block is written too -- zeroed, not left as
+        // whatever the image held.
+        assert!(disk.block(1).iter().all(|&b| b == 0));
+
+        // Opting in produces a checksum that verifies over the 1024-byte
+        // boot area, which at 512-byte blocks spans blocks 0 and 1.
+        let mut disk = MemDisk::filled(512, 1760, 0xA5);
+        let opts = FormatOptions {
+            boot_checksum: true,
+            ..FormatOptions::new(variant, 1760, b"Booted")
+        };
+        amiga_ffs::format(&mut disk, &opts).unwrap();
+        let mut area = disk.block(0).to_vec();
+        area.extend_from_slice(disk.block(1));
+        assert_eq!(area.len(), BOOT_AREA_LEN);
+        let mut sum: u32 = 0;
+        for off in (0..BOOT_AREA_LEN).step_by(4) {
+            let (s, carry) = sum.overflowing_add(be32(&area, off));
+            sum = s.wrapping_add(carry as u32);
+        }
+        assert_eq!(sum, 0xFFFF_FFFF, "{variant:?}: end-around-carry sum");
+    }
+}
+
+#[test]
+fn at_larger_block_sizes_the_boot_area_lives_inside_block_zero() {
+    // The boot area is two 512-byte *sectors* -- what the ROM reads --
+    // which is a fixed 1024 bytes and not two filesystem blocks. At 4 KB
+    // it is the front of block 0, and block 1 is just another zeroed
+    // reserved block.
+    let mut disk = MemDisk::filled(4096, 440, 0xA5);
+    let opts = FormatOptions {
+        boot_checksum: true,
+        ..FormatOptions::new(Variant::FfsIntl, 440, b"Wide")
+    };
+    amiga_ffs::format(&mut disk, &opts).unwrap();
+    let boot = disk.block(0).to_vec();
+    let mut sum: u32 = 0;
+    for off in (0..BOOT_AREA_LEN).step_by(4) {
+        let (s, carry) = sum.overflowing_add(be32(&boot, off));
+        sum = s.wrapping_add(carry as u32);
+    }
+    assert_eq!(sum, 0xFFFF_FFFF);
+    assert!(boot[BOOT_AREA_LEN..].iter().all(|&b| b == 0));
+    assert!(disk.block(1).iter().all(|&b| b == 0));
+}
+
+#[test]
+fn format_leaves_free_blocks_exactly_as_it_found_them() {
+    // Formatting a 2 GB image must not write 2 GB. Everything outside the
+    // layout keeps the byte it had, and is marked free.
+    let mut disk = MemDisk::filled(512, 1760, 0xA5);
+    let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"Untouched");
+    let layout = amiga_ffs::format(&mut disk, &opts).unwrap();
+    let written: Vec<u64> = layout.allocated();
+    for lba in 2..1760u64 {
+        if !written.contains(&lba) {
+            assert!(
+                disk.block(lba).iter().all(|&b| b == 0xA5),
+                "block {lba} was written for no reason"
+            );
+        }
+    }
+}
+
+#[test]
+fn format_refuses_what_it_cannot_write() {
+    let mut disk = MemDisk::blank(512, 1760);
+
+    let bad_name = |name: &[u8]| {
+        let opts = FormatOptions::new(Variant::Ffs, 1760, name);
+        let mut d = MemDisk::blank(512, 1760);
+        amiga_ffs::format(&mut d, &opts).unwrap_err()
+    };
+    assert!(matches!(bad_name(b""), FormatError::NameEmpty));
+    assert!(matches!(
+        bad_name(&[b'x'; 31]),
+        FormatError::NameTooLong { len: 31, max: 30 }
+    ));
+    // 30 bytes is the limit on *every* variant: the root's name field did
+    // not move on LNFS volumes, only directory entries' did.
+    let opts = FormatOptions::new(Variant::FfsIntlLongname, 1760, &[b'x'; 31]);
+    assert!(matches!(
+        amiga_ffs::format(&mut MemDisk::blank(512, 1760), &opts).unwrap_err(),
+        FormatError::NameTooLong { .. }
+    ));
+    assert!(matches!(
+        bad_name(b"Work:bench"),
+        FormatError::NameInvalidByte {
+            byte: b':',
+            index: 4
+        }
+    ));
+    assert!(matches!(
+        bad_name(b"a/b"),
+        FormatError::NameInvalidByte { byte: b'/', .. }
+    ));
+
+    // Geometry.
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Vol").reserved(1760);
+    assert!(matches!(
+        amiga_ffs::format(&mut disk, &opts).unwrap_err(),
+        FormatError::BadReserved { .. }
+    ));
+    let opts = FormatOptions::new(Variant::Ffs, 3, b"Vol");
+    assert!(matches!(
+        amiga_ffs::format(&mut disk, &opts).unwrap_err(),
+        FormatError::VolumeTooSmall { needed: 4, .. }
+    ));
+    // The sink knows it is too small, and says so before block one.
+    let opts = FormatOptions::new(Variant::Ffs, 4000, b"Vol");
+    assert!(matches!(
+        amiga_ffs::format(&mut disk, &opts).unwrap_err(),
+        FormatError::SinkTooSmall {
+            block_count: 4000,
+            sink_blocks: 1760
+        }
+    ));
+    // And nothing was written while refusing any of that.
+    assert!(disk.block(880).iter().all(|&b| b == 0));
+
+    // A volume no 32-bit block pointer could name, refused before the
+    // sink is even asked how big it is.
+    let opts = FormatOptions::new(Variant::Ffs, 1 << 33, b"Vol");
+    assert!(matches!(
+        amiga_ffs::format(&mut disk, &opts).unwrap_err(),
+        FormatError::VolumeTooLarge { .. }
+    ));
+
+    // A block size the format has no hash-table size for.
+    let mut odd = MemDisk::blank(256, 64);
+    let opts = FormatOptions::new(Variant::Ffs, 64, b"Vol");
+    assert!(matches!(
+        amiga_ffs::format(&mut odd, &opts).unwrap_err(),
+        FormatError::BadBlockSize(256)
+    ));
+}
+
+#[test]
+fn a_formatted_volume_is_the_shape_the_oracle_writes() {
+    // The block numbers a `DOS\1` ADF xdftool formats actually contains:
+    // root 880, one bitmap page at 881, the boot block naming the root.
+    // Asserted here as well as in the differential suite so the layout
+    // decision is pinned even where amitools is not installed.
+    let mut disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Empty");
+    let layout = amiga_ffs::format(&mut disk, &opts).unwrap();
+    assert_eq!(layout.root_lba, 880);
+    assert_eq!(layout.bitmap_pages, vec![881]);
+    assert_eq!(layout.blocks_used(), 2);
+
+    let root = disk.block(880);
+    assert_eq!(be32(root, OFF_TYPE), T_HEADER);
+    assert_eq!(be32(root, OFF_OWN_KEY), 0);
+    assert_eq!(be32(root, OFF_HASH_TABLE_SIZE), 72);
+    assert!(checksum_ok(root));
+    assert_eq!(be32(root, tail(512, TL_BITMAP_FLAG)) as i32, -1);
+    assert_eq!(be32(root, tail(512, TL_BITMAP_PAGES)), 881);
+    assert_eq!(be32(root, tail(512, TL_BITMAP_EXT)), 0);
+    assert_eq!(be32(root, tail(512, TL_SECONDARY_TYPE)) as i32, ST_ROOT);
+
+    // The bitmap page: checksum at longword 0, 1 = free, and exactly two
+    // bits clear.
+    let page = disk.block(881);
+    assert!(checksum_ok(page));
+    let clear: Vec<u64> = (0..1758u64)
+        .filter(|i| {
+            let w = be32(page, OFF_BITMAP_BITS + (*i as usize / 32) * 4);
+            w >> (i % 32) & 1 == 0
+        })
+        .map(|i| i + 2)
+        .collect();
+    assert_eq!(clear, vec![880, 881]);
 }

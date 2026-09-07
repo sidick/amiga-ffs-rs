@@ -36,8 +36,9 @@
 //! (the protection longword's inverted-sense bits, and the `DateStamp`'s
 //! calendar conversion), [`dircache`] (`DOS\4`/`DOS\5` cache blocks, read
 //! and marked advisory), [`bitmap`] (the allocation bitmap, with its four
-//! easily-inverted conventions stated) and [`validate`] (the whole-volume
-//! walk that reports rather than refuses).
+//! easily-inverted conventions stated), [`validate`] (the whole-volume
+//! walk that reports rather than refuses) and [`mod@format`] (creating a
+//! volume: boot block, root and bitmap, every variant, every block size).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -45,8 +46,13 @@
 //! *mostly* works. Everything above them is pointer-following, and every
 //! pointer is range-checked and every chain refuses to revisit a block.
 //!
-//! Milestone 1 (read) is complete. Writing — formatting a volume,
-//! allocating from the bitmap, mutating directories — is not here.
+//! Milestone 1 (read) is complete, and the first half of milestone 2 with
+//! it: [`BlockSink`] is the write seam (a second trait, not a bound on
+//! [`BlockSource`] — read-only sources are the common case) and
+//! [`format`](format()) creates a fresh, empty, valid volume of any
+//! variant at any block size, boot block, root and bitmap alike. What is
+//! *not* here yet: populating a volume from a tree, and mutating one that
+//! already has something in it.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -55,6 +61,7 @@ extern crate alloc;
 pub mod bitmap;
 pub mod dircache;
 pub mod file;
+pub mod format;
 pub mod layout;
 pub mod meta;
 pub mod read;
@@ -73,6 +80,7 @@ pub use read::{
 pub use bitmap::Bitmap;
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
+pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.
@@ -93,6 +101,58 @@ pub trait BlockSource {
     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
 
     /// Total number of blocks, if known.
+    fn block_count(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Anything that can accept fixed-size blocks by LBA — the write seam.
+///
+/// Deliberately a *second* trait rather than `write_block` bolted onto
+/// [`BlockSource`], and the same decision (and the same wording) as
+/// `amiga-rdb`'s: read-only sources are the common case and most of this
+/// crate's work — a `File` opened for reading, a memory-mapped image, a
+/// `&[u8]`, an emulator's read-only medium. One trait would force every
+/// one of them to supply a `write_block` that can only fail at runtime,
+/// which is a compile-time truth thrown away. Split, "this code writes"
+/// is visible in the bound: anything that reads *and* writes says
+/// `S: BlockSource + BlockSink`, and anything that only reads cannot be
+/// handed a sink by accident. The cost is `block_size` and `block_count`
+/// appearing on both traits — a deliberate duplication, since a type
+/// implementing both will have them agree trivially, and making
+/// `BlockSink: BlockSource` instead would rule out a write-only target
+/// (a fresh image being streamed out) for no gain. [`format`](format())
+/// is exactly such a caller: it writes a volume and never reads one
+/// back, so it asks for `BlockSink` alone and leaves verifying the
+/// result to whoever also has a [`BlockSource`].
+///
+/// The four decisions behind [`BlockSource`] — `&mut self`, a typed
+/// error, `u64` LBAs, a runtime block size — are the four decisions
+/// here, for the same four reasons.
+pub trait BlockSink {
+    /// How this sink reports a failed write. No bound is imposed here,
+    /// as on [`BlockSource::Error`].
+    type Error;
+
+    /// Bytes per block. Stable for the sink's lifetime, and — for a type
+    /// that is also a [`BlockSource`] — equal to what that trait reports.
+    fn block_size(&self) -> usize;
+
+    /// Write `buf` to block `lba`; `buf.len() == self.block_size()`.
+    ///
+    /// Whether the write has reached stable storage when this returns is
+    /// the implementation's business — nothing here assumes it, and a
+    /// caller that needs durability flushes the underlying object itself.
+    /// *Ordering* is this crate's business, though: the write paths are
+    /// ordered so an interruption leaves the previous structure intact,
+    /// which only holds if a sink does not reorder writes behind the
+    /// caller's back.
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error>;
+
+    /// Total number of blocks, if known — `None` on the same terms as
+    /// [`BlockSource::block_count`]. A sink that knows its size lets
+    /// [`format`](format()) refuse a layout that runs off the end
+    /// *before* writing the first block rather than halfway through.
     fn block_count(&self) -> Option<u64> {
         None
     }

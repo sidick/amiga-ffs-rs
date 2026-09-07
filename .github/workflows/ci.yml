@@ -1,0 +1,101 @@
+# The write side is where an untested configuration stops misreading
+# images and starts corrupting them, which is why CI arrives with
+# milestone 2 rather than after it. Every command here is one that is
+# also run locally before a commit; nothing in this file is a check the
+# repository does not already have to pass.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Both feature sets, on both ends of the supported range. `no_std` is
+  # not a configuration that can be tested by inspection: `--no-default-
+  # features` is the build that catches an `std::` that crept in.
+  test:
+    name: test (${{ matrix.rust }}, ${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.63 is the floor amiga-rdb sets; raising it is a
+        # semver-visible decision, so it is tested, not assumed.
+        rust: [stable, "1.63"]
+        features: ["", "--no-default-features"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}-${{ matrix.features }}
+      - run: cargo test ${{ matrix.features }}
+
+  clippy:
+    name: clippy (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--no-default-features"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.features }}
+      # --all-targets: the test suites are where a lint most often has
+      # something to say, and they are code this crate ships behaviour in.
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      # A broken intra-doc link in a crate whose documentation is half
+      # the deliverable is a broken deliverable.
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The differential suite skips itself when xdftool is absent, so this
+  # job exists to make sure it is *not* absent somewhere. It is the only
+  # leg that can catch a mistake this crate and its own test builder
+  # would make together.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install amitools
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: differential
+      # Fail rather than skip: on this job the oracle being missing is
+      # itself the bug.
+      - run: xdftool --help > /dev/null
+      - run: cargo test --test differential

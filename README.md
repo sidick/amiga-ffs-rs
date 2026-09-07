@@ -24,8 +24,16 @@ bitmap, and a `validate()` that walks the whole volume and *reports*
 rather than refusing, so a damaged volume still yields everything still
 reachable.
 
-Writing — formatting a volume, allocating from the bitmap, mutating
-directories — is milestone 2 and 3; see `PLAN.md`.
+**Creating a volume works** (milestone 2, wave 1): `BlockSink` is the
+write seam — a second trait, so a read-only source is never asked for a
+`write_block` it cannot have — and `format()` lays down a fresh, empty,
+valid volume of any variant at any block size: boot block, root, bitmap
+with its extension blocks, and the empty dircache block a `DOS\4`/`DOS\5`
+root carries from birth. xdftool mounts what it writes.
+
+Populating a volume from a host tree, allocating from the bitmap and
+mutating directories are the rest of milestone 2 and milestone 3; see
+`PLAN.md`.
 
 ## Why this exists
 

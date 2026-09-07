@@ -1,5 +1,6 @@
 //! Differential tests: volumes built by an *independent* implementation,
-//! read back through this crate.
+//! read back through this crate — and, since milestone 2, volumes built
+//! by this crate and handed to that implementation.
 //!
 //! The oracle is `xdftool` from amitools — GPL-2, so it is **run, never
 //! copied**. Nothing in this file transcribes a line of it; it is invoked
@@ -45,6 +46,19 @@
 //! images are 512-byte-blocked, and the RDB-partitioned images where
 //! other block sizes live are `rdbtool`'s territory and this crate's
 //! sibling's problem.
+//!
+//! # The write side
+//!
+//! The last two tests run the other way: this crate formats an ADF and
+//! xdftool is asked to mount it, list it, account for its free space,
+//! write a file into it and read that file back — and then the two
+//! implementations' *own* freshly formatted images are compared longword
+//! by longword, which is how the block placement decisions in
+//! [`amiga_ffs::format`] stay honest. The don't-cares are named in that
+//! comparison rather than assumed: the three root DateStamps (the
+//! formatting instant, and a caller-supplied parameter here) and the
+//! root's longword −4, which xdftool fills in on every variant and this
+//! crate fills in only on the LNFS ones that define it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -148,6 +162,43 @@ impl ImageDisk {
             bs: 512,
             data: std::fs::read(path).expect("image file"),
         }
+    }
+
+    /// A blank image of the size an ADF is, for this crate to format.
+    fn blank(blocks: u64) -> Self {
+        Self {
+            bs: 512,
+            data: vec![0u8; 512 * blocks as usize],
+        }
+    }
+
+    fn save(&self, path: &Path) {
+        std::fs::write(path, &self.data).expect("write image");
+    }
+
+    fn block(&self, lba: u64) -> &[u8] {
+        &self.data[lba as usize * self.bs..(lba as usize + 1) * self.bs]
+    }
+}
+
+impl BlockSink for ImageDisk {
+    type Error = ImageError;
+
+    fn block_size(&self) -> usize {
+        self.bs
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ImageError> {
+        let off = lba as usize * self.bs;
+        if off + self.bs > self.data.len() {
+            return Err(ImageError(format!("lba {lba} past end of image")));
+        }
+        self.data[off..off + self.bs].copy_from_slice(buf);
+        Ok(())
+    }
+
+    fn block_count(&self) -> Option<u64> {
+        Some(self.data.len() as u64 / self.bs as u64)
     }
 }
 
@@ -515,4 +566,168 @@ fn xdftool_refuses_a_long_name_on_a_variant_that_cannot_store_it() {
         vol.lookup(root, long.as_bytes()),
         Err(Error::NameTooLong { max: 30, .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The other direction: volumes this crate formatted, read by the oracle
+// ---------------------------------------------------------------------------
+
+/// The DD floppy geometry every ADF has: 80 cylinders x 2 heads x 11
+/// sectors. The only size xdftool will open as an ADF, which is why the
+/// write-side differential runs at this size and not another.
+const ADF_BLOCKS: u64 = 1760;
+
+/// Format an ADF-sized image with *this* crate and write it out.
+fn format_adf(scratch: &Scratch, variant: Variant, label: &str, name: &str) -> PathBuf {
+    let mut disk = ImageDisk::blank(ADF_BLOCKS);
+    let opts = FormatOptions::new(variant, ADF_BLOCKS, label.as_bytes());
+    amiga_ffs::format(&mut disk, &opts).expect("format");
+    let path = scratch.path(name);
+    disk.save(&path);
+    path
+}
+
+#[test]
+fn xdftool_accepts_a_volume_this_crate_formatted() {
+    let argv = oracle!();
+    let scratch = Scratch::new("wrote");
+
+    // The claim this test makes is the one that cannot be made by reading
+    // our own bytes back: an implementation that shares no code with this
+    // one mounts the volume, agrees about its name and its free space,
+    // writes a file into it, and reads that file back.
+    for (variant, tag) in [(Variant::Ffs, "dos1"), (Variant::FfsIntl, "dos3")] {
+        let image = format_adf(&scratch, variant, "Rustfmt", &format!("{tag}.adf"));
+        let path = image.to_str().unwrap();
+
+        let listing = run(&argv, &[path, "list"]);
+        assert!(
+            listing.contains("Rustfmt") && listing.contains("VOLUME"),
+            "{variant:?}: xdftool would not list our volume:\n{listing}"
+        );
+        // An empty volume, so nothing but the volume line itself.
+        assert_eq!(
+            listing.lines().filter(|l| l.contains("rwed")).count(),
+            0,
+            "{variant:?}: xdftool sees entries in an empty root:\n{listing}"
+        );
+
+        // Its accounting agrees with ours: root plus one bitmap page,
+        // plus the two boot blocks xdftool counts and the bitmap has no
+        // bits for.
+        let info = run(&argv, &[path, "info"]);
+        let used: u64 = info
+            .split_whitespace()
+            .skip_while(|w| *w != "used:")
+            .nth(1)
+            .expect("a used count")
+            .parse()
+            .expect("a number");
+        assert_eq!(used, 4, "{variant:?}:\n{info}");
+
+        // And it is a *working* filesystem, not merely a parseable one:
+        // the oracle allocates from our bitmap, chains into our root's
+        // hash table, and gets its bytes back.
+        let host = scratch.path("payload");
+        let payload = pattern(3000);
+        std::fs::write(&host, &payload).unwrap();
+        run(
+            &argv,
+            &[path, "write", host.to_str().unwrap(), "Startup-Sequence"],
+        );
+        let back = scratch.path("back");
+        run(
+            &argv,
+            &[path, "read", "Startup-Sequence", back.to_str().unwrap()],
+        );
+        assert_eq!(std::fs::read(&back).unwrap(), payload, "{variant:?}");
+
+        // And this crate still validates what the oracle left behind.
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after xdftool wrote to it: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn our_format_and_the_oracles_agree_block_for_block() {
+    let argv = oracle!();
+    let scratch = Scratch::new("shape");
+
+    for (variant, tag) in [(Variant::Ffs, "DOS1"), (Variant::FfsIntl, "DOS3")] {
+        let ours = ImageDisk::open(&format_adf(
+            &scratch,
+            variant,
+            "Empty",
+            &format!("ours-{tag}.adf"),
+        ));
+        let theirs = scratch.path(&format!("theirs-{tag}.adf"));
+        run(
+            &argv,
+            &["-f", theirs.to_str().unwrap(), "format", "Empty", tag],
+        );
+        let theirs = ImageDisk::open(&theirs);
+
+        // The boot block: dostype, no checksum, and the root's LBA in
+        // longword 2. Identical, including the deliberately-zero
+        // checksum -- `Format` leaves that to `Install`, and so do both
+        // of these.
+        assert_eq!(ours.block(0), theirs.block(0), "{variant:?} boot block");
+        assert_eq!(ours.block(1), theirs.block(1), "{variant:?} block 1");
+
+        // The root: every longword but the three DateStamps (which are
+        // the formatting instant, and ours is the caller's to supply)
+        // and longword -4, where xdftool writes the dostype on every
+        // variant and this crate writes it only on LNFS ones, the only
+        // place the format defines that field.
+        let dont_care: Vec<usize> = (105..=107)
+            .chain(117..=123)
+            .chain(core::iter::once(124))
+            .collect();
+        let (a, b) = (ours.block(880), theirs.block(880));
+        for lw in 0..128 {
+            if dont_care.contains(&lw) || lw == 5 {
+                continue;
+            }
+            assert_eq!(
+                be32(a, lw * 4),
+                be32(b, lw * 4),
+                "{variant:?}: root longword {lw} (tail -{})",
+                128 - lw
+            );
+        }
+        // Both checksums are correct over their own block, which is the
+        // statement worth making about longword 5.
+        assert!(checksum_ok(a) && checksum_ok(b));
+
+        // The bitmap: same page, same placement, and byte for byte the
+        // same contents -- checksum included, which only comes out if
+        // the allocated set, the bit polarity, the bit order and the
+        // checksum longword all agree.
+        assert_eq!(
+            be32(a, 512 - 49 * 4),
+            881,
+            "{variant:?}: the bitmap page goes straight after the root"
+        );
+        assert_eq!(ours.block(881), theirs.block(881), "{variant:?} bitmap");
+
+        // Nothing else in either image was touched.
+        for lba in 2..ADF_BLOCKS {
+            if lba == 880 || lba == 881 {
+                continue;
+            }
+            assert!(
+                ours.block(lba).iter().all(|&x| x == 0),
+                "{variant:?}: we wrote block {lba}"
+            );
+        }
+    }
 }
