@@ -31,8 +31,13 @@ plan, which owns everything outside the partition.
 - [ ] **Long-filename entries** (`DOS\6`/`DOS\7`): the different
       header-block name layout. **Regression to assert from day one:
       every name on a long-name volume non-empty** — the exact failure
-      watched in another reader (accepts the volume, returns `""` for
-      every entry, no error).
+      now observed in *two* independent readers against the same
+      fixture: affs-read, and AROS's own `afs.handler`, which masks the
+      dostype low byte away, mounts a `DOS\7` volume as classic FFS,
+      reads the volume name (classic offset in both layouts), and
+      resolves no directory entry. Accepting a variant's dostype
+      without implementing its layout is this format's signature trap;
+      this crate refuses what it cannot parse instead.
 - [ ] **File reading**: FFS data-block chains via file-header block
       lists and extension blocks; OFS data blocks with their headers
       (and use those headers to *verify*, since they're there).
@@ -53,8 +58,14 @@ plan, which owns everything outside the partition.
       of name, bitmap consistency, orphan blocks. Parse damaged volumes
       where possible — recovery needs the read side most of all.
 - [ ] **Differential suite**: same tree read through this crate,
-      xdftool (GPL oracle — run, never copy), and affs-read (MIT —
-      readable when outputs disagree); fixtures from amibake images
+      xdftool (GPL oracle — run, never copy), affs-read (MIT —
+      readable when outputs disagree), and AROS's `afs.handler`
+      (readable for understanding, licence-incompatible for copying —
+      but it runs *inside a guest* against the same images, which
+      makes it the one oracle that is also a real consumer). Its
+      `getHashKey` already confirms our hash structurally: seed with
+      length, `*13 + fold(c) & 0x7FF`, modulo table size, flags
+      selecting the fold table. Fixtures from amibake images
       (redistributable AROS DOS\7 included) plus synthetic minimal
       volumes per variant, mixed block sizes 512..=32K.
 
@@ -102,7 +113,9 @@ Gated on the milestone-1 validator and differential suite.
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and
   extended permission bits actually used and enforced; same blocks,
-  same hashing, same chains. Deferred, not excluded: no milestone
+  same hashing, same chains. Independently confirmed by AROS's
+  `afs.handler`, which mounts exactly two dostype families: `DOS` and
+  `muFS`. Deferred, not excluded: no milestone
   depends on it, and the metadata work above (owner longword and full
   protection long read as first-class on *every* variant) means adding
   it later is dostype acceptance plus a survey, not a rework. That
