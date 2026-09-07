@@ -205,6 +205,19 @@ Gated on the milestone-1 validator and differential suite.
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
       don't-care fields — dates, allocation order).
+- [ ] **Validator repair**: the write-side half of `validate()`, doing
+      what the ROM disk-validator does — rebuild the bitmap from the
+      reachability walk (which `validate()` already performs and
+      `pack_bits` already serialises), write fresh pages, stamp
+      `bm_flag` valid; optionally sever the unfixable (a corrupt chain
+      truncated at the last good link, orphans left leaked — leaks are
+      the recoverable direction). First consumer of the allocator after
+      the mutators themselves, and a prerequisite for resize, which
+      must rebuild the bitmap rather than hand FFS an invalid flag the
+      way AmiPart does. Repair only ever *adds* allocation and only
+      ever removes reachability — the two directions `validate()`
+      already distinguishes — so a repaired volume can be worse than a
+      healthy one but never worse than the damaged one it started as.
 
 ## In scope, not scheduled
 
