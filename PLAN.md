@@ -447,14 +447,30 @@ them.
   block index — no need to have walked from the start), clamping
   against `byte_size`, returning 0 bytes past EOF the way read(2)
   does. A pre-collected chain is also immutable data a concurrent
-  consumer can hold outside its `Volume` lock, which keeps the
-  critical section at one block read. Concurrency itself stays the
-  consumer's: `&mut self` was deliberate, a FUSE adapter wraps the
-  volume in a `Mutex` and brings the block cache its own medium
-  warrants — an LRU sized for a local image is wrong for a ZuluSCSI
-  card over USB, which is exactly why the format crate cannot choose
-  it. Scheduled into M3 wave 3 alongside the file-write work, since
-  both live in the chain machinery.
+  consumer can hold outside its `Volume` lock, which keeps the *read*
+  critical section at one block read — read is the only path with that
+  property, though: `lookup` and `readdir` walk hash chains, so their
+  sections are chain-length long, fine in practice (chains are short
+  unless someone has abused a `DOS\0` directory) but fine *because*
+  the adapter's block cache absorbs the walk, which is the cache
+  earning its place rather than an optimisation. Concurrency itself
+  stays the consumer's: `&mut self` was deliberate, a FUSE adapter
+  wraps the volume in a `Mutex` and brings the block cache its own
+  medium warrants — an LRU sized for a local image is wrong for a
+  ZuluSCSI card over USB, which is exactly why the format crate cannot
+  choose it. Scheduled into M3 wave 3 alongside the file-write work,
+  since both live in the chain machinery.
+
+  The mount-time story for such an adapter, recorded here because it
+  falls straight out of surfaces the crate already has: `validate()`
+  walks the whole volume — seconds on an image file, rather longer
+  through a USB-attached card — so it is a mount *option*, defaulted
+  by mode: always before exposing writes, opt-in for read-only. A
+  damaged volume still mounts read-only with everything reachable
+  (the walk records and continues by design, and read-only is when
+  someone most wants the driver); refuse-or-repair gates only the
+  write side. `bitmap_flag == 0` is the cheap early signal that a
+  full walk is warranted before anyone pays for one.
 
 - **Resize** (grow/shrink an existing volume in place): gated on the
   M3 allocator and mutation discipline. The filesystem half only — the
