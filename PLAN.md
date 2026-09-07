@@ -438,6 +438,24 @@ them.
 
 ## In scope, not scheduled
 
+- **Ranged reads** (`read_range(&chain, offset, buf)`): the FUSE-shaped
+  gap in the read surface, and Copperline's too — a trackdisk-level
+  consumer never wants whole files. `FileChain` was split from the
+  streaming read precisely so it could be collected once and reused;
+  this walks only the blocks the range covers, verifying OFS headers
+  for exactly those (the expected sequence number falls out of the
+  block index — no need to have walked from the start), clamping
+  against `byte_size`, returning 0 bytes past EOF the way read(2)
+  does. A pre-collected chain is also immutable data a concurrent
+  consumer can hold outside its `Volume` lock, which keeps the
+  critical section at one block read. Concurrency itself stays the
+  consumer's: `&mut self` was deliberate, a FUSE adapter wraps the
+  volume in a `Mutex` and brings the block cache its own medium
+  warrants — an LRU sized for a local image is wrong for a ZuluSCSI
+  card over USB, which is exactly why the format crate cannot choose
+  it. Scheduled into M3 wave 3 alongside the file-write work, since
+  both live in the chain machinery.
+
 - **Resize** (grow/shrink an existing volume in place): gated on the
   M3 allocator and mutation discipline. The filesystem half only — the
   RDB's `high_cyl` move is amiga-rdb's, composed by the consumer. The
