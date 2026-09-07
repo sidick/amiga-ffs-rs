@@ -46,6 +46,11 @@ pub struct MemDisk {
     /// so a test can assert *which* blocks a flush touched, not merely
     /// that the result is right.
     writes: Vec<u64>,
+    /// Every block *read* since the log was last cleared. A ranged read's
+    /// whole claim is that it touches only the blocks the range covers,
+    /// and counting them is the only way to assert it — the bytes come
+    /// back right either way.
+    reads: Vec<u64>,
     /// Refuse every write after this many. A crash, made deterministic:
     /// stepping it from 0 upward replays every prefix of a write
     /// sequence, which is the only way to check a crash-ordering claim
@@ -73,6 +78,7 @@ impl BlockSource for MemDisk {
         }
         let off = lba as usize * self.bs;
         buf.copy_from_slice(&self.data[off..off + self.bs]);
+        self.reads.push(lba);
         Ok(())
     }
 
@@ -128,6 +134,7 @@ impl MemDisk {
             bs,
             data: vec![0u8; bs * nblocks as usize],
             writes: Vec::new(),
+            reads: Vec::new(),
             fail_after: None,
         }
     }
@@ -139,6 +146,7 @@ impl MemDisk {
             bs,
             data: vec![byte; bs * nblocks as usize],
             writes: Vec::new(),
+            reads: Vec::new(),
             fail_after: None,
         }
     }
@@ -167,6 +175,16 @@ impl MemDisk {
 
     pub fn clear_log(&mut self) {
         self.writes.clear();
+    }
+
+    /// The blocks read since the last [`MemDisk::clear_read_log`], in
+    /// order.
+    pub fn read_log(&self) -> &[u64] {
+        &self.reads
+    }
+
+    pub fn clear_read_log(&mut self) {
+        self.reads.clear();
     }
 
     /// Start refusing writes once `n` more have been accepted.
@@ -695,6 +713,7 @@ impl Builder {
             bs: self.bs,
             data: self.data,
             writes: Vec::new(),
+            reads: Vec::new(),
             fail_after: None,
         }
     }
@@ -704,6 +723,7 @@ impl Builder {
             bs: self.bs,
             data: self.data,
             writes: Vec::new(),
+            reads: Vec::new(),
             fail_after: None,
         }
     }
@@ -5664,6 +5684,659 @@ fn a_random_interleave_of_mutations_agrees_with_a_model() {
                 allocated_set(&mut vol),
                 before,
                 "{variant:?} @{bs}: emptying the volume did not return every block"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ranged reads
+// ---------------------------------------------------------------------------
+
+/// A volume with one file big enough to have an extension block, and the
+/// bytes that went into it.
+fn ranged_volume(
+    variant: Variant,
+    bs: usize,
+    size: usize,
+) -> (Volume<MemDisk>, Vec<u8>, FileChain) {
+    let nblocks = 8 * 1024 * 1024 / bs as u64;
+    let data = pattern(size);
+    let payload = data.clone();
+    let mut vol = populated(variant, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Big", &amiga_ffs::Metadata::new(), &payload)
+            .unwrap();
+    });
+    let root = vol.root_lba();
+    let lba = vol.lookup(root, b"Big").unwrap().unwrap().lba;
+    let chain = vol.file_chain(lba).unwrap();
+    (vol, data, chain)
+}
+
+/// Every shape of range there is, against the bytes a whole-file read
+/// gives: within one block, exactly one block, spanning a boundary,
+/// crossing into extension-block territory, and clamped at the end.
+///
+/// The interesting half is the clamp. `byte_size` is the authority for
+/// where a file stops -- the last data block has capacity past it, and a
+/// ranged read that returned the block's tail would invent data that no
+/// whole-file read of the same volume ever produces.
+#[test]
+fn a_ranged_read_returns_exactly_what_a_whole_file_read_would() {
+    for variant in [Variant::Ofs, Variant::Ffs] {
+        for bs in [512usize, 4096] {
+            let payload = data_payload_size(bs, variant.is_ffs());
+            let slots = hash_table_size(bs) as usize;
+            // Past the header's own table by four blocks, so a range can
+            // cross into the extension block and sit wholly inside it.
+            let size = (slots + 3) * payload + 17;
+            let (mut vol, data, chain) = ranged_volume(variant, bs, size);
+            assert!(!chain.extensions.is_empty(), "{variant:?} @{bs}");
+
+            let p = payload as u64;
+            let ext = slots as u64 * p;
+            let cases: [(u64, usize); 12] = [
+                (0, size),              // the whole file, the long way round
+                (0, payload),           // exactly the first block
+                (p, payload),           // exactly a block, not the first
+                (3, 10),                // wholly within one block
+                (p - 5, 10),            // spanning a block boundary
+                (p / 2, payload * 3),   // partial, whole, partial
+                (p * 2, payload * 2),   // two whole blocks
+                (ext - 7, 20),          // crossing into the extension block
+                (ext + 1, payload * 2), // wholly inside it
+                (size as u64 - 3, 100), // clamped at the end
+                (size as u64 - 1, 1),   // the last byte
+                (0, size + 4096),       // a buffer longer than the file
+            ];
+            for (off, len) in cases {
+                let what = format!("{variant:?} @{bs}: {len} bytes at {off}");
+                let mut buf = vec![0xAAu8; len];
+                let got = vol.read_range(&chain, off, &mut buf).unwrap();
+                let want = &data[off as usize..(off as usize + len).min(size)];
+                assert_eq!(got, want.len(), "{what}: count");
+                assert_eq!(&buf[..got], want, "{what}: bytes");
+                // Nothing past the returned count is written, so a caller
+                // that trusts the count is never reading its own padding.
+                assert!(buf[got..].iter().all(|&b| b == 0xAA), "{what}: overrun");
+            }
+        }
+    }
+}
+
+/// End of file is a length, not a failure: read(2) returns 0 there and so
+/// does this. The distinction matters to a caller looping until it gets
+/// zero, which is every caller.
+#[test]
+fn a_ranged_read_at_or_past_the_end_of_file_returns_zero() {
+    for variant in [Variant::Ofs, Variant::Ffs] {
+        let size = 5000;
+        let (mut vol, _, chain) = ranged_volume(variant, 512, size);
+        let mut buf = [0u8; 64];
+        for off in [size as u64, size as u64 + 1, u64::MAX / 2] {
+            assert_eq!(vol.read_range(&chain, off, &mut buf).unwrap(), 0);
+        }
+        // A zero-length buffer inside the file falls out of the same
+        // clamp rather than being a case of its own.
+        assert_eq!(vol.read_range(&chain, 0, &mut []).unwrap(), 0);
+
+        // And an empty file is entirely past its own end.
+        let nblocks = 1760;
+        let mut vol = populated(variant, 512, nblocks, |pop| {
+            let root = pop.root_lba();
+            pop.create_file(root, b"Empty", &amiga_ffs::Metadata::new(), b"")
+                .unwrap();
+        });
+        let root = vol.root_lba();
+        let lba = vol.lookup(root, b"Empty").unwrap().unwrap().lba;
+        let chain = vol.file_chain(lba).unwrap();
+        assert_eq!(vol.read_range(&chain, 0, &mut buf).unwrap(), 0);
+    }
+}
+
+/// The whole claim of a ranged read: it walks the blocks the range covers
+/// and no others. The bytes come back right either way, so the only way
+/// to assert it is to count the reads.
+#[test]
+fn a_ranged_read_touches_only_the_blocks_the_range_covers() {
+    for variant in [Variant::Ofs, Variant::Ffs] {
+        let bs = 512;
+        let payload = data_payload_size(bs, variant.is_ffs()) as u64;
+        let slots = hash_table_size(bs) as u64;
+        let size = ((slots + 3) * payload + 17) as usize;
+        let (mut vol, _, chain) = ranged_volume(variant, bs, size);
+        let mut buf = vec![0u8; 4 * payload as usize];
+
+        for (off, len, blocks) in [
+            (0u64, 1usize, 1usize),
+            (payload - 1, 2, 2),
+            (payload * 40 + 3, 10, 1),
+            // Deep inside the extension block's territory: still one
+            // read, because the sequence number is arithmetic and nothing
+            // has to be walked from block 1 to know it.
+            (slots * payload + payload + 5, 20, 1),
+            (payload * 3, 3 * payload as usize, 3),
+        ] {
+            vol.source_mut().clear_read_log();
+            let got = vol.read_range(&chain, off, &mut buf[..len]).unwrap();
+            assert_eq!(got, len);
+            assert_eq!(
+                vol.source_mut().read_log().len(),
+                blocks,
+                "{variant:?}: {len} bytes at {off}"
+            );
+        }
+    }
+}
+
+/// A ranged read verifies the OFS headers of the blocks it touches --
+/// and, because it touches only those, a range that avoids a corrupt
+/// block still succeeds. Both halves matter: the first is the check not
+/// being skipped for speed, the second is the range genuinely being a
+/// range.
+#[test]
+fn a_ranged_read_verifies_the_ofs_headers_of_the_blocks_it_touches() {
+    let bs = 512;
+    let payload = data_payload_size(bs, false);
+    let size = 10 * payload;
+    let (mut vol, _, chain) = ranged_volume(Variant::Ofs, bs, size);
+
+    // Data block 5 claims to be somebody else's block 1.
+    let victim = chain.blocks[4] as u64;
+    let mut buf = vol.source_mut().block(victim).to_vec();
+    buf[OFF_DATA_SEQ..OFF_DATA_SEQ + 4].copy_from_slice(&1u32.to_be_bytes());
+    buf[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&0u32.to_be_bytes());
+    let ck = checksum_compute(&buf, CHECKSUM_INDEX);
+    buf[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&ck.to_be_bytes());
+    vol.source_mut().poke_block(victim, &buf);
+
+    let mut out = vec![0u8; 2 * payload];
+    // A range that stops before it is fine...
+    assert_eq!(
+        vol.read_range(&chain, 0, &mut out[..payload]).unwrap(),
+        payload
+    );
+    // ...one that touches it is refused, by name.
+    let err = vol
+        .read_range(&chain, 4 * payload as u64, &mut out[..8])
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            amiga_ffs::read::Error::DataBlockSequence {
+                found: 1,
+                expected: 5,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    // ...and so is one that merely runs through it on its way somewhere
+    // else, because a block in a range is a block that gets checked.
+    assert!(
+        vol.read_range(&chain, 3 * payload as u64, &mut out)
+            .is_err(),
+        "a range spanning the bad block must refuse"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// File write, append and truncate
+// ---------------------------------------------------------------------------
+
+/// Bytes that say which operation wrote them, so an overwrite that landed
+/// at the wrong offset shows up as the wrong *tag* rather than as a
+/// coincidence of two identical patterns.
+fn stamped(tag: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(tag))
+        .collect()
+}
+
+/// The model of a file: a `Vec<u8>` with `resize`'s zero-fill, which is
+/// exactly the semantics the crate implements and the reason it is worth
+/// stating that way.
+fn model_write(model: &mut Vec<u8>, off: u64, data: &[u8]) {
+    let end = off as usize + data.len();
+    if model.len() < end {
+        model.resize(end, 0);
+    }
+    model[off as usize..end].copy_from_slice(data);
+}
+
+/// A volume with the usual tree plus one file to rewrite.
+fn writable(variant: Variant, bs: usize, nblocks: u64, initial: &[u8]) -> Volume<MemDisk> {
+    let initial = initial.to_vec();
+    populated(variant, bs, nblocks, |pop| {
+        allocatable_tree(pop);
+        let root = pop.root_lba();
+        pop.create_file(root, b"Doc", &amiga_ffs::Metadata::new(), &initial)
+            .unwrap();
+    })
+}
+
+/// Read the file back whole and compare it to the model, then check the
+/// volume is still one: clean, with reachable and allocated agreeing, and
+/// the tree that was already there untouched.
+fn assert_file_model(vol: &mut Volume<MemDisk>, want: &[u8], what: &str) {
+    let root = vol.root_lba();
+    let e = vol.lookup(root, b"Doc").unwrap().expect("Doc");
+    assert_eq!(e.byte_size as usize, want.len(), "{what}: byte_size");
+    assert_eq!(vol.read_file(e.lba).unwrap(), want, "{what}: contents");
+    assert_clean(vol, what);
+    let report = vol.validate();
+    assert_eq!(report.summary.reachable, report.summary.allocated, "{what}");
+    assert_eq!(report.summary.orphans, 0, "{what}");
+    assert_eq!(report.summary.reachable_but_free, 0, "{what}");
+    assert_tree_intact(vol);
+}
+
+/// The matrix: every shape of write, append and truncate, on OFS and FFS,
+/// at two block sizes, with a dircache variant and a long-name variant in
+/// for the metadata that rides along -- each operation followed by a
+/// byte-identical readback against a model `Vec<u8>` and a clean
+/// `validate()`.
+///
+/// The sizes are all expressed in payload blocks and in the header's own
+/// table size, because that is where the arithmetic can go wrong: a file
+/// that never crosses the boundary between the header's table and its
+/// first extension block proves nothing about either.
+#[test]
+fn write_append_and_truncate_track_a_model_file_on_every_shape_of_volume() {
+    for variant in [
+        Variant::Ofs,
+        Variant::Ffs,
+        Variant::OfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let p = data_payload_size(bs, variant.is_ffs()) as u64;
+            let slots = hash_table_size(bs) as u64;
+            // The first byte the header's own table cannot reach.
+            let ext = slots * p;
+
+            let initial = pattern(300);
+            let mut model = initial.clone();
+            let mut vol = writable(variant, bs, nblocks, &initial);
+
+            let mut m = Mutator::open(vol).expect("mutator");
+            let root = m.volume().root_lba();
+            let mut step = 0u8;
+            let mut run = |m: &mut Mutator<MemDisk>, model: &mut Vec<u8>, op: Op| {
+                step = step.wrapping_add(1);
+                let what = format!("{variant:?} @{bs} step {step} {op:?}");
+                match op {
+                    Op::Write(off, len) => {
+                        let data = stamped(step, len);
+                        let got = m.write_file(root, b"Doc", off, &data).expect(&what);
+                        model_write(model, off, &data);
+                        assert_eq!(got, model.len() as u64, "{what}: returned length");
+                    }
+                    Op::Append(len) => {
+                        let data = stamped(step, len);
+                        let at = model.len() as u64;
+                        let got = m.append(root, b"Doc", &data).expect(&what);
+                        model_write(model, at, &data);
+                        assert_eq!(got, model.len() as u64, "{what}: returned length");
+                    }
+                    Op::Truncate(n) => {
+                        m.truncate(root, b"Doc", n).expect(&what);
+                        model.resize(n as usize, 0);
+                    }
+                }
+                what
+            };
+
+            for op in [
+                // Grow across the header table's last slot and three
+                // blocks into the first extension block.
+                Op::Append((ext + 3 * p) as usize - 300),
+                // Partial first block, whole middle blocks, partial last.
+                Op::Write(p / 2, 3 * p as usize),
+                // A single byte, at the very start.
+                Op::Write(0, 1),
+                // Back to exactly the extension boundary: the file now
+                // ends where the header's own table ends, so the whole
+                // extension chain goes.
+                Op::Truncate(ext),
+                // ...and out again into it, to a mid-block length.
+                Op::Truncate(ext + p / 3),
+                // A write wholly inside the extension block's territory.
+                Op::Write(ext + p, 200),
+                // Shrink to the middle of a block: the block that is now
+                // last has to have its OFS length corrected.
+                Op::Truncate(p / 2),
+                // Empty, then a write past the end -- the gap zero-fills,
+                // because the format has no hole to leave.
+                Op::Truncate(0),
+                Op::Write(3 * p + 7, 100),
+                // A no-op append, and a pure grow.
+                Op::Append(0),
+                Op::Truncate(5 * p),
+            ] {
+                let what = run(&mut m, &mut model, op);
+                assert_file_model(m.volume(), &model, &what);
+            }
+
+            vol = m.into_volume();
+            // The gap really is zeroes, not whatever the deleted blocks
+            // held -- the volume was filled with 0xA5 before it was
+            // formatted, so anything else would show.
+            let doc = vol.lookup(root, b"Doc").unwrap().unwrap();
+            let back = vol.read_file(doc.lba).unwrap();
+            assert_eq!(back, model);
+            assert!(back[..3 * p as usize + 7].iter().all(|&b| b == 0));
+        }
+    }
+}
+
+/// The operations a step of the matrix above can be.
+#[derive(Debug, Clone, Copy)]
+enum Op {
+    /// Write `len` bytes at this offset.
+    Write(u64, usize),
+    /// Append `len` bytes.
+    Append(usize),
+    /// Set the length.
+    Truncate(u64),
+}
+
+/// The refusals, and the one place the format's own field size shows
+/// through.
+#[test]
+fn write_refuses_what_has_no_contents_of_its_own() {
+    let vol = writable(Variant::FfsIntl, 512, 1760, b"hello");
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+
+    // A directory has no data chain...
+    let err = m.append(root, b"Devs", b"x").unwrap_err();
+    assert!(
+        matches!(err, MutateError::NotAFile { found: 2, .. }),
+        "{err}"
+    );
+    // ...and a name that is not there is not there.
+    let err = m.write_file(root, b"Nope", 0, b"x").unwrap_err();
+    assert!(matches!(err, MutateError::NotFound { .. }), "{err}");
+    // The format records a length in 32 bits, and says so rather than
+    // truncating it.
+    let err = m.truncate(root, b"Doc", 1 << 32).unwrap_err();
+    assert!(matches!(err, MutateError::FileTooLarge { .. }), "{err}");
+    assert!(err.to_string().contains("byte_size"), "{err}");
+}
+
+/// The caveat, asserted rather than merely written down: an interrupted
+/// **overwrite** leaves old bytes or new bytes, per block, and nothing
+/// structural at all.
+///
+/// This is the one operation where a content block and the file's
+/// metadata are both in play, and the reason it comes out this clean is
+/// that an overwrite that changes no length changes no metadata either:
+/// the block count, `byte_size`, the pointer table and the bitmap are all
+/// untouched, so every prefix of the write is a volume that validates with
+/// *zero* findings -- not even a leak -- and holds a file of the right
+/// length made of some old blocks and some new ones.
+#[test]
+fn an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else() {
+    for variant in [Variant::Ofs, Variant::Ffs] {
+        let bs = 512;
+        let nblocks = 1760;
+        let payload = data_payload_size(bs, variant.is_ffs());
+        let old = stamped(1, payload * 6);
+        let new = stamped(2, payload * 6);
+
+        let total = {
+            let vol = writable(variant, bs, nblocks, &old);
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).unwrap();
+            m.write_file(root, b"Doc", 0, &new).unwrap();
+            let mut vol = m.into_volume();
+            vol.source_mut().clear_log();
+            let mut m = Mutator::open(vol).unwrap();
+            m.write_file(root, b"Doc", 0, &old).unwrap();
+            m.into_volume().into_inner().write_log().len()
+        };
+        assert!(total >= 7, "{variant:?}: {total} writes");
+
+        let mut crashed = 0;
+        for n in 0..=total {
+            let vol = writable(variant, bs, nblocks, &old);
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).unwrap();
+            m.volume().source_mut().clear_log();
+            m.volume().source_mut().fail_after(n);
+            if m.write_file(root, b"Doc", 0, &new).is_err() {
+                crashed += 1;
+            }
+            let mut vol =
+                Volume::open_with(m.into_volume().into_inner(), None, nblocks, 2).unwrap();
+
+            let report = vol.validate();
+            assert!(
+                report.is_clean(),
+                "{variant:?}: crash after {n} writes left {:#?}",
+                report
+                    .findings
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+            );
+            let doc = vol.lookup(root, b"Doc").unwrap().unwrap();
+            let back = vol.read_file(doc.lba).unwrap();
+            assert_eq!(back.len(), old.len(), "{variant:?}: length moved");
+            // Old bytes or new bytes, independently per block, and
+            // nothing in between.
+            for i in 0..back.len() / payload {
+                let (from, to) = (i * payload, (i + 1) * payload);
+                assert!(
+                    back[from..to] == old[from..to] || back[from..to] == new[from..to],
+                    "{variant:?}: crash after {n} writes tore block {i}"
+                );
+            }
+            assert_tree_intact(&mut vol);
+        }
+        assert!(crashed > 0, "{variant:?}: no prefix actually failed");
+    }
+}
+
+/// The sweep the crash-shape box was held open for: every prefix of a
+/// session that appends across an extension-block boundary, overwrites,
+/// grows and shrinks.
+///
+/// The damage allowed is exactly what the module documents. `OrphanBlock`
+/// -- blocks allocated and not yet reachable, or reachable and not yet
+/// freed -- because that is the direction the ordering fails in;
+/// `DircacheStale` on the two variants that have caches, because a cache
+/// is advisory. `ReachableButFree` never, a corrupt block never, and every
+/// file still reachable still reads every one of its bytes -- which for
+/// the file being written means its length and its extent still agree,
+/// the thing the header-block-as-single-commit rule exists to guarantee.
+#[test]
+fn an_interrupted_file_write_leaks_and_never_double_allocates() {
+    for variant in [
+        Variant::Ofs,
+        Variant::Ffs,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        let bs = 512;
+        let nblocks = 1760;
+        let p = data_payload_size(bs, variant.is_ffs()) as u64;
+        let slots = hash_table_size(bs) as u64;
+        let ext = slots * p;
+
+        let session = |vol: Volume<MemDisk>| -> (Volume<MemDisk>, bool) {
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).expect("the bitmap is valid at every prefix");
+            let ok = m
+                .append(root, b"Doc", &stamped(1, (ext + 2 * p) as usize))
+                .is_ok()
+                & m.write_file(root, b"Doc", p / 2, &stamped(2, 2 * p as usize))
+                    .is_ok()
+                & m.truncate(root, b"Doc", p + 11).is_ok()
+                & m.truncate(root, b"Doc", 3 * p + 5).is_ok()
+                & m.append(root, b"Doc", &stamped(3, 40)).is_ok();
+            (m.into_volume(), ok)
+        };
+
+        let total = {
+            let mut vol = writable(variant, bs, nblocks, &pattern(700));
+            vol.source_mut().clear_log();
+            let (vol, ok) = session(vol);
+            assert!(ok, "{variant:?}: the uninterrupted session must succeed");
+            vol.into_inner().write_log().len()
+        };
+        assert!(total > 20, "{variant:?}: the session writes {total} blocks");
+
+        let mut crashed = 0;
+        for n in 0..=total {
+            let mut vol = writable(variant, bs, nblocks, &pattern(700));
+            vol.source_mut().clear_log();
+            vol.source_mut().fail_after(n);
+            let (vol, ok) = session(vol);
+            if !ok {
+                crashed += 1;
+            }
+            let mut vol = Volume::open_with(vol.into_inner(), None, nblocks, 2).unwrap();
+
+            let report = vol.validate();
+            for finding in &report.findings {
+                let excusable = matches!(finding, Finding::OrphanBlock { .. })
+                    || (variant.has_dircache() && matches!(finding, Finding::DircacheStale { .. }));
+                assert!(
+                    excusable,
+                    "{variant:?}: crash after {n} writes left {finding}"
+                );
+            }
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "{variant:?}: crash after {n} writes"
+            );
+
+            let root = vol.root_lba();
+            for entry in vol.read_dir(root).unwrap() {
+                if entry.kind == EntryKind::File {
+                    let read = vol.read_file(entry.lba).unwrap();
+                    assert_eq!(read.len(), entry.byte_size as usize);
+                }
+            }
+            assert_tree_intact(&mut vol);
+        }
+        assert!(crashed > 0, "{variant:?}: no prefix actually failed");
+    }
+}
+
+/// A seeded random interleave of ranged writes, appends and truncates
+/// against a `Vec<u8>`, on OFS and FFS.
+///
+/// The offsets and lengths are drawn around the two boundaries where the
+/// arithmetic differs -- the payload block and the header table's last
+/// slot -- rather than uniformly over the file, because a uniform draw
+/// almost never lands on either. Every step is followed by a whole-file
+/// readback, a ranged readback of a random window (so the two paths are
+/// checked against the same model, not against each other) and a clean
+/// `validate()`.
+#[test]
+fn a_random_interleave_of_writes_agrees_with_a_model_file() {
+    for (v, variant) in [Variant::Ofs, Variant::Ffs].into_iter().enumerate() {
+        for (b, bs) in [512usize, 4096].into_iter().enumerate() {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let p = data_payload_size(bs, variant.is_ffs()) as u64;
+            let slots = hash_table_size(bs) as u64;
+            let mut rng = Rng::new(0x03DF_2000 + (v * 16 + b) as u64);
+
+            let mut model = pattern(1234);
+            let vol = writable(variant, bs, nblocks, &model);
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).expect("mutator");
+            let mut counts = [0usize; 3];
+
+            // Offsets and lengths that cluster on the boundaries: a
+            // block edge, the header table's last slot, and small
+            // amounts either side of both.
+            let near = |rng: &mut Rng| -> u64 {
+                let base = match rng.below(4) {
+                    0 => 0,
+                    1 => p,
+                    2 => slots * p,
+                    _ => (1 + rng.below(6) as u64) * p,
+                };
+                let jitter = rng.below(2 * p as usize + 1) as u64;
+                (base + jitter).saturating_sub(p / 2)
+            };
+
+            for step in 0..40u8 {
+                let tag = step.wrapping_add(1);
+                match rng.below(6) {
+                    0..=2 => {
+                        let off = near(&mut rng);
+                        let len = rng.below(2 * p as usize + 200);
+                        let data = stamped(tag, len);
+                        m.write_file(root, b"Doc", off, &data).expect("write_file");
+                        model_write(&mut model, off, &data);
+                        counts[0] += 1;
+                    }
+                    3..=4 => {
+                        let len = rng.below(2 * p as usize + 200);
+                        let data = stamped(tag, len);
+                        let at = model.len() as u64;
+                        m.append(root, b"Doc", &data).expect("append");
+                        model_write(&mut model, at, &data);
+                        counts[1] += 1;
+                    }
+                    _ => {
+                        let n = near(&mut rng);
+                        m.truncate(root, b"Doc", n).expect("truncate");
+                        model.resize(n as usize, 0);
+                        counts[2] += 1;
+                    }
+                }
+
+                let what = format!("{variant:?} @{bs} step {step}");
+                let vol = m.volume();
+                let doc = vol.lookup(root, b"Doc").unwrap().unwrap();
+                assert_eq!(doc.byte_size as usize, model.len(), "{what}: byte_size");
+                assert_eq!(vol.read_file(doc.lba).unwrap(), model, "{what}");
+
+                // The same file through the ranged path, over a window
+                // the model also knows the answer for.
+                if !model.is_empty() {
+                    let chain = vol.file_chain(doc.lba).unwrap();
+                    let off = rng.below(model.len()) as u64;
+                    let len = rng.below(3 * p as usize + 1);
+                    let mut buf = vec![0u8; len];
+                    let got = vol.read_range(&chain, off, &mut buf).unwrap();
+                    let want = &model[off as usize..(off as usize + len).min(model.len())];
+                    assert_eq!(&buf[..got], want, "{what}: ranged read at {off}");
+                }
+                assert_clean(vol, &what);
+            }
+
+            for (i, n) in counts.iter().enumerate() {
+                assert!(*n > 0, "{variant:?} @{bs}: operation {i} never ran");
+            }
+
+            // And the file put back to what it started as leaves the
+            // volume using exactly as many blocks as it did then. Not the
+            // *same* blocks: a copy-on-written boundary block moves, so
+            // which blocks a file occupies is allocation order and a
+            // documented don't-care, while how many it occupies is
+            // arithmetic and is not.
+            let before = {
+                let mut fresh = writable(variant, bs, nblocks, &pattern(1234));
+                allocated_set(&mut fresh).len()
+            };
+            m.truncate(root, b"Doc", 1234).expect("truncate back");
+            m.write_file(root, b"Doc", 0, &pattern(1234))
+                .expect("rewrite");
+            let mut vol = m.into_volume();
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} restored"));
+            assert_eq!(
+                allocated_set(&mut vol).len(),
+                before,
+                "{variant:?} @{bs}: the file did not give its blocks back"
             );
         }
     }

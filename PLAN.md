@@ -309,12 +309,15 @@ it under a real Kickstart 3.1.
 
 ## Milestone 3 — mutate
 
-**In progress.** Wave 1 — the allocator and the validator's repair half,
-the two pieces everything else in this milestone stands on — is landed,
-and so is wave 2: create, delete, rename and set-metadata in volumes this
-crate did not write, through `Mutator`. Wave 3 (file write/append/
-truncate) is what is left, and it is the reason two boxes below stay
-open.
+**Landed, but for one leg of the differential suite.** Wave 1 — the
+allocator and the validator's repair half, the two pieces everything else
+in this milestone stands on; wave 2 — create, delete, rename and
+set-metadata in volumes this crate did not write, through `Mutator`; wave
+3 — file write, append and truncate, the ranged read that shares their
+chain machinery, and the crash sweep over all of it. The one box still
+open is the differential mutation suite's *guest* half, which needs a
+Copperline fixture pipeline rather than more filesystem code, and is the
+same remaining leg as milestone 1's.
 
 - [x] **Allocator**: bitmap-based block allocation with the volume's
       own policy quirks documented as discovered. `src/allocator.rs`,
@@ -480,14 +483,139 @@ open.
       and where the same operation sequence run through both
       implementations produces the same tree, the same file bytes and the
       same used-block count.
-- [ ] **File write/append/truncate**: FFS chains and OFS headers both.
-- [ ] **Crash-shape discipline**: data blocks before metadata, chain
+- [x] **File write/append/truncate**: FFS chains and OFS headers both.
+      `Mutator::write_file`, `Mutator::append` and `Mutator::truncate` in
+      `src/mutate.rs`, over one private `edit_file` — three ways of
+      choosing an offset, a slice and a resulting length, so the block
+      arithmetic and the OFS bookkeeping exist once.
+
+      **The file header block is the single commit.** Every size change
+      ends in exactly one write, carrying `byte_size`, `high_seq`, the
+      whole data-pointer table and the extension pointer together; before
+      it the file is entirely the old one, after it entirely the new one.
+      That is forced rather than chosen: `file_chain` refuses a header
+      whose length and extent disagree *in both directions*, so any order
+      moving one before the other leaves a file that will not read, and
+      `byte_size` lives in the header.
+
+      Two consequences follow, and they are the wave's two real decisions.
+      **The extension chain is rebuilt, never patched** — a `T_LIST` block
+      is reachable only through the block before it back to the header, so
+      editing one in place would commit a new block count from a block
+      that is not the header. A size change therefore allocates a fresh
+      chain, writes it last-block-first, points the header at it and frees
+      the old blocks afterwards; it costs one block per ~35 KB of OFS file
+      per size change, which is the price of the commit being one write,
+      and is why every entry point takes a whole slice. (The same argument
+      that made dircaches regenerate rather than patch, one chain over.)
+      **A data block whose *recorded* length changes is replaced, not
+      edited** — on OFS only, where the length is a field (longword 3): a
+      grow makes the old last block full, a shrink makes some earlier
+      block short, and copy-on-writing it keeps the header the only
+      commit. FFS records no such length, so its boundary block is written
+      in place and the bytes it gains past the old end are unreachable
+      until the commit adds them.
+
+      **Writing past the end zero-fills**, and the evidence says that is a
+      choice rather than a default. AmigaDOS cannot even reach the state
+      by seeking: "You cannot Seek() beyond the end of a file"
+      (`dos.library/Seek`), and `ACTION_SEEK` "shall fail with the error
+      code `ERROR_SEEK_ERROR`" past EOF, leaving the pointer unaltered —
+      confirmed structurally in AROS's `afs.handler`, whose `seek()`
+      initialises `ERROR_SEEK_ERROR` and never clears it when the chain
+      runs out. The only route is `SetFileSize()`, whose autodoc says "if
+      the file is extended, no values should be assumed for the new bytes"
+      and whose packet specification says outright that "unlike other
+      operating systems, AmigaDOS does not enforce zero-initialization of
+      the extended region". Both permitted answers ship: AROS grows via
+      `writeData` with a NULL buffer, which on FFS does not write the new
+      block at all and leaves whatever the disk held; Linux's `affs`
+      zeroes, through `cont_expand_zero` and
+      `affs_extent_file_ofs`/`affs_getzeroblk`. This crate zeroes — not
+      for tidiness but because the bytes a freshly allocated block holds
+      are a *deleted file's*, and handing them back through a new file's
+      length is an information leak the specification permits and nobody
+      wants. Sparse is not on the table at all: the pointer table is dense
+      by construction, data block *n* being the *n*th slot counted through
+      the chain with 0 as the terminator, so the format has no hole to
+      leave.
+
+      Tested by: the write/append/truncate matrix on OFS, FFS, a dircache
+      variant and a long-name variant at 512 and 4096 — appends crossing
+      the extension boundary, overwrites spanning
+      partial-first/full-middle/partial-last, truncates to 0, to mid-block,
+      to an extension boundary and upward, and a write past the end whose
+      gap is asserted to be zeroes on a volume pre-filled with `0xA5`;
+      every step followed by a byte-identical readback against a `Vec<u8>`
+      model and a clean `validate()`; a seeded random interleave of the
+      three operations with offsets and lengths drawn *around* the two
+      boundaries where the arithmetic differs; the crash sweeps below; and
+      a differential leg where xdftool reads back every byte of a file
+      this crate appended to, overwrote, truncated and grew, and where the
+      same end state reached by a delete-and-rewrite there and an
+      append-and-overwrite here yields the same tree, the same bytes and
+      the same used-block count.
+- [x] **Ranged reads** (`read_range(&chain, offset, buf)`): the FUSE-shaped
+      gap in the read surface, and Copperline's too — a trackdisk-level
+      consumer never wants whole files. `Volume::read_range` in
+      `src/file.rs`, landed with wave 3 because both live in the chain
+      machinery.
+
+      It walks **only the blocks the range covers** — the first is
+      `offset / payload_size`, arithmetic rather than a walk — and
+      verifies the OFS headers of exactly those, since a block's expected
+      sequence number falls out of its index and not out of having reached
+      it from block 1. The verification is the *same* function the
+      streaming read uses, because two copies would be two chances for one
+      of them to stop checking the sequence number. Clamping is `read(2)`'s:
+      `byte_size` is the authority for where the file stops (the last
+      block has capacity past it and returning that would invent data), an
+      offset at or past the end returns `Ok(0)` rather than an error, and
+      a short count is how a partial fill reports itself. Tested against
+      the whole-file read on both filesystems at both block sizes over
+      twelve range shapes, with the block *reads* counted to prove the
+      range really is a range, and with a corrupted OFS block that a range
+      stopping short of it still reads past and a range touching it
+      refuses by name.
+
+      `FileChain` was split from the streaming read precisely so it could
+      be collected once and reused; a pre-collected chain is also
+      immutable data a concurrent consumer can hold outside its `Volume`
+      lock, which keeps the *read* critical section at one block read.
+      Read is the only path with that property: `lookup` and `readdir`
+      walk hash chains, so their sections are chain-length long — fine in
+      practice, and fine *because* the adapter's block cache absorbs the
+      walk, which is the cache earning its place rather than an
+      optimisation. Concurrency itself stays the consumer's: `&mut self`
+      was deliberate, a FUSE adapter wraps the volume in a `Mutex` and
+      brings the block cache its own medium warrants, since an LRU sized
+      for a local image is wrong for a ZuluSCSI card over USB and that is
+      exactly why the format crate cannot choose it.
+
+      The mount-time story for such an adapter, recorded here because it
+      falls straight out of surfaces the crate already has: `validate()`
+      walks the whole volume — seconds on an image file, rather longer
+      through a USB-attached card — so it is a mount *option*, defaulted
+      by mode: always before exposing writes, opt-in for read-only. A
+      damaged volume still mounts read-only with everything reachable
+      (the walk records and continues by design, and read-only is when
+      someone most wants the driver); refuse-or-repair gates only the
+      write side. `bitmap_flag == 0` is the cheap early signal that a full
+      walk is warranted before anyone pays for one. And a mount that came
+      up read-only *because* validation found something must say so
+      distinctly from one the user asked to be read-only: `EROFS` on the
+      first write is technically correct and tells them nothing, while a
+      mount-time log naming the findings — and the repair option that
+      would clear them — turns "the driver refused" into "the driver
+      protected the image". Which is the whole point of `Report` being
+      typed findings rather than a boolean.
+- [x] **Crash-shape discipline**: data blocks before metadata, chain
       pointers flipped last, bitmap updated in an order that at worst
       *leaks* blocks (validator-recoverable) rather than double-uses
       them. The format has no journal; ordering is all there is.
 
-      **Held open for wave 3, and only for wave 3.** Every write path that
-      exists is swept: `tests/volumes.rs` stops the medium after each
+      Every write path in the crate is swept: `tests/volumes.rs` stops the
+      medium after each
       successive write of an allocator session (wave 1), of a repair
       (wave 1) and of a mutation session that creates a directory, creates
       a file with an overflowing comment, renames and deletes (wave 2), on
@@ -500,15 +628,36 @@ open.
       leaves behind, and `validate()` saying so is the mechanism by which
       it gets rebuilt.
 
-      What wave 3 must add before this is ticked: the same sweep over
-      **file write, append and truncate** — data blocks down before the
-      pointer table naming them, `high_seq` and `byte_size` moved in an
-      order that never claims a block the chain does not have, and the
-      truncate direction's frees after the header shrinks rather than
-      before. That is the one ordering in the format where the *content*
-      block and the *metadata* block are both being changed at once, and
-      it is the reason the box is not being ticked on the entry
-      operations alone.
+      Wave 3 added the sweep the box was held open for — **file write,
+      append and truncate** — and it comes out in two pieces, because the
+      two halves of the operation have different shapes.
+
+      An **overwrite that changes no length changes no metadata**: the
+      block count, `byte_size`, the pointer tables and the bitmap are all
+      untouched, so every prefix of it validates with *zero* findings and
+      the file is the right length made of some old blocks and some new
+      ones. That is asserted directly — each block compared against the
+      old bytes *and* the new bytes and required to be one of them. It is
+      also the one place this milestone's "old volume, new volume, or old
+      volume plus leaks" invariant weakens, and it weakens to exactly
+      **old bytes or new bytes, independently per block**. The weakening
+      is inherent to overwriting in place rather than a shortcut: the
+      alternative is copy-on-writing every touched block, which turns
+      every overwrite into a reallocation and makes a file's blocks
+      migrate across the volume for a guarantee the format cannot express
+      anyway. Nothing structural is at risk in it, and `ReachableButFree`
+      remains impossible.
+
+      A **size change** is swept the same way the entry operations are, on
+      a plain, a dircache and a long-name variant and on both filesystems:
+      every prefix of a session that appends across an extension-block
+      boundary, overwrites through the middle, truncates down and grows
+      again. `OrphanBlock` is allowed and `DircacheStale` on the two
+      variants that have caches; `ReachableButFree` never appears, no
+      reachable block is corrupt, and — the assertion this wave is really
+      about — *every file still reachable still reads every one of its
+      bytes*, which is the header-block-as-single-commit rule saying that
+      a file's length and its extent are never caught disagreeing.
 - [ ] **Differential mutation tests**: same operation sequence applied
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
@@ -519,7 +668,15 @@ open.
       writes, a delete, a write) through xdftool and through `Mutator`,
       and the resulting trees agree entry for entry, byte for byte, and
       on the used-block count; separately, xdftool lists, reads and
-      *writes into* a volume this crate mutated. The don't-cares are the
+      *writes into* a volume this crate mutated. Wave 3 added the same
+      exercise for file *contents*: xdftool reads back every byte of a
+      file this crate appended to across an extension-block boundary,
+      overwrote through the middle, truncated and grew — the one check the
+      model tests cannot make, since a writer and a reader that agreed on
+      the same wrong chain arithmetic would satisfy both — and the same
+      end state reached by a delete-and-rewrite there and an
+      append-and-overwrite here produces the same tree, the same bytes and
+      the same used-block count. The don't-cares are the
       two predicted ones and no others: allocation order (this crate
       scans forward from a hint, xdftool from the bottom of the bitmap)
       and dates (the caller's to supply here, the wall clock's there).
@@ -578,49 +735,6 @@ open.
       does.
 
 ## In scope, not scheduled
-
-- **Ranged reads** (`read_range(&chain, offset, buf)`): the FUSE-shaped
-  gap in the read surface, and Copperline's too — a trackdisk-level
-  consumer never wants whole files. `FileChain` was split from the
-  streaming read precisely so it could be collected once and reused;
-  this walks only the blocks the range covers, verifying OFS headers
-  for exactly those (the expected sequence number falls out of the
-  block index — no need to have walked from the start), clamping
-  against `byte_size`, returning 0 bytes past EOF the way read(2)
-  does. A pre-collected chain is also immutable data a concurrent
-  consumer can hold outside its `Volume` lock, which keeps the *read*
-  critical section at one block read — read is the only path with that
-  property, though: `lookup` and `readdir` walk hash chains, so their
-  sections are chain-length long, fine in practice (chains are short
-  unless someone has abused a `DOS\0` directory) but fine *because*
-  the adapter's block cache absorbs the walk, which is the cache
-  earning its place rather than an optimisation. Concurrency itself
-  stays the consumer's: `&mut self` was deliberate, a FUSE adapter
-  wraps the volume in a `Mutex` and brings the block cache its own
-  medium warrants — an LRU sized for a local image is wrong for a
-  ZuluSCSI card over USB, which is exactly why the format crate cannot
-  choose it. Scheduled into M3 wave 3 alongside the file-write work,
-  since both live in the chain machinery.
-
-  The mount-time story for such an adapter, recorded here because it
-  falls straight out of surfaces the crate already has: `validate()`
-  walks the whole volume — seconds on an image file, rather longer
-  through a USB-attached card — so it is a mount *option*, defaulted
-  by mode: always before exposing writes, opt-in for read-only. A
-  damaged volume still mounts read-only with everything reachable
-  (the walk records and continues by design, and read-only is when
-  someone most wants the driver); refuse-or-repair gates only the
-  write side. `bitmap_flag == 0` is the cheap early signal that a
-  full walk is warranted before anyone pays for one. And a mount that
-  came up read-only *because* validation found something must say so
-  distinctly from one the user asked to be read-only: `EROFS` on the
-  first write is technically correct and tells them nothing, while a
-  mount-time log naming the findings — and the repair option that
-  would clear them — turns "the driver refused" into "the driver
-  protected the image". Which is the whole point of `Report` being
-  typed findings rather than a boolean: the adapter can *say what it
-  saw*, and every finding already states its consequence in its
-  `Display`.
 
 - **Resize** (grow/shrink an existing volume in place): gated on the
   M3 allocator and mutation discipline. The filesystem half only — the

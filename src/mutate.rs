@@ -51,6 +51,98 @@
 //! sweep in `tests/volumes.rs` asserts exactly that, at every prefix of
 //! every operation's writes.
 //!
+//! # File contents: the one place two blocks change together
+//!
+//! [`Mutator::write_file`], [`Mutator::append`] and [`Mutator::truncate`]
+//! are the operations the three rules above do not fully cover, because a
+//! file's *length* and its *extent* are recorded in different blocks and
+//! must agree: [`Volume::file_chain`](crate::Volume::file_chain) refuses a
+//! header whose `byte_size` and data-block count disagree, in both
+//! directions, so any order that moves one before the other leaves a file
+//! that will not read. Three decisions make that go away.
+//!
+//! **The file header block is the single commit.** Every size change ends
+//! in exactly one write — the header, carrying `byte_size`, `high_seq`,
+//! the whole data-pointer table and the extension pointer together. Before
+//! that write the file is entirely the old one; after it, entirely the new
+//! one.
+//!
+//! **The extension chain is immutable: it is rebuilt, never patched.**
+//! That falls out of the previous rule rather than being a taste. A
+//! `T_LIST` block is reachable only through the block before it, back to
+//! the header, so *editing* one in place would commit a new block count
+//! from a block that is not the header — and the header's `byte_size` would
+//! still be the old one, which is precisely the unreadable state. So a
+//! size change allocates a fresh chain, writes it (last block first, so no
+//! `next` ever names a block that is not there), points the header at it,
+//! and frees the old blocks afterwards. It costs one block per ~35 KB of
+//! OFS file per size change, which is the price of the commit being one
+//! write; a caller appending a byte at a time to a large file should
+//! buffer, and every entry point here takes a whole slice for that reason.
+//!
+//! **A data block whose recorded length changes is replaced, not
+//! edited** — on OFS only, where the length *is* recorded (longword 3 of
+//! the block's own header). Growing a file makes its old last block full
+//! and shrinking makes some earlier block short, and either way that
+//! block's `size` field has to move in step with the header's `byte_size`.
+//! Writing the new content to a freshly allocated block and swapping the
+//! pointer in the commit keeps that single-write property. On FFS there is
+//! no such field — the last block's length is `byte_size` arithmetic and
+//! nothing else — so the boundary block is written in place, and the bytes
+//! it gains past the old end of file are unreachable until the commit
+//! makes them part of the file.
+//!
+//! ## The caveat: an in-place overwrite is not crash-atomic
+//!
+//! Data blocks that are entirely inside both the old file and the new one
+//! and keep their length are **overwritten in place**, with a
+//! read-modify-write for a partial first or last block. That is the one
+//! place this module's "old volume, new volume, or old volume plus leaks"
+//! invariant weakens, and it weakens to exactly: **old bytes or new bytes,
+//! independently per block**. It is inherent to overwriting rather than a
+//! shortcut — the alternative is copy-on-writing every touched block,
+//! which turns every overwrite into a reallocation and makes a file's
+//! blocks migrate across the volume for no gain the format can express.
+//! What still holds through it is everything structural: the block count,
+//! `byte_size`, the pointer tables and the bitmap are untouched by an
+//! overwrite, so an interrupted one leaves a file of the right length made
+//! of some old and some new blocks, which reads, validates and can simply
+//! be written again. `ReachableButFree` remains impossible.
+//!
+//! ## Writing past the end: the gap is zero-filled
+//!
+//! [`Mutator::write_file`] at an offset past the current end of file, and
+//! [`Mutator::truncate`] to a larger size, both **allocate every block in
+//! the gap and fill it with zeroes**. The format has no other option: a
+//! file's pointer table is dense by construction — data block *n* is the
+//! *n*th table slot, counted through the extension chain, and slot 0 is
+//! the chain's terminator — so there is no encoding for a hole and nothing
+//! to be sparse with.
+//!
+//! Which leaves *what the gap contains*, and AmigaDOS answers that
+//! deliberately loosely. `Seek()` cannot create the situation at all:
+//! "You cannot Seek() beyond the end of a file" (`dos.library/Seek`
+//! autodoc), and `ACTION_SEEK` "shall fail with the error code
+//! `ERROR_SEEK_ERROR`" for a position "beyond the end-of-file", leaving
+//! the file pointer unaltered — so seek-past-EOF-then-write is not a
+//! behaviour to be compatible with, it is a refusal. The only route to an
+//! extended file is `SetFileSize()`, whose autodoc says "if the file is
+//! extended, no values should be assumed for the new bytes" and
+//! `ACTION_SET_FILE_SIZE`'s specification says outright that "unlike other
+//! operating systems, AmigaDOS does not enforce zero-initialization of the
+//! extended region". Both permitted answers exist in the wild: AROS's
+//! `afs.handler` grows by calling `writeData` with a NULL buffer, which on
+//! FFS does not write the newly allocated block *at all* and leaves
+//! whatever was on the disk; Linux's `affs` zeroes, through
+//! `cont_expand_zero` on FFS and `affs_extent_file_ofs`/`affs_getzeroblk`
+//! on OFS.
+//!
+//! This crate zeroes, and the reason is not tidiness: the bytes a
+//! freshly allocated block holds are a *deleted file's*, and handing them
+//! back through a new file's length is an information leak that the
+//! specification permits and nobody wants. Zero is also within what every
+//! caller may assume, since the specification lets them assume nothing.
+//!
 //! # Dircaches: regenerated, never patched
 //!
 //! On `DOS\4`/`DOS\5` the affected directory's whole cache chain is
@@ -252,6 +344,27 @@ pub enum MutateError<E> {
         /// The object it names.
         target: u64,
     },
+    /// A write, append or truncate aimed at something that is not a plain
+    /// file. A directory has no data chain; a *hard link* has none of its
+    /// own either — the bytes belong to the block it names, which is what
+    /// [`Volume::resolve_link`](crate::Volume::resolve_link) is for, and
+    /// silently following it here would write through a name the caller
+    /// did not give.
+    NotAFile {
+        /// The block.
+        lba: u64,
+        /// Its secondary type.
+        found: i32,
+    },
+    /// A file grown past what longword −47 can record. `byte_size` is a
+    /// 32-bit field, so 4 GB − 1 is the format's ceiling and not this
+    /// crate's.
+    FileTooLarge {
+        /// The length asked for.
+        size: u64,
+        /// The largest the format can record.
+        max: u64,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for MutateError<E> {
@@ -306,6 +419,15 @@ impl<E: fmt::Display> fmt::Display for MutateError<E> {
             Self::NotInLinkChain { lba, target } => write!(
                 f,
                 "hard link {lba} is not in the link chain of the object {target} it names"
+            ),
+            Self::NotAFile { lba, found } => write!(
+                f,
+                "block {lba} (secondary type {found}) is not a file, so it has no contents to write"
+            ),
+            Self::FileTooLarge { size, max } => write!(
+                f,
+                "a file of {size} bytes cannot be recorded: the format's byte_size field stops at \
+                 {max}"
             ),
         }
     }
@@ -546,11 +668,12 @@ impl<S: BlockMedium> Mutator<S> {
     /// points at those, then the parent's hash slot. Each write only ever
     /// names blocks already on the disk.
     ///
-    /// The whole file is held by the caller rather than streamed: append
-    /// and truncate — and with them the streaming writer that shares their
-    /// machinery — are wave 3 of this milestone.
+    /// The whole file is held by the caller rather than streamed.
     /// [`Populator::create_file_with`](crate::Populator::create_file_with)
-    /// is the streaming form for a volume being built from nothing.
+    /// is the streaming form for a volume being built from nothing; here,
+    /// a caller with more bytes than memory creates the file empty and
+    /// [`appends`](Mutator::append), which costs one rebuild of the
+    /// extension chain per call and is why the argument is a slice.
     pub fn create_file(
         &mut self,
         parent: u64,
@@ -645,6 +768,338 @@ impl<S: BlockMedium> Mutator<S> {
         );
 
         self.emit(&prep, EntryKind::File, data.len() as u32, &mut hdr)
+    }
+
+    // -- file contents -----------------------------------------------------
+
+    /// Write `data` into an existing file at `offset`, extending it if the
+    /// range runs past the end.
+    ///
+    /// Returns the file's length afterwards, which is
+    /// `max(byte_size, offset + data.len())` — a write wholly inside the
+    /// file does not shorten it, and one that runs past the end grows it.
+    ///
+    /// Blocks the range covers entirely are overwritten in place; a
+    /// partial first or last block is read, patched and written back. See
+    /// this module's documentation for the write order, for why the header
+    /// block is the single commit, and for the one caveat this operation
+    /// carries — an interrupted overwrite leaves old bytes or new bytes,
+    /// per block, and nothing structural.
+    ///
+    /// An `offset` past the current end of file is legal and **zeroes the
+    /// gap**, allocating every block of it: the format has no
+    /// representation for a hole, `Seek()` on AmigaDOS refuses to position
+    /// past the end at all, and `SetFileSize()` — the only way to get
+    /// there — leaves the extended region explicitly undefined. Zero is
+    /// the answer that does not hand a deleted file's bytes to a new one.
+    pub fn write_file(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let entry = self.expect_file(parent, name)?;
+        let end = offset.saturating_add(data.len() as u64);
+        let new_size = end.max(entry.byte_size as u64);
+        self.edit_file(&entry, offset, data, new_size)
+    }
+
+    /// Append `data` to a file: the common case, and sugar for
+    /// [`Mutator::write_file`] at the current end of file.
+    ///
+    /// Deliberately sugar rather than a second implementation. "Where does
+    /// the file end" is one question with one answer — longword −47 — and
+    /// an append that computed the position itself would be a second place
+    /// to get the last block's short length wrong.
+    pub fn append(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        data: &[u8],
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let entry = self.expect_file(parent, name)?;
+        let at = entry.byte_size as u64;
+        self.edit_file(&entry, at, data, at.saturating_add(data.len() as u64))
+    }
+
+    /// Set a file's length, in either direction — AmigaDOS's
+    /// `SetFileSize`.
+    ///
+    /// **Shrinking** frees the data blocks and extension blocks past the
+    /// cut, and does it in that order: the header block is rewritten with
+    /// the new `byte_size`, `high_seq` and table — and, on OFS, the block
+    /// that is now last is replaced by one whose recorded length is the
+    /// short one — and only once all of that is on the disk is a single
+    /// bit cleared. A crash before the header write leaves the file as it
+    /// was; a crash after it leaks the blocks past the cut, which
+    /// [`repair`](crate::repair) reclaims. The other order would leave the
+    /// bitmap calling a block free while the file still pointed at it.
+    ///
+    /// **Growing** allocates blocks and zero-fills them, for the reasons
+    /// given in this module's documentation — the format cannot express a
+    /// hole, and the specification's "no values should be assumed" leaves
+    /// the choice open, so this takes the one that cannot leak a deleted
+    /// file's contents.
+    ///
+    /// On FFS a shrink is `byte_size` arithmetic and a table: there is no
+    /// per-block length anywhere to correct. On OFS there is exactly one,
+    /// in the new last block, and it is the reason that block is rewritten
+    /// rather than left alone.
+    pub fn truncate(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        new_size: u64,
+    ) -> Result<(), MutateError<Transport<S>>> {
+        let entry = self.expect_file(parent, name)?;
+        // Offset at the new end with nothing to write: everything between
+        // the old end and there — if there is anything — is the gap, and
+        // the gap is zeroes.
+        self.edit_file(&entry, new_size, &[], new_size)?;
+        Ok(())
+    }
+
+    /// The one implementation behind write, append and truncate.
+    ///
+    /// `data` lands at `offset`; the file ends at `new_size`; anything
+    /// between the old end and `new_size` that `data` does not cover is
+    /// zeroes. Every caller above is a way of choosing those three
+    /// numbers, which is the point — the block arithmetic, the ordering
+    /// and the OFS header bookkeeping exist once.
+    fn edit_file(
+        &mut self,
+        entry: &Entry,
+        offset: u64,
+        data: &[u8],
+        new_size: u64,
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        if new_size > u32::MAX as u64 {
+            return Err(MutateError::FileTooLarge {
+                size: new_size,
+                max: u32::MAX as u64,
+            });
+        }
+        let bs = self.bs();
+        let ffs = self.vol.variant().is_ffs();
+        let payload = data_payload_size(bs, ffs) as u64;
+        let slots = hash_table_size(bs) as usize;
+        let header = entry.lba;
+
+        let chain = self.vol.file_chain(header)?;
+        let old_size = chain.byte_size as u64;
+        let n_old = chain.blocks.len();
+        let n_new = div_ceil(new_size, payload) as usize;
+        let kept = n_old.min(n_new);
+
+        // How many bytes of block `i` the file uses at a given length.
+        let len_at = |size: u64, i: usize| -> usize {
+            size.saturating_sub(i as u64 * payload).min(payload) as usize
+        };
+
+        // At most one *kept* block changes its recorded length: the last
+        // one either file has in common. Every earlier kept block is full
+        // in both, and everything past `kept` is new or gone.
+        let relength = (kept > 0 && len_at(old_size, kept - 1) != len_at(new_size, kept - 1))
+            .then(|| kept - 1);
+        // Only OFS records that length, so only OFS has to replace the
+        // block; on FFS the same bytes go back where they were.
+        let cow_index = if ffs { None } else { relength };
+
+        // Whether the extension chain's *contents* change. The header's
+        // own table holds the first `slots` pointers, so a file that stays
+        // inside it never touches the chain at all.
+        let n_ext_new = ext_block_count(n_new, slots);
+        let ext_dirty = (n_new != n_old && (n_new > slots || n_old > slots))
+            || matches!(cow_index, Some(i) if i >= slots);
+
+        // Everything up front, then one flush: after it every block number
+        // below is durable, so `reference` never refuses.
+        let mut hint = chain.blocks.last().map(|&b| b as u64).unwrap_or(entry.lba);
+        let mut fresh: Vec<Allocation> = Vec::with_capacity(n_new.saturating_sub(n_old));
+        for _ in n_old..n_new {
+            let a = self.alloc.allocate_near(hint)?;
+            hint = a.block();
+            fresh.push(a);
+        }
+        let cow_at = match cow_index {
+            Some(_) => {
+                let a = self.alloc.allocate_near(hint)?;
+                hint = a.block();
+                Some(a)
+            }
+            None => None,
+        };
+        let mut ext_at: Vec<Allocation> = Vec::new();
+        if ext_dirty {
+            for _ in 0..n_ext_new {
+                let a = self.alloc.allocate_near(hint)?;
+                hint = a.block();
+                ext_at.push(a);
+            }
+        }
+        self.flush()?;
+
+        let mut fresh_lba = Vec::with_capacity(fresh.len());
+        for a in &fresh {
+            fresh_lba.push(self.alloc.reference(a)?);
+        }
+        let cow_lba = match &cow_at {
+            Some(a) => Some(self.alloc.reference(a)?),
+            None => None,
+        };
+        let mut ext_lba = Vec::with_capacity(ext_at.len());
+        for a in &ext_at {
+            ext_lba.push(self.alloc.reference(a)?);
+        }
+
+        // The file's blocks as they will be: kept, replaced, or new.
+        let mut blocks: Vec<u64> = Vec::with_capacity(n_new);
+        for i in 0..n_new {
+            if i >= n_old {
+                blocks.push(fresh_lba[i - n_old]);
+            } else if Some(i) == cow_index {
+                blocks.push(cow_lba.expect("a cow index implies a cow block"));
+            } else {
+                blocks.push(chain.blocks[i] as u64);
+            }
+        }
+
+        let write_lo = offset;
+        let write_hi = offset + data.len() as u64;
+        // The grow region: everything between the old end and the new one,
+        // which `data` may or may not cover and the rest of which is
+        // zeroes.
+        let grow_lo = old_size.min(new_size);
+
+        let mut buf = vec![0u8; bs];
+        // Two passes, in this order: blocks nothing reaches first, blocks
+        // the old file already reaches second. The first pass is free —
+        // an interruption in it leaks. The second is the documented
+        // in-place caveat.
+        for pass in 0..2 {
+            for i in 0..n_new {
+                let untouchable = i >= n_old || Some(i) == cow_index;
+                if untouchable != (pass == 0) {
+                    continue;
+                }
+                let start = i as u64 * payload;
+                let len = len_at(new_size, i);
+                let next = blocks.get(i + 1).copied().unwrap_or(0) as u32;
+                if !untouchable {
+                    // A kept block is rewritten only if something in it
+                    // actually differs: its bytes, or — on OFS, where it
+                    // is recorded — which block follows it.
+                    let old_next = chain.blocks.get(i + 1).copied().unwrap_or(0);
+                    let bytes_change = overlaps(start, len, write_lo, write_hi)
+                        || overlaps(start, len, grow_lo, new_size);
+                    let next_changes = !ffs && old_next as u64 != next as u64;
+                    if !bytes_change && !next_changes {
+                        continue;
+                    }
+                }
+
+                // Whatever the old file had here survives, unless the
+                // write covers it: read-modify-write, through the ranged
+                // read so an OFS block is verified on the way in rather
+                // than trusted.
+                let mut payload_buf = vec![0u8; len];
+                let keep = len_at(old_size, i).min(len);
+                if keep > 0 && i < n_old {
+                    let got = self
+                        .vol
+                        .read_range(&chain, start, &mut payload_buf[..keep])?;
+                    debug_assert_eq!(got, keep);
+                }
+                let lo = start.max(write_lo);
+                let hi = (start + len as u64).min(write_hi);
+                if lo < hi {
+                    let n = (hi - lo) as usize;
+                    let from = (lo - write_lo) as usize;
+                    let to = (lo - start) as usize;
+                    payload_buf[to..to + n].copy_from_slice(&data[from..from + n]);
+                }
+
+                build_data_block(&mut buf, header, i as u32 + 1, &payload_buf, next, ffs);
+                self.write(blocks[i], &buf)?;
+            }
+        }
+
+        // The fresh extension chain, written backwards so a `next` never
+        // names a block that is not on the disk yet. Nothing points at its
+        // first block until the header does.
+        for (k, &lba) in ext_lba.iter().enumerate().rev() {
+            let first = slots + k * slots;
+            let count = (n_new - first).min(slots);
+            let mut eb = vec![0u8; bs];
+            wr32(&mut eb, OFF_TYPE, T_LIST);
+            wr32(&mut eb, OFF_OWN_KEY, lba as u32);
+            wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
+            wr32(&mut eb, tail(bs, TL_PARENT), header as u32);
+            wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
+            wr32(
+                &mut eb,
+                tail(bs, TL_EXTENSION),
+                ext_lba.get(k + 1).copied().unwrap_or(0) as u32,
+            );
+            for i in 0..count {
+                wr32(
+                    &mut eb,
+                    data_pointer_offset(bs, i as u32 + 1),
+                    blocks[first + i] as u32,
+                );
+            }
+            finish_checksum(&mut eb);
+            self.write(lba, &eb)?;
+        }
+
+        // The commit: one write, carrying the length, the count, the whole
+        // table and the extension pointer. Before it the file is entirely
+        // the old one; after it, entirely the new one.
+        let in_header = n_new.min(slots);
+        let mut hdr = self.get(header)?;
+        for b in hdr[OFF_HASH_TABLE..OFF_HASH_TABLE + slots * 4].iter_mut() {
+            *b = 0;
+        }
+        wr32(&mut hdr, OFF_HIGH_SEQ, in_header as u32);
+        wr32(
+            &mut hdr,
+            OFF_FIRST_DATA,
+            blocks.first().copied().unwrap_or(0) as u32,
+        );
+        for (i, &lba) in blocks.iter().take(in_header).enumerate() {
+            wr32(&mut hdr, data_pointer_offset(bs, i as u32 + 1), lba as u32);
+        }
+        let first_ext = if ext_dirty {
+            ext_lba.first().copied().unwrap_or(0)
+        } else {
+            chain.extensions.first().copied().unwrap_or(0) as u64
+        };
+        wr32(&mut hdr, tail(bs, TL_EXTENSION), first_ext as u32);
+        wr32(&mut hdr, tail(bs, TL_BYTE_SIZE), new_size as u32);
+        if let Some(now) = self.clock {
+            write_date(&mut hdr, self.vol.variant(), now);
+        }
+        self.put(header, &mut hdr)?;
+
+        // Advisory records after the authoritative one, then the frees:
+        // a bit is cleared only once nothing on the disk names the block.
+        self.refresh_dircache(entry.parent as u64)?;
+        self.touch_disk()?;
+        for i in n_new..n_old {
+            self.alloc.free(chain.blocks[i] as u64)?;
+        }
+        if let Some(i) = cow_index {
+            self.alloc.free(chain.blocks[i] as u64)?;
+        }
+        if ext_dirty {
+            for &e in &chain.extensions {
+                self.alloc.free(e as u64)?;
+            }
+        }
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(new_size)
     }
 
     // -- deleting ----------------------------------------------------------
@@ -976,6 +1431,23 @@ impl<S: BlockMedium> Mutator<S> {
             });
         }
         Ok(())
+    }
+
+    /// The entry `name` in `parent`, refusing anything whose contents are
+    /// not its own to write.
+    fn expect_file(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+    ) -> Result<Entry, MutateError<Transport<S>>> {
+        let entry = self.expect_entry(parent, name)?;
+        if entry.kind != EntryKind::File {
+            return Err(MutateError::NotAFile {
+                lba: entry.lba,
+                found: entry.kind.secondary_type(),
+            });
+        }
+        Ok(entry)
     }
 
     fn expect_entry(
@@ -1367,6 +1839,30 @@ impl<S: BlockMedium> Mutator<S> {
         self.put(root, &mut buf)
     }
 
+    /// Stamp the root's `disk_altered` (−10) and nothing else — what a
+    /// change to a *file's contents* alters.
+    ///
+    /// Deliberately not [`Mutator::touch`]: writing to a file does not
+    /// change what its directory contains, and the four implementations
+    /// surveyed in this module's documentation agree on that much even
+    /// where they disagree about everything else. amitools stamps a
+    /// directory only from `_create_node`/`_delete`; Linux's `affs` stamps
+    /// the *file's* inode on a write and the directory's only on an insert
+    /// or a remove; AROS stamps every ancestor on a write, which is the
+    /// outlier. The file's own DateStamp is stamped too — in the header
+    /// write that commits the change, so it costs nothing.
+    fn touch_disk(&mut self) -> Result<(), MutateError<Transport<S>>> {
+        let now = match self.clock {
+            Some(now) => now,
+            None => return Ok(()),
+        };
+        let bs = self.bs();
+        let root = self.vol.root_lba();
+        let mut buf = self.get(root)?;
+        wr_date(&mut buf, tail(bs, TL_ROOT_DISK_ALTERED), now);
+        self.put(root, &mut buf)
+    }
+
     // -- block I/O and the bitmap ------------------------------------------
 
     /// Read a metadata block whole, checksum verified.
@@ -1441,4 +1937,19 @@ struct Prepared<'a> {
     comment_block: u32,
     name: &'a [u8],
     meta: &'a Metadata<'a>,
+}
+
+/// How many `T_LIST` blocks a file of `n_data` data blocks needs: the
+/// header's own table holds the first `slots` pointers and every extension
+/// block another `slots`.
+fn ext_block_count(n_data: usize, slots: usize) -> usize {
+    let over = n_data.saturating_sub(slots);
+    over / slots + usize::from(over % slots != 0)
+}
+
+/// Does the block starting at `start` and `len` bytes long overlap the
+/// byte range `lo..hi`? An empty range overlaps nothing, which is what
+/// makes a pure shrink touch no data block on FFS at all.
+fn overlaps(start: u64, len: usize, lo: u64, hi: u64) -> bool {
+    lo < hi && start < hi && lo < start + len as u64
 }

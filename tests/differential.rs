@@ -1191,3 +1191,232 @@ fn the_same_operation_sequence_through_both_implementations_agrees() {
         assert_eq!(std::fs::read(&back).unwrap(), payload, "{variant:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// File contents, differentially
+// ---------------------------------------------------------------------------
+
+/// The oracle reads back every byte of a file this crate *rewrote in
+/// place* -- appended to across an extension-block boundary, overwritten
+/// through the middle, truncated down and grown again.
+///
+/// This is the claim the model tests in `volumes.rs` cannot make. They
+/// compare the crate against a `Vec<u8>` through the crate's own reader,
+/// so a writer and a reader that agreed on the same wrong extension-chain
+/// arithmetic would pass both. xdftool shares no code with either, and it
+/// walks the chain the way an AmigaDOS handler does: header table first,
+/// then `T_LIST` blocks, and for `DOS\0` the OFS data headers with their
+/// sequence numbers and per-block lengths -- every one of which this
+/// wave's copy-on-written boundary block has to have got right.
+#[test]
+fn xdftool_reads_back_a_file_this_crate_rewrote_in_place() {
+    let argv = oracle!();
+    let scratch = Scratch::new("filewrite");
+
+    for (variant, tag) in [(Variant::Ofs, "dos0"), (Variant::Ffs, "dos1")] {
+        let image = mutable_adf(&scratch, variant, &format!("{tag}.adf"));
+        let bs = 512usize;
+        let p = layout::data_payload_size(bs, variant.is_ffs()) as u64;
+        let slots = hash_table_size(bs) as u64;
+        let ext = slots * p;
+
+        // The model, built with the same arithmetic the crate's own tests
+        // use: `resize` zero-fills, which is what a grow does.
+        let mut model: Vec<u8> = pattern(1000);
+        let write = |model: &mut Vec<u8>, off: u64, data: &[u8]| {
+            let end = off as usize + data.len();
+            if model.len() < end {
+                model.resize(end, 0);
+            }
+            model[off as usize..end].copy_from_slice(data);
+        };
+
+        let vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+        let root = vol.root_lba();
+        let mut m = Mutator::open(vol).expect("mutator");
+        m.create_file(root, b"Doc", &Metadata::new(), &model)
+            .expect("create_file");
+
+        // Across the header table's last slot and two blocks beyond.
+        let grown = pattern((ext + 2 * p) as usize);
+        let at = model.len() as u64;
+        m.append(root, b"Doc", &grown).expect("append");
+        write(&mut model, at, &grown);
+
+        // Partial first block, whole middle, partial last.
+        let over = pattern(3 * p as usize);
+        m.write_file(root, b"Doc", p / 2, &over)
+            .expect("write_file");
+        write(&mut model, p / 2, &over);
+
+        // Down to the middle of a block -- on OFS the block that is now
+        // last has its recorded length corrected -- and back out past the
+        // extension boundary, the gap zero-filled.
+        m.truncate(root, b"Doc", p + 33).expect("truncate down");
+        model.resize((p + 33) as usize, 0);
+        m.truncate(root, b"Doc", ext + p).expect("truncate up");
+        model.resize((ext + p) as usize, 0);
+
+        // ...and one more write, landing inside the region the grow
+        // zeroed, so a reader that lost the zero-fill shows it here.
+        let tail = pattern(500);
+        m.write_file(root, b"Doc", ext, &tail).expect("write_file");
+        write(&mut model, ext, &tail);
+
+        let mut vol = m.into_volume();
+        assert!(vol.validate().is_clean(), "{variant:?}: our own validator");
+        assert_eq!(
+            read_named(&mut vol, root, b"Doc"),
+            model,
+            "{variant:?}: our own reader"
+        );
+        vol.into_inner().save(&image);
+        let path = image.to_str().unwrap();
+
+        // The oracle's turn: the size in its listing, then every byte.
+        let listing = run(&argv, &[path, "list"]);
+        assert!(
+            listing.contains(&format!("{}", model.len())),
+            "{variant:?}: xdftool does not see a {}-byte Doc:\n{listing}",
+            model.len()
+        );
+        let back = scratch.path("back");
+        run(&argv, &[path, "read", "Doc", back.to_str().unwrap()]);
+        assert_eq!(
+            std::fs::read(&back).unwrap(),
+            model,
+            "{variant:?}: xdftool read different bytes"
+        );
+
+        // And the volume is still one it can allocate from, after all
+        // that freeing and reallocating.
+        let host = scratch.path("theirs");
+        std::fs::write(&host, pattern(3000)).unwrap();
+        run(&argv, &[path, "write", host.to_str().unwrap(), "Theirs"]);
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after xdftool wrote into it: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(read_named(&mut vol, root, b"Theirs"), pattern(3000));
+        assert_eq!(read_named(&mut vol, root, b"Doc"), model);
+    }
+}
+
+/// Look a name up in a directory and read the file whole -- the pattern
+/// every assertion below wants, written once because in one expression it
+/// would borrow the volume twice.
+fn read_named(vol: &mut Volume<ImageDisk>, dir: u64, name: &[u8]) -> Vec<u8> {
+    let lba = vol
+        .lookup(dir, name)
+        .expect("lookup")
+        .unwrap_or_else(|| panic!("{} is not there", String::from_utf8_lossy(name)))
+        .lba;
+    vol.read_file(lba).expect("read_file")
+}
+
+/// The same *content* sequence through both implementations.
+///
+/// xdftool has no in-place write -- `write` replaces a file whole -- so
+/// the sequence has to be expressed in each implementation's own terms:
+/// it deletes and rewrites, this crate truncates and writes. What must
+/// agree is the volume they end up with: the same tree, the same bytes,
+/// and the same number of blocks in use, which is the part a rewrite that
+/// leaked its old data blocks would get wrong.
+#[test]
+fn the_same_file_content_through_both_implementations_agrees() {
+    let argv = oracle!();
+    let scratch = Scratch::new("bothfiles");
+
+    for (variant, tag) in [(Variant::Ofs, "DOS0"), (Variant::Ffs, "DOS1")] {
+        let first = pattern(20_000);
+        let second = pattern(45_000);
+        let host_a = scratch.path("a");
+        let host_b = scratch.path("b");
+        std::fs::write(&host_a, &first).unwrap();
+        std::fs::write(&host_b, &second).unwrap();
+
+        // Theirs: write 20 000 bytes, then replace them with 45 000 --
+        // which crosses the extension-block boundary the first one did
+        // not reach.
+        let theirs = scratch.path(&format!("theirs-{tag}.adf"));
+        run(
+            &argv,
+            &[
+                "-f",
+                theirs.to_str().unwrap(),
+                "format",
+                "Both",
+                tag,
+                "+",
+                "write",
+                host_a.to_str().unwrap(),
+                "Doc",
+                "+",
+                "delete",
+                "Doc",
+                "+",
+                "write",
+                host_b.to_str().unwrap(),
+                "Doc",
+            ],
+        );
+
+        // Ours: create it at 20 000, then grow it in place to 45 000 --
+        // an append and an overwrite rather than a delete and a create,
+        // which is the whole point of the comparison.
+        let ours = scratch.path(&format!("ours-{tag}.adf"));
+        {
+            let mut disk = ImageDisk::blank(ADF_BLOCKS);
+            let opts = FormatOptions::new(variant, ADF_BLOCKS, b"Both");
+            amiga_ffs::format(&mut disk, &opts).expect("format");
+            let vol = Volume::open(disk, None).expect("open");
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).expect("mutator");
+            m.create_file(root, b"Doc", &Metadata::new(), &first)
+                .expect("create");
+            m.append(root, b"Doc", &second[first.len()..])
+                .expect("append");
+            m.write_file(root, b"Doc", 0, &second[..first.len()])
+                .expect("overwrite");
+            m.into_volume().into_inner().save(&ours);
+        }
+
+        let mut a = Volume::open(ImageDisk::open(&ours), None).unwrap();
+        let mut b = Volume::open(ImageDisk::open(&theirs), None).unwrap();
+        let (ra, rb) = (a.root_lba(), b.root_lba());
+        assert_eq!(walk(&mut a, ra, ""), walk(&mut b, rb, ""), "{variant:?}");
+        assert_eq!(read_named(&mut a, ra, b"Doc"), second, "{variant:?}: ours");
+        assert_eq!(
+            read_named(&mut b, rb, b"Doc"),
+            second,
+            "{variant:?}: theirs"
+        );
+        assert!(a.validate().is_clean(), "{variant:?}: ours");
+        assert!(b.validate().is_clean(), "{variant:?}: theirs");
+        assert_eq!(
+            a.read_bitmap().unwrap().allocated_count(),
+            b.read_bitmap().unwrap().allocated_count(),
+            "{variant:?}: the two volumes disagree about how much is in use"
+        );
+
+        // And the oracle reads every byte of the file we grew in place.
+        let back = scratch.path("back");
+        run(
+            &argv,
+            &[
+                ours.to_str().unwrap(),
+                "read",
+                "Doc",
+                back.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(std::fs::read(&back).unwrap(), second, "{variant:?}");
+    }
+}

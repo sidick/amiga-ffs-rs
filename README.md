@@ -54,8 +54,12 @@ deletes, renames and re-describes entries — hash chains spliced under both
 fold tables, `T_COMMENT` blocks moving in and out as an LNFS name grows,
 `DOS\4`/`DOS\5` dircaches regenerated from the chains they cache, and a
 write order whose worst crash outcome is a leaked block rather than a
-block with two owners. Writing, appending to and truncating a file's data
-is what remains. See `PLAN.md`.
+block with two owners. `write_file`, `append` and `truncate` change a
+file's contents in place, committing every size change in the single
+header-block write that carries the length, the block count and the
+pointer table together; `Volume::read_range` is the read half, touching
+only the blocks a range covers. What remains is the differential suite's
+guest leg. See `PLAN.md`.
 
 ```rust
 let mut m = Mutator::open(Volume::open(disk, None)?)?;
@@ -63,6 +67,8 @@ let dir = m.create_dir(root, b"Devs", &Metadata::new())?;
 m.create_file(dir, b"system-configuration", &Metadata::new(), &bytes)?;
 m.rename(root, b"Old", dir, b"New")?;
 m.delete(root, b"Doomed")?;
+m.append(dir, b"system-configuration", b"...more bytes")?;
+m.truncate(dir, b"system-configuration", 232)?;
 ```
 
 ## Why this exists

@@ -38,6 +38,20 @@
 //! `next` (longword 4): it duplicates the header's table, and the table
 //! is what the filesystem allocates from, so where they disagree the
 //! table is right. It is exposed rather than checked.
+//!
+//! # Ranged reads
+//!
+//! [`Volume::read_range`] is the other half of the read surface, and the
+//! one a FUSE adapter or a trackdisk-level consumer actually wants: nobody
+//! at that layer reads whole files. It touches **only the blocks the range
+//! covers** — the first is `offset / payload_size`, which is arithmetic
+//! rather than a walk — and verifies the OFS headers of exactly those,
+//! because a block's expected sequence number falls out of its index and
+//! not out of having walked there from block 1. That is what makes a
+//! ranged read O(range) rather than O(file), and it is only true because
+//! [`FileChain`] was split out of the streaming read in the first place: the
+//! chain is collected once, and is immutable data a concurrent consumer can
+//! hold outside its `Volume` lock.
 
 use alloc::vec::Vec;
 
@@ -211,47 +225,143 @@ impl<S: BlockSource> Volume<S> {
                 chunk(&self.buf[..want]);
             } else {
                 self.read_checked(lba)?;
-                let ty = be32(&self.buf, OFF_TYPE);
-                if ty != T_DATA {
-                    return Err(Error::WrongBlockType {
-                        lba,
-                        found: ty,
-                        expected: T_DATA,
-                    });
-                }
-                let owner = be32(&self.buf, OFF_DATA_HEADER_KEY);
-                if owner as u64 != header_lba {
-                    return Err(Error::BlockOwnerMismatch {
-                        lba,
-                        found: owner,
-                        expected: header_lba as u32,
-                    });
-                }
-                let found = be32(&self.buf, OFF_DATA_SEQ);
-                if found != seq {
-                    return Err(Error::DataBlockSequence {
-                        lba,
-                        found,
-                        expected: seq,
-                    });
-                }
-                // One comparison covers both traps: a size past the
-                // block's capacity, and a short block anywhere but at the
-                // end of the file.
-                let size = be32(&self.buf, OFF_DATA_SIZE);
-                if size as u64 != want as u64 {
-                    return Err(Error::DataBlockSize {
-                        lba,
-                        found: size,
-                        expected: want as u32,
-                    });
-                }
+                self.verify_ofs_data(lba, header_lba, seq, want)?;
                 chunk(&self.buf[OFF_DATA_PAYLOAD..OFF_DATA_PAYLOAD + want]);
             }
             remaining -= want as u64;
         }
         debug_assert_eq!(remaining, 0);
         Ok(chain.byte_size as u64)
+    }
+
+    /// Read `buf.len()` bytes from `offset` into a file, touching only the
+    /// blocks that range covers.
+    ///
+    /// The read(2) shape, and deliberately so — this is what a FUSE
+    /// adapter, a trackdisk transport or anything else block-oriented
+    /// actually calls. Returns how many bytes were delivered:
+    ///
+    /// - **`offset` at or past the file's end returns `Ok(0)`.** Not an
+    ///   error: end of file is a length, not a failure, and a caller
+    ///   looping until it gets zero is the idiom this has to support.
+    ///   (AmigaDOS's own `Seek` refuses to *position* past the end, which
+    ///   is a different question — this is a read, and it has no cursor to
+    ///   leave anywhere.)
+    /// - **A range that runs off the end is clamped**, so the count comes
+    ///   back short. `byte_size` is the authority for where the file ends,
+    ///   not the blocks: the last block has payload capacity past the last
+    ///   byte and returning it would invent data.
+    /// - **A zero-length `buf` returns `Ok(0)`** at any offset before the
+    ///   end, which falls out of the clamping rather than being special.
+    ///
+    /// The first block is `offset / payload_size` and every OFS header
+    /// from there on is verified exactly as [`Volume::read_chain_with`]
+    /// verifies it — the expected sequence number is `index + 1`, which is
+    /// arithmetic, so nothing has to be walked from block 1 to know it.
+    /// That is the whole point: reading 512 bytes out of the middle of a
+    /// 200 MB file costs one block read, and still refuses an OFS block
+    /// that belongs to another file or sits in the wrong place.
+    pub fn read_range(
+        &mut self,
+        chain: &FileChain,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, Error<S::Error>> {
+        let bs = self.block_size;
+        let ffs = self.variant.is_ffs();
+        let payload = data_payload_size(bs, ffs) as u64;
+        let size = chain.byte_size as u64;
+        if offset >= size {
+            return Ok(0);
+        }
+        let want = ((size - offset).min(buf.len() as u64)) as usize;
+        let header_lba = chain.header_lba;
+
+        let mut done = 0usize;
+        let mut index = (offset / payload) as usize;
+        // Only the first block starts part-way in; every one after it is
+        // entered at its own byte 0.
+        let mut skip = (offset % payload) as usize;
+        while done < want {
+            let block = match chain.blocks.get(index) {
+                Some(&b) => b as u64,
+                // Unreachable via `file_chain`, which refuses a chain whose
+                // length and `byte_size` disagree — but this takes a chain
+                // by reference and a caller can hold a stale one, so it
+                // stops rather than indexing off the end.
+                None => break,
+            };
+            // How much of this block the *file* uses: full but for the
+            // last, whose length falls out of byte_size — the same rule
+            // the streaming read applies, and the OFS size field is
+            // checked against it here too.
+            let full = ((size - index as u64 * payload).min(payload)) as usize;
+            let take = (full - skip).min(want - done);
+            if ffs {
+                self.read_raw(block)?;
+                buf[done..done + take].copy_from_slice(&self.buf[skip..skip + take]);
+            } else {
+                self.read_checked(block)?;
+                self.verify_ofs_data(block, header_lba, index as u32 + 1, full)?;
+                let at = OFF_DATA_PAYLOAD + skip;
+                buf[done..done + take].copy_from_slice(&self.buf[at..at + take]);
+            }
+            done += take;
+            skip = 0;
+            index += 1;
+        }
+        Ok(done)
+    }
+
+    /// Check the four cross-references an OFS data block carries, against
+    /// the block already in [`Volume::buf`].
+    ///
+    /// Shared by the streaming read and the ranged one so that a range
+    /// cannot verify *less* than a whole-file read of the same bytes
+    /// would: two copies of this would be two chances for one of them to
+    /// stop checking the sequence number.
+    fn verify_ofs_data(
+        &self,
+        lba: u64,
+        header_lba: u64,
+        seq: u32,
+        want: usize,
+    ) -> Result<(), Error<S::Error>> {
+        let ty = be32(&self.buf, OFF_TYPE);
+        if ty != T_DATA {
+            return Err(Error::WrongBlockType {
+                lba,
+                found: ty,
+                expected: T_DATA,
+            });
+        }
+        let owner = be32(&self.buf, OFF_DATA_HEADER_KEY);
+        if owner as u64 != header_lba {
+            return Err(Error::BlockOwnerMismatch {
+                lba,
+                found: owner,
+                expected: header_lba as u32,
+            });
+        }
+        let found = be32(&self.buf, OFF_DATA_SEQ);
+        if found != seq {
+            return Err(Error::DataBlockSequence {
+                lba,
+                found,
+                expected: seq,
+            });
+        }
+        // One comparison covers both traps: a size past the block's
+        // capacity, and a short block anywhere but at the end of the file.
+        let size = be32(&self.buf, OFF_DATA_SIZE);
+        if size as usize != want {
+            return Err(Error::DataBlockSize {
+                lba,
+                found: size,
+                expected: want as u32,
+            });
+        }
+        Ok(())
     }
 
     /// Read a whole file into one `Vec`.

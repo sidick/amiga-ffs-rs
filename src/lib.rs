@@ -63,7 +63,8 @@
 //! `populate::populate_from_tree` turning a host directory into an image
 //! in one call under the `std` feature.
 //!
-//! Milestone 3 (mutate) is in progress. [`Allocator`] hands out blocks
+//! Milestone 3 (mutate) is complete but for one leg of its differential
+//! suite. [`Allocator`] hands out blocks
 //! from an existing volume's own bitmap — refusing one that is
 //! mid-update, tracking dirty pages, and making the crash ordering
 //! visible in the types ([`Allocation::block`] to write a block,
@@ -75,9 +76,13 @@
 //! hash-chain splicing under both fold tables, `T_COMMENT` blocks moving
 //! in and out as an LNFS name grows past what the merged field holds,
 //! `DOS\4`/`DOS\5` dircaches regenerated from the chains they cache, and
-//! a write order at every step whose worst crash outcome is a leak.
-//! What is still *not* here: writing, appending to or truncating a file's
-//! data, which is the last wave.
+//! a write order at every step whose worst crash outcome is a leak. It
+//! also writes, appends to and truncates a file's *contents*
+//! ([`Mutator::write_file`], [`Mutator::append`], [`Mutator::truncate`]),
+//! with the file header block as the single commit — before that one
+//! write the file is entirely the old one, after it entirely the new —
+//! and [`Volume::read_range`] reads a slice of a file back, walking only
+//! the blocks the range covers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
