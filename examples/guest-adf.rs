@@ -59,7 +59,7 @@ fn main() {
     p.create_file(
         root,
         b"ReadMe",
-        &md.clone().comment(b"written by amiga-ffs-rs"),
+        &md.comment(b"written by amiga-ffs-rs"),
         b"This volume was formatted and populated by amiga-ffs-rs.\n",
     )
     .expect("readme");
