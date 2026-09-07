@@ -145,6 +145,17 @@ OFS/FFS drives from directories) and amibake (dir→hdf) actually want.
       trees match — the independent-implementation proof.
 - [ ] **Guest-mount proof**: an image created here boots/mounts under a
       real Amiga ROM (the consumer that cannot be argued with).
+- [ ] **CI**: stable + MSRV 1.63, `--no-default-features`, clippy
+      `-D warnings`, rustfmt, docs; differential job where xdftool is
+      installable. Pulled into this milestone because the write side is
+      where an untested-configuration regression starts corrupting
+      images rather than misreading them.
+- [ ] **Fuzzing**: parse arbitrary volumes without panic — the hash
+      chains and name lengths specifically, and now also
+      format-then-read round trips with arbitrary trees. In this
+      milestone because the writer gives the fuzzer its second target:
+      not just "does hostile input crash the reader" but "can any tree
+      the writer accepts produce a volume the reader refuses".
 
 ## Milestone 3 — mutate
 
@@ -208,11 +219,6 @@ Gated on the milestone-1 validator and differential suite.
 - [x] Errors: `Display` everywhere, `std::error::Error` under `std` —
       `Error<E>` and every `validate()` `Finding` state their
       consequence, and the transport error survives via `source()`
-- [ ] Fuzzing: parse arbitrary volumes without panic; fuzz the hash
-      chains and name lengths specifically
-- [ ] CI: stable + MSRV 1.63, `--no-default-features`, clippy
-      `-D warnings`, rustfmt, docs; differential job where fixtures
-      are buildable
 - [ ] crates.io publish at read-complete; `#![deny(missing_docs)]`
       once the surface settles. Read-complete is *reached* — the gate
       now is deciding the surface is one worth freezing, which is
