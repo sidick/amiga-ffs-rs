@@ -1,5 +1,9 @@
 # amiga-ffs
 
+[![crates.io](https://img.shields.io/crates/v/amiga-ffs.svg)](https://crates.io/crates/amiga-ffs)
+[![docs.rs](https://docs.rs/amiga-ffs/badge.svg)](https://docs.rs/amiga-ffs)
+[![CI](https://github.com/sidick/amiga-ffs-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sidick/amiga-ffs-rs/actions)
+
 The Amiga Fast File System (and its OFS ancestor) as a pure-Rust,
 permissively-licensed library: every `DOS\0`–`DOS\7` variant, including
 the `DOS\6`/`DOS\7` long-filename layouts that classic-offset readers
@@ -13,9 +17,21 @@ Nothing here knows what an RDB is; a volume is a run of blocks.
 `no_std` + `alloc` at the core; the `std` feature (default) adds only
 conveniences. No dependencies. MSRV 1.63.
 
+```sh
+cargo add amiga-ffs
+```
+
 ## Status
 
-**Reading is complete** (milestone 1): root blocks, directory traversal
+**Complete: read, create, and mutate** — the plan's three milestones
+are landed and released, each closed by an oracle that is not this
+crate: xdftool driving the same images for structure, and a real
+Kickstart 3.1 under deterministic emulation for behaviour — mounting
+volumes this crate built, reading every byte through the ROM's own FFS
+handler, mutating a volume in place, and agreeing entry-for-entry with
+the same operations replayed through this crate.
+
+**Reading** (milestone 1): root blocks, directory traversal
 under both fold tables, the `DOS\6`/`DOS\7` long-name layout, file data
 through FFS chains and OFS data blocks, hard and soft links, metadata
 (protection, owner, dates), `DOS\4`/`DOS\5` dircache blocks (read and
@@ -24,7 +40,7 @@ bitmap, and a `validate()` that walks the whole volume and *reports*
 rather than refusing, so a damaged volume still yields everything still
 reachable.
 
-**Creating a volume works** (milestone 2): `BlockSink` is the write seam
+**Creating** (milestone 2): `BlockSink` is the write seam
 — a second trait, so a read-only source is never asked for a
 `write_block` it cannot have — and `format()` lays down a fresh, empty,
 valid volume of any variant at any block size: boot block, root, bitmap
@@ -45,8 +61,8 @@ let disk = amiga_ffs::populate::populate_from_tree(disk, &opts, Path::new("./tre
 ```
 
 `Populator` is append-only, over a volume this crate just formatted.
-**Changing a volume that already exists** is milestone 3, and most of it
-is here: `Allocator` hands out blocks from a volume's own bitmap with the
+**Changing a volume that already exists** (milestone 3) is the rest:
+`Allocator` hands out blocks from a volume's own bitmap with the
 mark-then-use ordering in the types (an allocation is not a block number
 until its bitmap page is on the disk), `Volume::repair()` rebuilds a
 bitmap the way the ROM's disk-validator does, and `Mutator` creates,
@@ -58,8 +74,9 @@ block with two owners. `write_file`, `append` and `truncate` change a
 file's contents in place, committing every size change in the single
 header-block write that carries the length, the block count and the
 pointer table together; `Volume::read_range` is the read half, touching
-only the blocks a range covers. What remains is the differential suite's
-guest leg. See `PLAN.md`.
+only the blocks a range covers. `PLAN.md` is the full map, including
+what is in scope but not yet scheduled (in-place resize, the muFS
+dostype survey, notes for a FUSE adapter).
 
 ```rust
 let mut m = Mutator::open(Volume::open(disk, None)?)?;
@@ -80,9 +97,11 @@ crate is MIT OR Apache-2.0 so that emulators, image-building tools and
 hobby OS projects can all use it, whatever their own licence.
 
 Written against the layouts documented in the AmigaOS NDK and the
-FFS/AFFS format literature, and tested differentially against
-independent implementations (xdftool, affs-read, and a real Amiga ROM
-filesystem driving the same images).
+FFS/AFFS format literature, tested differentially against independent
+implementations (xdftool on every variant, and a real Amiga ROM's FFS
+mounting, reading and mutating the same images under deterministic
+emulation), fuzzed, and CI-checked across stable and MSRV on both
+feature sets.
 
 ## License
 
