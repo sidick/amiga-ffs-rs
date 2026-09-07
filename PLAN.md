@@ -161,6 +161,27 @@ Gated on the milestone-1 validator and differential suite.
 
 ## In scope, not scheduled
 
+- **Resize** (grow/shrink an existing volume in place): gated on the
+  M3 allocator and mutation discipline. The filesystem half only — the
+  RDB's `high_cyl` move is amiga-rdb's, composed by the consumer. The
+  algorithm exists in shipping form in AmiPart's `ffsresize.c` (John
+  Hertell, MIT — licence-compatible; port the algorithm, cite the
+  source): FFS recomputes the root LBA from geometry on every mount, so
+  the root must *move* to the new midpoint — copy root, free the old
+  block, re-parent the root's direct children (their parent longword
+  names the root; deeper entries and hard-link `real_entry` pointers
+  are unaffected because no child header moves). Grow: new bitmap
+  pages at natural positions (`reserved + N × bits-per-page`), root
+  last, read-back verification. Shrink: refuse unless every allocated
+  block past the new end is movable metadata; a read-only minimum-size
+  estimate falls out of `Bitmap` already. Do better than AmiPart
+  where it punts: rebuild the bitmap ourselves instead of stamping
+  `bm_flag = 0` for FFS to fix on mount, handle dircache chains and
+  LNFS root fields, and support all block sizes, not just 512/1024.
+  AmiPart's code independently confirms wave 3's bitmap conventions
+  (LSB-first, `(block − reserved)` indexing, checksum longword 0,
+  checksum-less ext blocks) and the `canonical_root_lba` formula.
+
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and
   extended permission bits actually used and enforced; same blocks,
