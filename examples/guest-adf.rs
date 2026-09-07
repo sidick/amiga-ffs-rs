@@ -46,12 +46,11 @@ fn main() {
     let out = std::env::args().nth(1).expect("usage: guest-adf <out.adf>");
     let disk = MemDisk(vec![0u8; 901_120]); // DD floppy, 1760 blocks
 
-    let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"FfsRsProof")
-        .created(DateStamp {
-            days: 17781,
-            mins: 600,
-            ticks: 0,
-        });
+    let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"FfsRsProof").created(DateStamp {
+        days: 17781,
+        mins: 600,
+        ticks: 0,
+    });
     let mut p = Populator::new(disk, &opts).expect("format+wrap");
 
     let root = p.root_lba();
@@ -66,9 +65,7 @@ fn main() {
     .expect("readme");
     // A file big enough to cross into an extension block: the chain the
     // guest has to walk correctly to type it.
-    let big: Vec<u8> = (0..40_000u32)
-        .map(|i| b'A' + (i % 26) as u8)
-        .collect();
+    let big: Vec<u8> = (0..40_000u32).map(|i| b'A' + (i % 26) as u8).collect();
     p.create_file(dir, b"Extension-Crosser", &md, &big)
         .expect("big file");
     p.create_file(
