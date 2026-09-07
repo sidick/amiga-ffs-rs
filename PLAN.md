@@ -108,6 +108,23 @@ of the differential suite that need more than `cargo test` can reach.
       What remains, and why it is not done rather than merely not done
       yet:
 
+      - **`fstool` as the readable oracle** (KarpelesLab, **MIT**,
+        crates.io) — found after the suite was built, and the piece
+        `affs-read` was supposed to be. Its AFFS backend reads *and*
+        writes `.adf`, mutates images incrementally in place, and is
+        licence-compatible: unlike xdftool it can be **read** when
+        outputs disagree, which is the whole reason the plan wanted a
+        permissive second implementation. Verified by hand at 0.4.26:
+        it reads a volume this crate built and a guest ROM then
+        mutated (`DOS\3 (FFS+INTL)`, correct tree, correct bytes), and
+        this crate reads a volume `fstool create -t affs` produced —
+        `validate()` clean, 40 000-byte extension-block crosser
+        intact. Worth wiring into `tests/differential.rs` as a third
+        leg alongside xdftool: same skip-if-absent shape, and a
+        disagreement there comes with source to read rather than
+        behaviour to infer. Note its table claims no `DOS\6`/`DOS\7`
+        long-name support, so that variant stays this crate's own
+        (and the long-name regression stays the thing only we assert).
       - **affs-read and AROS `afs.handler` as oracles.** xdftool is the
         leg that catches the mistakes this crate and its own synthetic
         builder would make *together*; the other two matter for
