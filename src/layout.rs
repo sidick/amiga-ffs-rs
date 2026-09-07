@@ -269,6 +269,123 @@ pub fn softlink_path_capacity(block_size: usize) -> usize {
     block_size - 200 - OFF_SOFTLINK_PATH
 }
 
+// --- directory cache blocks (DOS\4 / DOS\5) ------------------------------
+
+/// [`T_DIRCACHE`] block, longword 2: the directory this cache describes.
+/// (`parent` in ADFlib's `bDirCacheBlock`.)
+///
+/// Note where the *pointer* to this block lives: longword −2, the same
+/// [`TL_EXTENSION`] field a file header uses for its first `T_LIST` block.
+/// The two never collide because the field's meaning follows the block's
+/// secondary type — a directory or root has no data chain to extend, and
+/// a file has no directory to cache — which is why the format could
+/// afford to reuse it when `DOS\4` was added.
+pub const OFF_DIRCACHE_PARENT: usize = 8;
+/// [`T_DIRCACHE`] block, longword 3: how many records follow.
+pub const OFF_DIRCACHE_RECORDS: usize = 12;
+/// [`T_DIRCACHE`] block, longword 4: the next cache block for the same
+/// directory, or 0. One directory's cache is a *chain* of these; a
+/// directory with more entries than one block's records will hold spills
+/// onward.
+pub const OFF_DIRCACHE_NEXT: usize = 16;
+/// [`T_DIRCACHE`] block: where the packed records start, after the same
+/// six-longword head every other block has (the checksum still at
+/// longword 5, [`CHECKSUM_INDEX`]).
+pub const OFF_DIRCACHE_RECORDS_START: usize = 24;
+
+/// Fixed part of a dircache record, before the two counted strings:
+/// entry block (long), size (long), protection (long), UID (word), GID
+/// (word), days/mins/ticks (three **words**, not longwords — the one
+/// place the format stores a `DateStamp` narrowed), the entry's secondary
+/// type as a signed byte, and the name's length byte.
+///
+/// So a record is `24 + name_len` bytes, then a comment length byte and
+/// its bytes: [`DIRCACHE_RECORD_MIN`]` + name_len + comment_len`, rounded
+/// **up to an even length** — records are word-aligned, because the
+/// fields inside them are.
+pub const DIRCACHE_RECORD_FIXED: usize = 24;
+/// The shortest a dircache record can be: the fixed part plus the
+/// comment's length byte, with both strings empty.
+pub const DIRCACHE_RECORD_MIN: usize = DIRCACHE_RECORD_FIXED + 1;
+
+/// Byte offset within a dircache record: the entry's header block.
+pub const DC_ENTRY: usize = 0;
+/// Byte offset within a dircache record: the file's length in bytes
+/// (0 for a directory).
+pub const DC_SIZE: usize = 4;
+/// Byte offset within a dircache record: the protection longword.
+pub const DC_PROTECTION: usize = 8;
+/// Byte offset within a dircache record: the owner UID (a *word* here,
+/// where a header block holds UID and GID as one longword).
+pub const DC_UID: usize = 12;
+/// Byte offset within a dircache record: the owner GID.
+pub const DC_GID: usize = 14;
+/// Byte offset within a dircache record: the date's day count, as a word.
+pub const DC_DAYS: usize = 16;
+/// Byte offset within a dircache record: minutes past midnight, a word.
+pub const DC_MINS: usize = 18;
+/// Byte offset within a dircache record: ticks past the minute, a word.
+/// A minute is 3000 ticks, so the narrowing costs nothing here — unlike
+/// [`DC_DAYS`], which runs out in 2157.
+pub const DC_TICKS: usize = 20;
+/// Byte offset within a dircache record: the entry's secondary type,
+/// narrowed to a signed byte (`2` for a directory, `-3` for a file).
+pub const DC_TYPE: usize = 22;
+/// Byte offset within a dircache record: the name's length byte, with
+/// the name itself at [`DIRCACHE_RECORD_FIXED`].
+pub const DC_NAME_LEN: usize = 23;
+
+/// The length of a dircache record with these two string lengths, padded
+/// to the word boundary the next record starts on.
+#[inline]
+pub fn dircache_record_len(name_len: usize, comment_len: usize) -> usize {
+    let raw = DIRCACHE_RECORD_MIN + name_len + comment_len;
+    raw + (raw & 1)
+}
+
+// --- bitmap blocks and bitmap extension blocks ---------------------------
+
+/// A bitmap block's checksum lives in longword **0**, not longword 5.
+///
+/// This is the format's one exception, and it is an easy one to get
+/// wrong in the direction that still passes [`crate::checksum_ok`]:
+/// verification never needs the index (the stored value participates in
+/// the sum wherever it sits), so a writer using index 5 produces blocks
+/// that verify against themselves and against nothing else. A bitmap
+/// block has no type longword and no own-key — the checksum is the whole
+/// header, and the rest of the block is bits.
+pub const BITMAP_CHECKSUM_INDEX: usize = 0;
+/// A bitmap block: where the bits start, immediately after the checksum.
+pub const OFF_BITMAP_BITS: usize = 4;
+
+/// How many blocks one bitmap block accounts for: every bit of every
+/// longword after the checksum. 4064 at 512 bytes, 32704 at 4 KB.
+#[inline]
+pub fn bitmap_bits_per_block(block_size: usize) -> u64 {
+    (block_size - OFF_BITMAP_BITS) as u64 * 8
+}
+
+/// How many bitmap-page pointers a bitmap **extension** block holds:
+/// every longword but the last, which is the chain to the next extension
+/// block. 127 at 512 bytes.
+///
+/// An extension block has no type longword, no own key and **no
+/// checksum** — it is a bare array of pointers. Confirmed by dumping one
+/// out of an image xdftool built: a 60 MB volume's 31 bitmap pages are 25
+/// in the root and 6 in an extension block whose longwords do not sum to
+/// zero.
+#[inline]
+pub fn bitmap_ext_pointers(block_size: usize) -> usize {
+    block_size / 4 - 1
+}
+
+/// A bitmap extension block: the byte offset of its next-block pointer,
+/// the last longword.
+#[inline]
+pub fn bitmap_ext_next(block_size: usize) -> usize {
+    block_size - 4
+}
+
 /// Smallest filesystem block size the format allows.
 pub const MIN_BLOCK_SIZE: usize = 512;
 /// Largest filesystem block size the format allows.
@@ -438,6 +555,70 @@ mod tests {
             hash_table_size(512) as usize * data_payload_size(512, true),
             36864
         );
+    }
+
+    /// The record layout, checked against a `DOS\5` block dumped out of
+    /// an image xdftool built: three records for `abcd`, `ab` and
+    /// `xyzzyx`, starting at bytes 24, 54 and 82. Only word-alignment
+    /// makes those numbers come out — 24 + 29 is 53, and the next record
+    /// begins at 54.
+    #[test]
+    fn dircache_records_are_word_aligned_after_two_counted_strings() {
+        assert_eq!(OFF_DIRCACHE_RECORDS_START, 24);
+        assert_eq!(DIRCACHE_RECORD_MIN, 25);
+        assert_eq!(DC_NAME_LEN + 1, DIRCACHE_RECORD_FIXED);
+
+        let starts = {
+            let mut p = OFF_DIRCACHE_RECORDS_START;
+            let mut v = alloc::vec![p];
+            for name in [4usize, 2, 6] {
+                p += dircache_record_len(name, 0);
+                v.push(p);
+            }
+            v
+        };
+        assert_eq!(starts, alloc::vec![24, 54, 82, 114]);
+
+        // An odd raw length rounds up; an even one is left alone.
+        assert_eq!(dircache_record_len(4, 0), 30); // 29 -> 30
+        assert_eq!(dircache_record_len(3, 0), 28); // 28 -> 28
+        assert_eq!(dircache_record_len(7, 0), 32);
+        assert_eq!(dircache_record_len(3, 12), 40);
+    }
+
+    /// Bitmap geometry, checked against images xdftool built: a 1760-block
+    /// floppy needs one bitmap page (4064 bits covers it), and a
+    /// 122880-block volume needs 31 — 25 in the root and 6 in one
+    /// extension block, which is exactly what that image contains.
+    #[test]
+    fn bitmap_pages_cover_the_volume_and_extensions_chain_at_the_end() {
+        assert_eq!(BITMAP_CHECKSUM_INDEX, 0);
+        assert_eq!(OFF_BITMAP_BITS, 4);
+        assert_eq!(bitmap_bits_per_block(512), 4064);
+        assert_eq!(bitmap_bits_per_block(4096), 32_736);
+
+        // A DD floppy: 1758 blocks to cover, one page.
+        assert!(bitmap_bits_per_block(512) >= 1760 - 2);
+        // 60 MB at 512 bytes: 122878 blocks to cover.
+        let need = (122_880u64 - 2).div_ceil_(bitmap_bits_per_block(512));
+        assert_eq!(need, 31);
+        assert_eq!(need as usize - BITMAP_PAGES, 6);
+        assert!(6 <= bitmap_ext_pointers(512));
+
+        // The pointers fill the block but for the chain longword.
+        assert_eq!(bitmap_ext_pointers(512), 127);
+        assert_eq!(bitmap_ext_next(512), 508);
+        assert_eq!(bitmap_ext_pointers(512) * 4, bitmap_ext_next(512));
+        assert_eq!(bitmap_ext_pointers(4096) * 4, bitmap_ext_next(4096));
+    }
+
+    trait DivCeil {
+        fn div_ceil_(self, rhs: u64) -> u64;
+    }
+    impl DivCeil for u64 {
+        fn div_ceil_(self, rhs: u64) -> u64 {
+            self / rhs + u64::from(self % rhs != 0)
+        }
     }
 
     #[test]

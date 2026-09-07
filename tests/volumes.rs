@@ -68,6 +68,16 @@ impl BlockSource for MemDisk {
     }
 }
 
+impl MemDisk {
+    /// Overwrite a block after the fact — for damage a test wants to
+    /// apply *after* `finish()` has fixed the checksums up, so that what
+    /// fails is the thing being tested and not a stale sum.
+    pub fn write_block(&mut self, lba: u64, buf: &[u8]) {
+        let off = lba as usize * self.bs;
+        self.data[off..off + self.bs].copy_from_slice(buf);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The builder
 // ---------------------------------------------------------------------------
@@ -82,6 +92,47 @@ pub struct Builder {
     root_lba: u64,
     next_free: u64,
     touched: Vec<u64>,
+    /// Every block the builder handed out, plus the root: what a correct
+    /// bitmap for this volume must mark allocated.
+    used: Vec<u64>,
+    /// Every entry written, so a dircache can be built from the same
+    /// facts the hash chains were built from — and then deliberately
+    /// diverged from.
+    entries: Vec<EntryRec>,
+}
+
+/// What the builder remembers about an entry, for building dircaches.
+#[derive(Debug, Clone)]
+pub struct EntryRec {
+    pub dir: u64,
+    pub lba: u64,
+    pub name: Vec<u8>,
+    pub comment: Vec<u8>,
+    pub secondary_type: i32,
+    pub byte_size: u32,
+}
+
+/// One dircache record as the builder lays it down. Public and mutable
+/// so a test can write a cache that has gone stale in one specific way.
+#[derive(Debug, Clone)]
+pub struct DcRecord {
+    pub entry: u32,
+    pub size: u32,
+    pub protection: u32,
+    pub uid: u16,
+    pub gid: u16,
+    pub days: u16,
+    pub mins: u16,
+    pub ticks: u16,
+    pub etype: i8,
+    pub name: Vec<u8>,
+    pub comment: Vec<u8>,
+}
+
+impl DcRecord {
+    fn len(&self) -> usize {
+        dircache_record_len(self.name.len(), self.comment.len())
+    }
 }
 
 fn wr32(data: &mut [u8], off: usize, v: u32) {
@@ -104,6 +155,8 @@ impl Builder {
             root_lba,
             next_free: root_lba + 1,
             touched: vec![],
+            used: vec![root_lba],
+            entries: vec![],
         };
 
         // Boot block: the dostype is all this crate reads from it.
@@ -149,6 +202,7 @@ impl Builder {
         let lba = self.next_free;
         self.next_free += 1;
         assert!(lba < self.nblocks, "test volume too small");
+        self.used.push(lba);
         lba
     }
 
@@ -211,6 +265,18 @@ impl Builder {
             wr32(blk, tail(bs, TL_DATE) + 8, 7);
         }
         self.touched.push(lba);
+        self.entries.push(EntryRec {
+            dir: dir_lba,
+            lba,
+            name: name.to_vec(),
+            comment: comment.to_vec(),
+            secondary_type: kind.secondary_type(),
+            byte_size: if matches!(kind, EntryKind::File | EntryKind::LinkFile) {
+                byte_size
+            } else {
+                0
+            },
+        });
     }
 
     /// Chain an already-written entry into its directory's hash table:
@@ -369,6 +435,150 @@ impl Builder {
             lba as u32,
         );
         lba
+    }
+
+    /// The dircache records a *correct* cache of `dir_lba` would hold —
+    /// the same facts the hash chains were built from. Tests take this
+    /// and then bend one record, so what they are testing is the
+    /// divergence and not the builder.
+    pub fn dircache_records(&self, dir_lba: u64) -> Vec<DcRecord> {
+        self.entries
+            .iter()
+            .filter(|e| e.dir == dir_lba)
+            .map(|e| DcRecord {
+                entry: e.lba as u32,
+                size: e.byte_size,
+                protection: 0x0000_FFF0 | 0x5,
+                uid: 7,
+                gid: 0x42,
+                days: 1234,
+                mins: 56,
+                ticks: 7,
+                etype: e.secondary_type as i8,
+                name: e.name.clone(),
+                comment: e.comment.clone(),
+            })
+            .collect()
+    }
+
+    /// Lay down a dircache chain for `dir_lba` and point longword −2 at
+    /// it. Records spill into as many `T_DIRCACHE` blocks as they need,
+    /// which is the only way to exercise the chain.
+    pub fn add_dircache(&mut self, dir_lba: u64, records: &[DcRecord]) -> Vec<u64> {
+        let bs = self.bs;
+        let capacity = bs - OFF_DIRCACHE_RECORDS_START;
+
+        // Split into blockfuls first, so each block can name its
+        // successor as it is written.
+        let mut groups: Vec<Vec<&DcRecord>> = vec![vec![]];
+        let mut used = 0usize;
+        for r in records {
+            if used + r.len() > capacity && !groups.last().unwrap().is_empty() {
+                groups.push(vec![]);
+                used = 0;
+            }
+            used += r.len();
+            groups.last_mut().unwrap().push(r);
+        }
+
+        let lbas: Vec<u64> = (0..groups.len()).map(|_| self.alloc()).collect();
+        for (i, group) in groups.iter().enumerate() {
+            let lba = lbas[i];
+            let next = lbas.get(i + 1).copied().unwrap_or(0) as u32;
+            let group: Vec<DcRecord> = group.iter().map(|r| (*r).clone()).collect();
+            let blk = self.block_mut(lba);
+            wr32(blk, OFF_TYPE, T_DIRCACHE);
+            wr32(blk, OFF_OWN_KEY, lba as u32);
+            wr32(blk, OFF_DIRCACHE_PARENT, dir_lba as u32);
+            wr32(blk, OFF_DIRCACHE_RECORDS, group.len() as u32);
+            wr32(blk, OFF_DIRCACHE_NEXT, next);
+            let mut off = OFF_DIRCACHE_RECORDS_START;
+            for r in &group {
+                wr32(blk, off + DC_ENTRY, r.entry);
+                wr32(blk, off + DC_SIZE, r.size);
+                wr32(blk, off + DC_PROTECTION, r.protection);
+                blk[off + DC_UID..off + DC_UID + 2].copy_from_slice(&r.uid.to_be_bytes());
+                blk[off + DC_GID..off + DC_GID + 2].copy_from_slice(&r.gid.to_be_bytes());
+                blk[off + DC_DAYS..off + DC_DAYS + 2].copy_from_slice(&r.days.to_be_bytes());
+                blk[off + DC_MINS..off + DC_MINS + 2].copy_from_slice(&r.mins.to_be_bytes());
+                blk[off + DC_TICKS..off + DC_TICKS + 2].copy_from_slice(&r.ticks.to_be_bytes());
+                blk[off + DC_TYPE] = r.etype as u8;
+                blk[off + DC_NAME_LEN] = r.name.len() as u8;
+                let n = off + DIRCACHE_RECORD_FIXED;
+                blk[n..n + r.name.len()].copy_from_slice(&r.name);
+                blk[n + r.name.len()] = r.comment.len() as u8;
+                let c = n + r.name.len() + 1;
+                blk[c..c + r.comment.len()].copy_from_slice(&r.comment);
+                off += r.len();
+            }
+            self.touched.push(lba);
+        }
+        wr32(
+            self.block_mut(dir_lba),
+            tail(bs, TL_EXTENSION),
+            lbas[0] as u32,
+        );
+        lbas
+    }
+
+    /// Write an allocation bitmap covering every block the builder has
+    /// handed out, and point the root at it.
+    ///
+    /// Deliberately built from the builder's own allocation record rather
+    /// than by walking what it wrote: a bitmap derived from the same walk
+    /// the validator does would agree with the validator by construction
+    /// and prove nothing.
+    ///
+    /// `valid` sets the root's `bitmap_flag`; `false` is the shape an
+    /// unclean unmount leaves.
+    pub fn add_bitmap(&mut self, valid: bool) -> Vec<u64> {
+        let (bs, nblocks) = (self.bs, self.nblocks);
+        let per_page = bitmap_bits_per_block(bs);
+        let need = nblocks - RESERVED;
+        let pages = (need / per_page + u64::from(need % per_page != 0)) as usize;
+        let lbas: Vec<u64> = (0..pages).map(|_| self.alloc()).collect();
+
+        let used = self.used.clone();
+        let words = amiga_ffs::bitmap::pack_bits(RESERVED, nblocks, &used, bs);
+        let words_per_page = (bs - OFF_BITMAP_BITS) / 4;
+        for (i, &lba) in lbas.iter().enumerate() {
+            let blk = self.block_mut(lba);
+            for w in 0..words_per_page {
+                let v = words
+                    .get(i * words_per_page + w)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                wr32(blk, OFF_BITMAP_BITS + w * 4, v);
+            }
+            // Longword 0, not longword 5 -- the format's one exception,
+            // and the checksums are fixed up here rather than in finish()
+            // for exactly that reason.
+            let ck = checksum_compute(self.block(lba), BITMAP_CHECKSUM_INDEX);
+            wr32(self.block_mut(lba), 0, ck);
+        }
+
+        let root = self.root_lba;
+        wr32(
+            self.block_mut(root),
+            tail(bs, TL_BITMAP_FLAG),
+            if valid { 0xFFFF_FFFF } else { 0 },
+        );
+        // Clear the placeholder page list before writing the real one.
+        for i in 0..BITMAP_PAGES {
+            wr32(self.block_mut(root), tail(bs, TL_BITMAP_PAGES) + i * 4, 0);
+        }
+        assert!(
+            lbas.len() <= BITMAP_PAGES,
+            "test volume needs bitmap extension blocks"
+        );
+        for (i, &lba) in lbas.iter().enumerate() {
+            wr32(
+                self.block_mut(root),
+                tail(bs, TL_BITMAP_PAGES) + i * 4,
+                lba as u32,
+            );
+        }
+        lbas
     }
 
     /// Overwrite an arbitrary longword — for building damaged volumes.
@@ -1522,4 +1732,773 @@ fn an_lnfs_comment_that_did_not_fit_is_read_from_its_own_block() {
             ..
         })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Dircache blocks -- read, and never believed
+// ---------------------------------------------------------------------------
+
+/// A DOS\5 volume with a handful of entries and an accurate cache, plus
+/// the entry LBAs, so each stale-cache test can bend exactly one record.
+fn dircache_volume(bend: impl FnOnce(&mut Vec<DcRecord>, &Builder)) -> (MemDisk, u64) {
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Cached");
+    let root = b.root_lba();
+    b.add(root, b"Foo", b"", EntryKind::Directory, 0);
+    b.add_file(root, b"bar.txt", b"a comment", &pattern(12));
+    b.add_file(root, b"xyzzyx", b"", &pattern(3));
+    let mut records = b.dircache_records(root);
+    bend(&mut records, &b);
+    b.add_dircache(root, &records);
+    b.add_bitmap(true);
+    (b.finish(), root)
+}
+
+#[test]
+fn a_dircache_reads_back_record_for_record() {
+    let (disk, root) = dircache_volume(|_, _| {});
+    let mut vol = Volume::open(disk, None).unwrap();
+    assert_eq!(vol.variant(), Variant::FfsIntlDircache);
+
+    let cache = vol.read_dircache(root).unwrap();
+    assert_eq!(cache.dir_lba, root);
+    assert_eq!(
+        cache.blocks.len(),
+        1,
+        "three short records fit in one block"
+    );
+    assert_eq!(cache.records.len(), 3);
+
+    let names: Vec<Vec<u8>> = cache.records.iter().map(|r| r.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![b"Foo".to_vec(), b"bar.txt".to_vec(), b"xyzzyx".to_vec()]
+    );
+    let bar = &cache.records[1];
+    assert_eq!(bar.size, 12);
+    assert_eq!(bar.comment, b"a comment");
+    assert_eq!(bar.entry_type, ST_FILE as i8);
+    assert_eq!(bar.uid, 7);
+    assert_eq!(bar.gid, 0x42);
+    assert_eq!(bar.owner(), 0x0007_0042);
+    assert_eq!(bar.protection, 0x0000_FFF5);
+    // The DateStamp is three *words* in a dircache record, widened back
+    // out on the way in.
+    assert_eq!(
+        bar.date,
+        DateStamp {
+            days: 1234,
+            mins: 56,
+            ticks: 7
+        }
+    );
+    // Records are word-aligned: 25 + name + comment, rounded up. "Foo"
+    // with no comment is 28 bytes, so the second record starts at 52.
+    assert_eq!(cache.records[0].offset, OFF_DIRCACHE_RECORDS_START);
+    assert_eq!(cache.records[1].offset, 52);
+
+    // ...and a cache that agrees with the chains produces no findings.
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    assert_eq!(report.summary.dircache_blocks, 1);
+}
+
+#[test]
+fn a_dircache_that_needs_more_than_one_block_chains() {
+    // 30-character names: 25 + 30 = 55, padded to 56, so eight records a
+    // 512-byte block. Twenty of them is three blocks.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Chained");
+    let root = b.root_lba();
+    for i in 0..20u32 {
+        let name = format!("entry-with-a-long-name-{i:07}").into_bytes();
+        assert_eq!(name.len(), 30);
+        b.add_file(root, &name, b"", &pattern(i as usize));
+    }
+    let records = b.dircache_records(root);
+    let blocks = b.add_dircache(root, &records);
+    b.add_bitmap(true);
+    assert_eq!(blocks.len(), 3, "8 + 8 + 4 records");
+
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let cache = vol.read_dircache(root).unwrap();
+    assert_eq!(cache.blocks, blocks);
+    assert_eq!(cache.records.len(), 20);
+    for (i, r) in cache.records.iter().enumerate() {
+        assert_eq!(r.size, i as u32);
+    }
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    assert_eq!(report.summary.dircache_blocks, 3);
+}
+
+#[test]
+fn a_variant_without_dircaches_reports_none_rather_than_guessing() {
+    // Longword -2 exists on every variant; on DOS\3 it is not a dircache
+    // pointer, and following it would be a guess.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"NoCache");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    b.poke(root, tail(512, TL_EXTENSION), 300); // whatever happens to be there
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert_eq!(vol.dircache_head(root).unwrap(), 0);
+    assert_eq!(vol.read_dircache(root).unwrap().records, vec![]);
+}
+
+#[test]
+fn a_stale_dircache_is_reported_and_never_believed() {
+    // An entry deleted from the cache but still in the chains: a listing
+    // served from this cache would not show the file at all.
+    let (disk, root) = dircache_volume(|recs, _| {
+        recs.retain(|r| r.name != b"bar.txt");
+    });
+    let mut vol = Volume::open(disk, None).unwrap();
+    // Lookup still finds it, because lookup never consults the cache.
+    assert!(vol.lookup(root, b"bar.txt").unwrap().is_some());
+    let report = vol.validate();
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            Finding::DircacheStale {
+                detail: DircacheDiscrepancy::Missing { .. },
+                ..
+            }
+        )),
+        "{:?}",
+        report.findings
+    );
+
+    // A record for something the chains do not hold: a listing served
+    // from this cache shows a file that is not there.
+    let (disk, _) = dircache_volume(|recs, _| {
+        let mut ghost = recs[0].clone();
+        ghost.entry = 400;
+        ghost.name = b"deleted-but-cached".to_vec();
+        recs.push(ghost);
+    });
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::DircacheStale {
+            detail: DircacheDiscrepancy::Extra { entry: 400 },
+            ..
+        }
+    )));
+
+    // A rename the cache did not see.
+    let (disk, _) = dircache_volume(|recs, _| recs[0].name = b"OldName".to_vec());
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::DircacheStale {
+            detail: DircacheDiscrepancy::NameMismatch { .. },
+            ..
+        }
+    )));
+
+    // ...but a *case* difference is not a rename: the filesystem folds,
+    // so `FOO` and `Foo` are the same name and the cache is not stale.
+    let (disk, _) = dircache_volume(|recs, _| recs[0].name = b"FOO".to_vec());
+    let mut vol = Volume::open(disk, None).unwrap();
+    assert!(vol.validate().is_clean());
+
+    // A file that grew after the cache was written.
+    let (disk, _) = dircache_volume(|recs, _| recs[1].size = 99);
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::DircacheStale {
+            detail: DircacheDiscrepancy::SizeMismatch {
+                cached: 99,
+                actual: 12,
+                ..
+            },
+            ..
+        }
+    )));
+
+    // The same entry cached twice.
+    let (disk, _) = dircache_volume(|recs, _| {
+        let dup = recs[2].clone();
+        recs.push(dup);
+    });
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::DircacheStale {
+            detail: DircacheDiscrepancy::Duplicate { .. },
+            ..
+        }
+    )));
+
+    // A directory cached as a file.
+    let (disk, _) = dircache_volume(|recs, _| recs[0].etype = ST_FILE as i8);
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::DircacheStale {
+            detail: DircacheDiscrepancy::TypeMismatch {
+                cached: -3,
+                actual: 2,
+                ..
+            },
+            ..
+        }
+    )));
+
+    // ...but a *zero* type byte means "not recorded", not "wrong": some
+    // writers lay down the whole record and never fill it in, and
+    // flagging every entry of every image they make would be useless.
+    let (disk, _) = dircache_volume(|recs, _| {
+        for r in recs.iter_mut() {
+            r.etype = 0;
+        }
+    });
+    let mut vol = Volume::open(disk, None).unwrap();
+    assert!(vol.validate().is_clean());
+}
+
+#[test]
+fn a_dircache_block_must_verify_structurally() {
+    // A cache block that names another directory as its parent.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Bad");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    let recs = b.dircache_records(root);
+    let dc = b.add_dircache(root, &recs)[0];
+    b.poke(dc, OFF_DIRCACHE_PARENT, 7);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert!(matches!(
+        vol.read_dircache(root),
+        Err(Error::BlockOwnerMismatch { found: 7, .. })
+    ));
+
+    // A block that is not a dircache block at all.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Bad");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    let recs = b.dircache_records(root);
+    let dc = b.add_dircache(root, &recs)[0];
+    b.poke(dc, OFF_TYPE, T_HEADER);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert!(matches!(
+        vol.read_dircache(root),
+        Err(Error::WrongBlockType {
+            found: 2,
+            expected: 33,
+            ..
+        })
+    ));
+
+    // A record count promising more records than the block can hold: the
+    // count and the two length bytes are three separate chances to walk
+    // off the end of a 512-byte buffer, and none of them is trusted.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Bad");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    let recs = b.dircache_records(root);
+    let dc = b.add_dircache(root, &recs)[0];
+    b.poke(dc, OFF_DIRCACHE_RECORDS, 500);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert!(matches!(
+        vol.read_dircache(root),
+        Err(Error::DircacheRecordOverflow { .. })
+    ));
+
+    // A name length byte reaching past the block's end.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Bad");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    let recs = b.dircache_records(root);
+    let dc = b.add_dircache(root, &recs)[0];
+    let mut disk = b.finish();
+    let mut raw = vec![0u8; 512];
+    disk.read_block(dc, &mut raw).unwrap();
+    raw[OFF_DIRCACHE_RECORDS_START + DC_NAME_LEN] = 255;
+    disk.write_block(dc, &raw);
+    let mut vol = Volume::open(disk, None).unwrap();
+    let e = vol.read_dircache(root);
+    assert!(
+        matches!(
+            e,
+            Err(Error::DircacheRecordOverflow { .. }) | Err(Error::Checksum { .. })
+        ),
+        "{e:?}"
+    );
+
+    // A cache chain that points back at itself.
+    let mut b = Builder::new(Variant::FfsIntlDircache, 512, 512, b"Bad");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 1);
+    let recs = b.dircache_records(root);
+    let dc = b.add_dircache(root, &recs)[0];
+    b.poke(dc, OFF_DIRCACHE_NEXT, dc as u32);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert!(matches!(
+        vol.read_dircache(root),
+        Err(Error::ChainCycle { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// The bitmap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_bitmap_marks_exactly_the_blocks_the_volume_uses() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Allocated");
+    let root = b.root_lba();
+    let dir = b.add(root, b"Dir", b"", EntryKind::Directory, 0);
+    b.add(dir, b"Inner", b"", EntryKind::File, 0);
+    let f = b.add_file(root, b"Payload", b"", &pattern(3000));
+    let pages = b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+
+    let bm = vol.read_bitmap().unwrap();
+    assert!(bm.valid());
+    assert_eq!(bm.pages(), &pages[..]);
+    assert_eq!(bm.ext_blocks(), &[] as &[u64]);
+    assert_eq!(bm.first_block(), 2);
+    assert_eq!(bm.end_block(), 512);
+    assert!(bm.covers_whole_volume());
+
+    // The root, the bitmap page, the directory tree and every data block.
+    for lba in [root, pages[0], dir, f.header] {
+        assert_eq!(bm.is_allocated(lba), Some(true), "block {lba}");
+        assert_eq!(bm.is_free(lba), Some(false));
+    }
+    for &d in &f.data {
+        assert_eq!(bm.is_allocated(d), Some(true), "data block {d}");
+    }
+    // A block nothing uses is free.
+    assert_eq!(bm.is_allocated(500), Some(false));
+    assert_eq!(bm.is_free(500), Some(true));
+
+    // The two boot blocks have no bit at all: they are not allocatable,
+    // so the bitmap does not answer for them -- which is deliberately
+    // not the same answer as "free".
+    assert!(!bm.covers(0));
+    assert!(!bm.covers(1));
+    assert_eq!(bm.is_allocated(0), None);
+    assert_eq!(bm.is_allocated(512), None);
+
+    // Counts, and the iterators that back them.
+    assert_eq!(bm.covered_count(), 510);
+    assert_eq!(bm.allocated_count() + bm.free_count(), 510);
+    assert_eq!(bm.allocated().count() as u64, bm.allocated_count());
+    assert_eq!(bm.free().count() as u64, bm.free_count());
+    assert_eq!(bm.covered().count(), 510);
+    let allocated: Vec<u64> = bm.allocated().collect();
+    assert!(allocated.contains(&root) && allocated.contains(&f.header));
+    assert!(!allocated.contains(&500));
+    // 1 = free, so an almost-empty volume is almost all ones.
+    assert!(bm.free_count() > bm.allocated_count());
+}
+
+#[test]
+fn an_invalid_bitmap_flag_is_surfaced_rather_than_hidden() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Dirty");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 0);
+    b.add_bitmap(false);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+
+    assert_eq!(vol.root().bitmap_flag, 0);
+    // The bits are still readable -- a recovery tool wants to see what
+    // the interrupted update left -- and still marked untrustworthy.
+    let bm = vol.read_bitmap().unwrap();
+    assert!(!bm.valid());
+    assert_eq!(bm.is_allocated(root), Some(true));
+
+    // validate() says so, and then declines to compare against it: every
+    // disagreement with a bitmap mid-update is noise.
+    let report = vol.validate();
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::BitmapInvalid)));
+    assert!(!report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::OrphanBlock { .. })));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.to_string().contains("must not be trusted")));
+}
+
+#[test]
+fn a_bitmap_page_with_a_bad_checksum_is_refused() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Broken");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 0);
+    let pages = b.add_bitmap(true);
+    // One flipped bit anywhere in the page breaks the sum -- and the sum
+    // is over the whole block including longword 0, which is where a
+    // bitmap block keeps its checksum rather than longword 5.
+    b.poke(pages[0], 64, 0x1234_5678);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    assert!(matches!(
+        vol.read_bitmap(),
+        Err(Error::Checksum { lba }) if lba == pages[0]
+    ));
+}
+
+#[test]
+fn the_bitmap_checksum_lives_in_longword_zero() {
+    // Stated as an assertion because it is the format's one exception and
+    // the failure mode is silent: verification never needs the index, so
+    // a writer using longword 5 produces blocks that verify against
+    // themselves and against no other implementation.
+    assert_eq!(BITMAP_CHECKSUM_INDEX, 0);
+    assert_ne!(BITMAP_CHECKSUM_INDEX, CHECKSUM_INDEX);
+    let mut page = vec![0u8; 512];
+    page[64] = 0x42;
+    let ck = checksum_compute(&page, BITMAP_CHECKSUM_INDEX);
+    page[0..4].copy_from_slice(&ck.to_be_bytes());
+    assert!(checksum_ok(&page));
+}
+
+// ---------------------------------------------------------------------------
+// validate()
+// ---------------------------------------------------------------------------
+
+/// A volume with a bit of everything: two directory levels, a file big
+/// enough to need an extension block, a hard link and a soft link.
+fn healthy_volume(variant: Variant) -> (MemDisk, u64) {
+    let mut b = Builder::new(variant, 512, 512, b"Healthy");
+    let root = b.root_lba();
+    let dir = b.add(root, b"Devs", b"", EntryKind::Directory, 0);
+    b.add(dir, b"system-configuration", b"", EntryKind::File, 0);
+    let f = b.add_file(root, b"Payload", b"a comment", &pattern(3000));
+    b.add_hard_link(root, b"Alias", EntryKind::LinkFile, f.header);
+    b.add_soft_link(root, b"Elsewhere", b"Work:Tools/Ed");
+    if variant.has_dircache() {
+        for d in [root, dir] {
+            let recs = b.dircache_records(d);
+            b.add_dircache(d, &recs);
+        }
+    }
+    b.add_bitmap(true);
+    (b.finish(), root)
+}
+
+#[test]
+fn a_healthy_volume_validates_clean_on_every_variant() {
+    for variant in [
+        Variant::Ofs,
+        Variant::Ffs,
+        Variant::FfsIntl,
+        Variant::OfsIntlDircache,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        let (disk, _root) = healthy_volume(variant);
+        let mut vol = Volume::open(disk, None).unwrap();
+        let report = vol.validate();
+        assert!(report.is_clean(), "{variant:?}: {:?}", report.findings);
+        assert!(!report.truncated);
+
+        let s = report.summary;
+        assert_eq!(s.directories, 2, "{variant:?}");
+        assert_eq!(s.files, 2);
+        assert_eq!(s.hard_links, 1);
+        assert_eq!(s.soft_links, 1);
+        assert_eq!(
+            s.dircache_blocks,
+            if variant.has_dircache() { 2 } else { 0 }
+        );
+        assert_eq!(s.bitmap_blocks, 1);
+        // Every reachable block is allocated, and nothing else is.
+        assert_eq!(s.reachable, s.allocated, "{variant:?}");
+        assert_eq!(s.orphans, 0);
+        assert_eq!(s.reachable_but_free, 0);
+        assert_eq!(s.allocated + s.free, 510);
+        // FFS data blocks are counted reachable without being verified:
+        // there is nothing in one to verify.
+        assert!(s.data_blocks > 0);
+        assert_eq!(s.extension_blocks, 0, "3000 bytes fits one table");
+    }
+}
+
+#[test]
+fn validate_reports_a_leaked_block_and_a_double_allocation_separately() {
+    // An orphan: allocated, reached by nothing. Space lost, and harmless
+    // until a validator frees it.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Leaky");
+    let root = b.root_lba();
+    b.add(root, b"File", b"", EntryKind::File, 0);
+    let stray = b.add(root, b"Stray", b"", EntryKind::File, 0);
+    // ...unchained from the directory, but still marked allocated.
+    let slot = name_hash(b"Stray", Variant::FfsIntl.fold(), hash_table_size(512)) as usize;
+    b.poke(root, OFF_HASH_TABLE + slot * 4, 0);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let report = vol.validate();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::OrphanBlock { lba } if *lba == stray)),
+        "{:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.orphans, 1);
+    assert_eq!(report.summary.reachable_but_free, 0);
+
+    // The other direction, and the dangerous one: a block a file is
+    // using, marked free. The next allocation hands it to a second owner.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Doomed");
+    let root = b.root_lba();
+    let f = b.add_file(root, b"Payload", b"", &pattern(3000));
+    let pages = b.add_bitmap(true);
+    // Free the third data block by hand, then re-checksum the page.
+    let victim = f.data[2];
+    let bit = victim - 2;
+    let off = OFF_BITMAP_BITS + (bit / 32) as usize * 4;
+    let mut disk = b.finish();
+    let mut page = vec![0u8; 512];
+    disk.read_block(pages[0], &mut page).unwrap();
+    let w = be32(&page, off) | 1 << (bit % 32);
+    page[off..off + 4].copy_from_slice(&w.to_be_bytes());
+    page[0..4].copy_from_slice(&0u32.to_be_bytes());
+    let ck = checksum_compute(&page, BITMAP_CHECKSUM_INDEX);
+    page[0..4].copy_from_slice(&ck.to_be_bytes());
+    disk.write_block(pages[0], &page);
+
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::ReachableButFree { lba } if *lba == victim)),
+        "{:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.reachable_but_free, 1);
+    assert_eq!(report.summary.orphans, 0);
+}
+
+#[test]
+fn validate_finds_an_entry_in_the_wrong_hash_slot() {
+    // The entry parses perfectly and enumeration lists it; only lookup by
+    // name will never find it, because lookup walks one chain.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Misfiled");
+    let root = b.root_lba();
+    let lba = b.add(root, b"Hidden", b"", EntryKind::File, 0);
+    let right = name_hash(b"Hidden", Variant::FfsIntl.fold(), hash_table_size(512)) as usize;
+    let wrong = (right + 1) % hash_table_size(512) as usize;
+    b.poke(root, OFF_HASH_TABLE + right * 4, 0);
+    b.poke(root, OFF_HASH_TABLE + wrong * 4, lba as u32);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+
+    // The symptom, first: enumeration sees it, lookup does not.
+    assert_eq!(vol.read_dir(root).unwrap().len(), 1);
+    assert!(vol.lookup(root, b"Hidden").unwrap().is_none());
+
+    let report = vol.validate();
+    let found = report
+        .findings
+        .iter()
+        .find(|f| matches!(f, Finding::WrongChainSlot { lba: l, .. } if *l == lba));
+    match found {
+        Some(Finding::WrongChainSlot {
+            found, hashes_to, ..
+        }) => {
+            assert_eq!(*found as usize, wrong);
+            assert_eq!(*hashes_to as usize, right);
+        }
+        other => panic!("expected a WrongChainSlot finding, got {other:?}"),
+    }
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.to_string().contains("lookup never will")));
+}
+
+#[test]
+fn validate_keeps_going_past_a_corrupt_block() {
+    // Three files, the middle one's header corrupted. A validator that
+    // stopped here would say nothing about the third -- and recovery
+    // needs the read side most of all.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Damaged");
+    let root = b.root_lba();
+    b.add(root, b"First", b"", EntryKind::File, 0);
+    let broken = b.add(root, b"Second", b"", EntryKind::File, 0);
+    b.add(root, b"Third", b"", EntryKind::File, 0);
+    let dir = b.add(root, b"Sub", b"", EntryKind::Directory, 0);
+    b.add(dir, b"Inside", b"", EntryKind::File, 0);
+    b.add_bitmap(true);
+    let mut disk = b.finish();
+    // Break the checksum *after* finish, so what fails is the sum and not
+    // the structure.
+    let mut raw = vec![0u8; 512];
+    disk.read_block(broken, &mut raw).unwrap();
+    raw[100] ^= 0xFF;
+    disk.write_block(broken, &raw);
+
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::Checksum { lba } if *lba == broken)));
+    // The walk carried on: the subdirectory and its file were still
+    // reached, so the summary counts them.
+    assert_eq!(report.summary.directories, 2);
+    assert!(report.summary.files >= 2);
+    // ...and the block it could not read is now an orphan, correctly.
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::OrphanBlock { lba } if *lba == broken)));
+}
+
+#[test]
+fn validate_names_the_structural_disagreements_individually() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Structural");
+    let root = b.root_lba();
+    let bad_key = b.add(root, b"BadKey", b"", EntryKind::File, 0);
+    let bad_parent = b.add(root, b"BadParent", b"", EntryKind::File, 0);
+    let no_name = b.add(root, b"Nameless", b"", EntryKind::File, 0);
+    let dangling = b.add_hard_link(root, b"Dangling", EntryKind::LinkFile, bad_key);
+    b.poke(bad_key, OFF_OWN_KEY, 999);
+    b.poke(bad_parent, tail(512, TL_PARENT), 3);
+    b.poke(no_name, tail(512, TL_NAME), 0); // length byte to zero
+    b.poke(dangling, tail(512, TL_REAL_ENTRY), 0);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let report = vol.validate();
+    let fs = &report.findings;
+
+    assert!(fs
+        .iter()
+        .any(|f| matches!(f, Finding::OwnKeyMismatch { lba, found: 999 } if *lba == bad_key)));
+    assert!(fs.iter().any(
+        |f| matches!(f, Finding::ParentMismatch { lba, found: 3, expected } if *lba == bad_parent && *expected == root)
+    ));
+    assert!(fs
+        .iter()
+        .any(|f| matches!(f, Finding::EmptyName { lba } if *lba == no_name)));
+    assert!(fs
+        .iter()
+        .any(|f| matches!(f, Finding::LinkTargetMissing { lba } if *lba == dangling)));
+    // An empty name hashes to slot 0, so it is also in the wrong chain --
+    // but that is reported only when there is a name to hash.
+    assert!(!fs
+        .iter()
+        .any(|f| matches!(f, Finding::WrongChainSlot { lba, .. } if *lba == no_name)));
+}
+
+#[test]
+fn validate_reports_rather_than_erroring_on_an_out_of_range_pointer() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Wild");
+    let root = b.root_lba();
+    let f = b.add_file(root, b"Payload", b"", &pattern(1000));
+    b.poke(f.header, data_pointer_offset(512, 1), 100_000);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let report = vol.validate();
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            Finding::Unreadable {
+                error: Error::LbaOutOfRange { lba: 100_000, .. },
+                ..
+            }
+        )),
+        "{:?}",
+        report.findings
+    );
+    // ...and it did not stop there: the bitmap comparison still ran.
+    assert!(report.summary.allocated > 0);
+}
+
+#[test]
+fn validate_counts_extension_and_ofs_data_blocks() {
+    for variant in [Variant::FfsIntl, Variant::OfsIntl] {
+        let mut b = Builder::new(variant, 512, 400, b"Big");
+        let root = b.root_lba();
+        let f = b.add_file(root, b"BigFile", b"", &pattern(BIG));
+        b.add_bitmap(true);
+        let mut vol = Volume::open(b.finish(), None).unwrap();
+        let report = vol.validate();
+        assert!(report.is_clean(), "{variant:?}: {:?}", report.findings);
+        assert_eq!(report.summary.extension_blocks, 1);
+        assert_eq!(report.summary.data_blocks as usize, f.data.len());
+    }
+
+    // An OFS data block whose own header disagrees with the table is a
+    // finding; the FFS equivalent cannot exist, because there is no
+    // header to disagree.
+    let mut b = Builder::new(Variant::OfsIntl, 512, 400, b"Checked");
+    let root = b.root_lba();
+    let f = b.add_file(root, b"Payload", b"", &pattern(3000));
+    b.poke(f.data[1], OFF_DATA_SEQ, 7);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let report = vol.validate();
+    assert!(report.findings.iter().any(|f| matches!(
+        f,
+        Finding::Unreadable {
+            error: Error::DataBlockSequence { found: 7, .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn validate_refuses_to_report_the_same_block_twice_over() {
+    // Two directory entries pointing at one header block: whichever is
+    // wrong, one of them is writing over the other.
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Shared");
+    let root = b.root_lba();
+    let one = b.add(root, b"One", b"", EntryKind::File, 0);
+    let two = b.add(root, b"Two", b"", EntryKind::File, 0);
+    // Point Two's slot at One's block as well.
+    let slot = name_hash(b"Two", Variant::FfsIntl.fold(), hash_table_size(512)) as usize;
+    b.poke(root, OFF_HASH_TABLE + slot * 4, one as u32);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let report = vol.validate();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::DoublyReachable { lba, .. } if *lba == one)),
+        "{:?}",
+        report.findings
+    );
+    // Two is now unreachable and its block leaks.
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| matches!(f, Finding::OrphanBlock { lba } if *lba == two)));
+}
+
+#[test]
+fn findings_display_with_the_consequence_stated() {
+    let f: Finding<MemError> = Finding::ReachableButFree { lba: 42 };
+    assert!(f.to_string().contains("hand it out twice"));
+    let f: Finding<MemError> = Finding::OrphanBlock { lba: 42 };
+    assert!(f.to_string().contains("leaked"));
+    let f: Finding<MemError> = Finding::BitmapInvalid;
+    assert!(f.to_string().contains("must not be trusted"));
+    let f: Finding<MemError> = Finding::DircacheStale {
+        dir: 880,
+        block: 866,
+        detail: DircacheDiscrepancy::Missing { entry: 900 },
+    };
+    assert!(f.to_string().contains("entry 900 is not cached"));
+    let f: Finding<MemError> = Finding::Unreadable {
+        lba: 5,
+        error: Error::ChainCycle { lba: 5 },
+    };
+    assert!(f.to_string().contains("revisits block 5"));
 }

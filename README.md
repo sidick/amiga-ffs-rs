@@ -15,12 +15,17 @@ conveniences. No dependencies. MSRV 1.63.
 
 ## Status
 
-Foundations: the `BlockSource` seam (runtime block size, `u64` LBAs,
-typed errors), the DOS-type/variant model, both checksum algorithms,
-BCPL strings, and both name-hash case-folding tables — the primitives
-where a subtle mistake produces a filesystem that *mostly* works, so
-they come first, with tests. Directory and file reading are next; see
-`PLAN.md`.
+**Reading is complete** (milestone 1): root blocks, directory traversal
+under both fold tables, the `DOS\6`/`DOS\7` long-name layout, file data
+through FFS chains and OFS data blocks, hard and soft links, metadata
+(protection, owner, dates), `DOS\4`/`DOS\5` dircache blocks (read and
+marked advisory — the hash chains stay authoritative), the allocation
+bitmap, and a `validate()` that walks the whole volume and *reports*
+rather than refusing, so a damaged volume still yields everything still
+reachable.
+
+Writing — formatting a volume, allocating from the bitmap, mutating
+directories — is milestone 2 and 3; see `PLAN.md`.
 
 ## Why this exists
 

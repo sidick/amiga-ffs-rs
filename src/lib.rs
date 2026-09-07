@@ -32,9 +32,12 @@
 //! (every on-disk offset, for both the classic and the long-name name
 //! layouts), [`read`] (boot block, root block, directory traversal),
 //! [`mod@file`] (file data through FFS chains and OFS data blocks, hard-link
-//! resolution, soft-link paths, overflow comment blocks) and [`meta`]
+//! resolution, soft-link paths, overflow comment blocks), [`meta`]
 //! (the protection longword's inverted-sense bits, and the `DateStamp`'s
-//! calendar conversion).
+//! calendar conversion), [`dircache`] (`DOS\4`/`DOS\5` cache blocks, read
+//! and marked advisory), [`bitmap`] (the allocation bitmap, with its four
+//! easily-inverted conventions stated) and [`validate`] (the whole-volume
+//! walk that reports rather than refuses).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -42,16 +45,20 @@
 //! *mostly* works. Everything above them is pointer-following, and every
 //! pointer is range-checked and every chain refuses to revisit a block.
 //!
-//! Not here yet: dircache blocks, bitmaps, `validate()`.
+//! Milestone 1 (read) is complete. Writing — formatting a volume,
+//! allocating from the bitmap, mutating directories — is not here.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
+pub mod bitmap;
+pub mod dircache;
 pub mod file;
 pub mod layout;
 pub mod meta;
 pub mod read;
+pub mod validate;
 
 pub use layout::{
     ST_FILE, ST_LINKDIR, ST_LINKFILE, ST_ROOT, ST_SOFTLINK, ST_USERDIR, T_COMMENT, T_DATA,
@@ -63,7 +70,10 @@ pub use read::{
     DateStamp, DostypeSource, Entry, EntryKind, Error, RootBlock, Volume, DEFAULT_RESERVED,
 };
 
+pub use bitmap::Bitmap;
+pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
+pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.
 ///

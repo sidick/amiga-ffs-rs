@@ -48,15 +48,35 @@ plan, which owns everything outside the partition.
       "where present": muFS is in scope (below), and plain FFS carries
       the same fields zeroed.
 - [x] **Hard/soft links**: link chains resolved, loops refused.
-- [ ] **Dircache blocks** (`DOS\4`/`DOS\5`): read them, but treat the
+- [x] **Dircache blocks** (`DOS\4`/`DOS\5`): read them, but treat the
       hash chains as authoritative — caches go stale, and a reader
       that trusts a stale cache invents a directory that isn't there.
-- [ ] **Bitmap**: read and verify (block-in-use vs reachable-from-root)
+      `read_dircache()` is documented advisory and nothing in the crate
+      resolves a name through it; `validate()` compares cache against
+      chains and reports the six ways they can disagree. Record layout
+      (three *words* of DateStamp, a signed type byte, two counted
+      strings, word-aligned) confirmed byte for byte against `DOS\5`
+      images built by xdftool. The pointer is longword −2, the field a
+      file header uses for its extension chain — no collision, because
+      the meaning follows the secondary type.
+- [x] **Bitmap**: read and verify (block-in-use vs reachable-from-root)
       — the read-side half of `validate()`, and the foundation the
-      allocator will stand on.
-- [ ] **`validate()`**: checksums, hash-chain membership matches hash
+      allocator will stand on. Four inversion-prone conventions each
+      confirmed against xdftool-built images: **1 = free**, LSB-first
+      within each big-endian longword, first bit is block `reserved`,
+      and the checksum is longword **0** rather than 5. Bitmap extension
+      blocks are bare pointer arrays — no type, no own key, no checksum
+      — with the last longword chaining onward. `bitmap_flag == 0` is
+      surfaced (`Bitmap::valid()`), never silently trusted.
+- [x] **`validate()`**: checksums, hash-chain membership matches hash
       of name, bitmap consistency, orphan blocks. Parse damaged volumes
-      where possible — recovery needs the read side most of all.
+      where possible — recovery needs the read side most of all. Returns
+      a `Report` of typed `Finding`s rather than erroring: the walk
+      records and continues, so a directory with one corrupt chain still
+      yields the other seventy-one. Orphans (leaked) and
+      reachable-but-free (double-allocation risk) are reported as
+      *different* findings, because the mutation ordering in milestone 3
+      exists precisely to fail in the first direction and not the second.
 - [ ] **Differential suite**: same tree read through this crate,
       xdftool (GPL oracle — run, never copy), affs-read (MIT —
       readable when outputs disagree), and AROS's `afs.handler`
@@ -68,6 +88,37 @@ plan, which owns everything outside the partition.
       selecting the fold table. Fixtures from amibake images
       (redistributable AROS DOS\7 included) plus synthetic minimal
       volumes per variant, mixed block sizes 512..=32K.
+
+      **Partly landed**, so the box stays open. `tests/differential.rs`
+      does the xdftool leg: it generates all eight `DOS\0`–`DOS\7`
+      variants at test time (nothing checked in — a committed ADF is a
+      blob nobody can review) and reads each back through this crate —
+      whole tree, every byte of every file including one that crosses an
+      extension block, dircache against the chains, bitmap against
+      xdftool's own `info` accounting, and `validate()` clean on all
+      eight. It skips with a printed reason when xdftool is absent, so
+      it is never a build dependency.
+
+      What remains, and why it is not done rather than merely not done
+      yet:
+
+      - **affs-read and AROS `afs.handler` as oracles.** xdftool is the
+        leg that catches the mistakes this crate and its own synthetic
+        builder would make *together*; the other two matter for
+        understanding a disagreement once there is one. `afs.handler`
+        additionally needs a guest to run in, which is Copperline's seam
+        and not something `cargo test` can reach.
+      - **Block sizes other than 512.** xdftool's ADF and HDF images are
+        512-blocked; larger block sizes live behind an RDB, which is
+        `rdbtool`'s and amiga-rdb's territory. Covered synthetically at
+        512/1024/4096 in `tests/volumes.rs` meanwhile.
+      - **Comments.** xdftool's `comment` command raises a `TypeError`
+        before writing anything (amitools 0.7.x), so no oracle-written
+        volume can carry one. Covered synthetically in both layouts,
+        `T_COMMENT` overflow block included.
+      - **The amibake AROS `DOS\7` fixture** — a real-world image rather
+        than a generated one. Wanted; needs a fixture pipeline, not just
+        a test.
 
 ## Milestone 2 — create
 

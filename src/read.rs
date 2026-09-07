@@ -241,6 +241,19 @@ pub enum Error<E> {
         /// The link's header block.
         lba: u64,
     },
+    /// A dircache block whose record count promises more records than the
+    /// block has room for, or whose name/comment length bytes run a
+    /// record past the block's end. Refused rather than short-read: the
+    /// count and the two length bytes are three independent chances to
+    /// walk off the end of a 512-byte buffer.
+    DircacheRecordOverflow {
+        /// The dircache block.
+        lba: u64,
+        /// Which record (0-based) did not fit.
+        index: u32,
+        /// The byte offset it would have started at.
+        off: usize,
+    },
     /// A soft link reached where a resolved object was required. Not an
     /// error in the volume: soft links store a *path*, and resolving a
     /// path is the caller's job, not this crate's. See
@@ -362,6 +375,10 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             } => write!(
                 f,
                 "data block {lba} holds {found} bytes, expected {expected}"
+            ),
+            Self::DircacheRecordOverflow { lba, index, off } => write!(
+                f,
+                "dircache block {lba} record {index} does not fit at offset {off}"
             ),
             Self::NotALink { lba, found } => write!(
                 f,
@@ -513,7 +530,7 @@ fn parse_root(block: &[u8], lba: u64, variant: Variant) -> RootBlock {
 /// here — following them is a separate job with its own loop refusal.
 /// Classifying them is still the point: a reader that cannot name what
 /// it found should not silently drop it from a listing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntryKind {
     /// `ST_USERDIR` (2).
     Directory,
@@ -751,6 +768,7 @@ pub struct Volume<S: crate::BlockSource> {
     pub(crate) variant: Variant,
     pub(crate) block_size: usize,
     pub(crate) block_count: u64,
+    pub(crate) reserved: u64,
     pub(crate) root: RootBlock,
     pub(crate) buf: Vec<u8>,
 }
@@ -783,7 +801,9 @@ impl<S: crate::BlockSource> Volume<S> {
         })?;
         let dostype = read_boot_dostype(&mut src)?;
         let variant = resolve_variant(dostype, expect)?;
-        Self::open_at_root(src, variant, block_count, root_lba)
+        let mut vol = Self::open_at_root(src, variant, block_count, root_lba)?;
+        vol.reserved = reserved;
+        Ok(vol)
     }
 
     /// Open a volume whose root block is already known — for recovery,
@@ -831,9 +851,29 @@ impl<S: crate::BlockSource> Volume<S> {
             variant,
             block_size,
             block_count,
+            reserved: DEFAULT_RESERVED,
             root,
             buf,
         })
+    }
+
+    /// Blocks reserved at the front of the volume, before the bitmap's
+    /// first bit and before anything the filesystem allocates.
+    ///
+    /// [`Volume::open_with`] takes it from the caller (an RDB's
+    /// `de_Reserved`); the other constructors assume
+    /// [`DEFAULT_RESERVED`], which is what every volume anyone has made
+    /// actually uses. It matters here rather than only at open time
+    /// because the bitmap's first bit is block `reserved`, so a wrong
+    /// value shifts every allocation answer.
+    pub fn reserved(&self) -> u64 {
+        self.reserved
+    }
+
+    /// Correct the reserved-block count on an already-open volume — for
+    /// recovery, where the geometry is what is in doubt.
+    pub fn set_reserved(&mut self, reserved: u64) {
+        self.reserved = reserved;
     }
 
     /// The variant this volume is being read as.
