@@ -156,8 +156,25 @@ pub const TL_COMMENT_BLOCK: usize = 18;
 /// −23 to make room for [`TL_NAC`].
 pub const TL_DATE_LONG: usize = 15;
 
+/// Hard-link blocks only, longword −11: the block of the *real* object
+/// this link names — `original` in Linux's `struct affs_tail`,
+/// `realEntry` in ADFlib's `bLinkBlock`. The link's own header block
+/// carries name, dates and protection of its own; everything else
+/// (data, hash table) lives on the target.
+///
+/// Immediately before [`TL_NEXT_LINK`] in both layouts: the classic tail
+/// runs `…name[32], spare, original, link_chain, spare[5], hash_chain…`
+/// and the LNFS tail runs `…Created[3], Spare5[2], FirstLink,
+/// Spare6[5], HashChain…`, so LNFS's second `Spare5` longword is exactly
+/// this field — a plain directory is nobody's link and leaves it zero.
+pub const TL_REAL_ENTRY: usize = 11;
 /// Longword −10: first hard link pointing at this entry (`next_link` in
 /// the classic naming). Same place in both layouts.
+///
+/// On a *link* block this is the next link in the chain of links to the
+/// same object; on the target it is the head of that chain. Following it
+/// enumerates every name an object has — it does not resolve anything,
+/// which is [`TL_REAL_ENTRY`]'s job.
 pub const TL_NEXT_LINK: usize = 10;
 /// Longword −4: next entry in this hash chain, 0 at the end. Zero in a
 /// root block, which is nobody's directory entry.
@@ -169,6 +186,88 @@ pub const TL_PARENT: usize = 3;
 pub const TL_EXTENSION: usize = 2;
 /// Longword −1: the secondary type (`ST_*`).
 pub const TL_SECONDARY_TYPE: usize = 1;
+
+// --- file data: extension blocks, OFS data blocks ------------------------
+
+/// A file header's (and file-extension block's) data-pointer table shares
+/// the hash table's space, longword 6 onward — but is filled from the
+/// *end backwards*. Slot `n-1` holds data block 1, slot `n-2` data block
+/// 2, and so on for [`OFF_HIGH_SEQ`] entries.
+///
+/// Backwards because the filesystem appends: a new pointer goes in the
+/// next slot *down*, so the block's used region grows towards the head
+/// and the table never has to be shuffled. A reader that walks the table
+/// forwards gets the file's blocks in reverse, which for most files still
+/// produces the right *number* of blocks and the wrong bytes.
+///
+/// The table holds [`hash_table_size`](crate::hash_table_size()) entries —
+/// 72 at 512 bytes, so ~36 KB of FFS data before the first extension
+/// block is needed, ~35 KB of OFS data.
+#[inline]
+pub fn data_pointer_offset(block_size: usize, seq: u32) -> usize {
+    let slots = crate::hash_table_size(block_size);
+    OFF_HASH_TABLE + (slots - seq) as usize * 4
+}
+
+/// OFS data block, longword 1: the *file header* block this data belongs
+/// to. Redundant with the header's own table, and precisely because it is
+/// redundant it is worth checking — it catches a table pointing into
+/// another file's data.
+pub const OFF_DATA_HEADER_KEY: usize = 4;
+/// OFS data block, longword 2: the block's sequence number in the file,
+/// counting from **1**.
+pub const OFF_DATA_SEQ: usize = 8;
+/// OFS data block, longword 3: bytes of payload in this block,
+/// `<= block_size - 24`. Only the last block of a file may be short.
+pub const OFF_DATA_SIZE: usize = 12;
+/// OFS data block, longword 4: the next data block, 0 at the end.
+/// Redundant with the header's table, which this crate treats as
+/// authoritative; recorded, not enforced.
+pub const OFF_DATA_NEXT: usize = 16;
+/// OFS data block: where the payload starts, after the six-longword
+/// header. FFS data blocks have no header at all and start at 0.
+pub const OFF_DATA_PAYLOAD: usize = 24;
+
+/// Payload bytes per data block: the whole block on FFS, 24 fewer on OFS.
+/// This is the single number that makes the same file occupy a different
+/// number of blocks on `DOS\0` and `DOS\1`.
+#[inline]
+pub fn data_payload_size(block_size: usize, is_ffs: bool) -> usize {
+    if is_ffs {
+        block_size
+    } else {
+        block_size - OFF_DATA_PAYLOAD
+    }
+}
+
+// --- LNFS overflow comment block -----------------------------------------
+
+/// [`T_COMMENT`] block, longword 2: the header block whose comment this
+/// is. (`struct CommentBlock`'s `HeaderKey`.)
+pub const OFF_COMMENT_HEADER_KEY: usize = 8;
+/// [`T_COMMENT`] block: the comment itself, a BCPL string in 80 bytes,
+/// starting where every other block's table starts.
+pub const OFF_COMMENT_TEXT: usize = 24;
+
+// --- soft links ----------------------------------------------------------
+
+/// An `ST_SOFTLINK` block stores a *path*, not a block pointer, as a
+/// NUL-terminated string in the space a directory uses for its hash table
+/// — `struct slink_front`'s `symname`, longword 6 onward, running to the
+/// start of the tail (`block_size - 200`).
+///
+/// A path, not a pointer, is the whole difference between the two link
+/// kinds: a hard link is resolved by the filesystem, a soft link by
+/// whatever is doing path resolution — which on AmigaDOS is the caller,
+/// via the `ERROR_IS_SOFT_LINK` packet dance.
+pub const OFF_SOFTLINK_PATH: usize = OFF_HASH_TABLE;
+
+/// Bytes available for a soft link's path on a `block_size` block:
+/// everything between the head and the tail.
+#[inline]
+pub fn softlink_path_capacity(block_size: usize) -> usize {
+    block_size - 200 - OFF_SOFTLINK_PATH
+}
 
 /// Smallest filesystem block size the format allows.
 pub const MIN_BLOCK_SIZE: usize = 512;
@@ -274,6 +373,71 @@ mod tests {
         assert_eq!(tail(bs, TL_ROOT_DISK_MADE), 484);
         assert_eq!(tail(bs, TL_ROOT_FS_TYPE), 496);
         assert_eq!(tail(bs, TL_SECONDARY_TYPE), 508);
+    }
+
+    #[test]
+    fn link_and_comment_and_data_fields_match_the_c_layout() {
+        // struct affs_tail (Linux fs/affs/amigaffs.h), from block_size-200:
+        //   spare1 4, uid+gid 4, protect 4, size 4      -> 16
+        //   comment[92]                                 -> 108
+        //   change[3]                                   -> 120
+        //   name[32]                                    -> 152
+        //   spare2 4                                    -> 156
+        //   original 4                                  -> 160   (= -11)
+        //   link_chain 4                                -> 164   (= -10)
+        let bs = 512;
+        assert_eq!(tail(bs, TL_REAL_ENTRY), bs - 200 + 156);
+        assert_eq!(tail(bs, TL_NEXT_LINK), bs - 200 + 160);
+        // ADFlib's bLinkBlock names the same two longwords realEntry
+        // (0x1d4 = 468) and nextLink (0x1d8 = 472).
+        assert_eq!(tail(bs, TL_REAL_ENTRY), 0x1d4);
+        assert_eq!(tail(bs, TL_NEXT_LINK), 0x1d8);
+
+        // struct CommentBlock: Type, OwnKey, HeaderKey, Spare1[2],
+        // Checksum, Comment[80] -> the comment starts at 24 and the
+        // 80-byte field holds a 79-character BCPL string exactly.
+        assert_eq!(OFF_COMMENT_HEADER_KEY, 8);
+        assert_eq!(OFF_COMMENT_TEXT, 24);
+        assert_eq!(OFF_COMMENT_TEXT + 1 + COMMENT_MAX, 104);
+
+        // struct affs_data_head: ptype, key, sequence, size, next,
+        // checksum, then data[] -- six longwords of header.
+        assert_eq!(OFF_DATA_HEADER_KEY, 4);
+        assert_eq!(OFF_DATA_SEQ, 8);
+        assert_eq!(OFF_DATA_SIZE, 12);
+        assert_eq!(OFF_DATA_NEXT, 16);
+        assert_eq!(OFF_DATA_PAYLOAD, 24);
+        assert_eq!(data_payload_size(512, false), 488);
+        assert_eq!(data_payload_size(512, true), 512);
+        assert_eq!(data_payload_size(4096, false), 4072);
+
+        // struct slink_front: six longwords, then symname to the tail.
+        assert_eq!(OFF_SOFTLINK_PATH, 24);
+        assert_eq!(softlink_path_capacity(512), 288);
+        assert_eq!(softlink_path_capacity(4096), 3872);
+    }
+
+    #[test]
+    fn the_data_pointer_table_is_filled_from_the_end_backwards() {
+        // Data block 1 goes in the last slot, and the high_seq'th data
+        // block in the slot high_seq places from the end.
+        for bs in [512usize, 1024, 4096] {
+            let slots = hash_table_size(bs);
+            assert_eq!(
+                data_pointer_offset(bs, 1),
+                OFF_HASH_TABLE + (slots as usize - 1) * 4
+            );
+            // The last usable slot is the first one, longword 6.
+            assert_eq!(data_pointer_offset(bs, slots), OFF_HASH_TABLE);
+            // And it never runs into the tail.
+            assert!(data_pointer_offset(bs, 1) + 4 <= tail(bs, TL_BITMAP_FLAG));
+        }
+        // At 512 bytes: 72 pointers, so 36 KB of FFS data in the header
+        // alone before an extension block is needed.
+        assert_eq!(
+            hash_table_size(512) as usize * data_payload_size(512, true),
+            36864
+        );
     }
 
     #[test]

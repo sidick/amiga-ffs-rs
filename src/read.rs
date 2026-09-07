@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::layout::*;
+use crate::meta::Protection;
 use crate::{bcpl_str, be32, checksum_ok, hash_table_size, name_hash, Variant};
 use crate::{MAX_NAME_CLASSIC, MAX_NAME_LONG};
 
@@ -139,6 +140,115 @@ pub enum Error<E> {
         /// The variant's maximum.
         max: usize,
     },
+    /// A block whose primary type is not the one its position requires —
+    /// an extension block that is not `T_LIST`, an OFS data block that is
+    /// not `T_DATA`, a comment block that is not `T_COMMENT`.
+    WrongBlockType {
+        /// The block read.
+        lba: u64,
+        /// The primary type found in longword 0.
+        found: u32,
+        /// The primary type required.
+        expected: u32,
+    },
+    /// A block whose longword 1 does not name itself. Every metadata
+    /// block records its own number; a block that disagrees was written
+    /// somewhere it did not belong, which is the signature of a bad
+    /// pointer *into* it rather than corruption within it.
+    OwnKeyMismatch {
+        /// The block read.
+        lba: u64,
+        /// The own key found.
+        found: u32,
+    },
+    /// A block that names a different owner than the one that pointed at
+    /// it: an extension block whose parent is another file, an OFS data
+    /// block whose header key is another file's, a comment block
+    /// belonging to another entry.
+    BlockOwnerMismatch {
+        /// The block read.
+        lba: u64,
+        /// The owner the block claims.
+        found: u32,
+        /// The owner that pointed at it.
+        expected: u32,
+    },
+    /// A file header or extension block claiming more data pointers than
+    /// its table has slots.
+    DataPointerCount {
+        /// The block read.
+        lba: u64,
+        /// The `high_seq` found.
+        high_seq: u32,
+        /// Slots the table actually has.
+        max: u32,
+    },
+    /// A zero where `high_seq` promised a data block. A hole is not a
+    /// sparse file — the format has no such thing — it is a truncated
+    /// write, and reading zeroes for it would invent data.
+    DataPointerHole {
+        /// The header or extension block holding the table.
+        lba: u64,
+        /// Which data block (1-based) was missing.
+        seq: u32,
+    },
+    /// The file's length and the number of data blocks it has disagree.
+    /// Checked in both directions: a chain too short would read a short
+    /// file, a chain too long would read blocks the file does not own.
+    FileSizeMismatch {
+        /// The file header block.
+        lba: u64,
+        /// The length the header claims.
+        byte_size: u32,
+        /// Data blocks the chain actually holds.
+        blocks: u64,
+        /// Data blocks `byte_size` implies.
+        expected: u64,
+    },
+    /// An OFS data block whose sequence number is not its position in the
+    /// file. The header's table is authoritative; this is the block's own
+    /// disagreement with it.
+    DataBlockSequence {
+        /// The data block.
+        lba: u64,
+        /// The sequence number found.
+        found: u32,
+        /// The sequence number its position requires (1-based).
+        expected: u32,
+    },
+    /// An OFS data block whose payload length is impossible, or short
+    /// where it is not the last block of the file.
+    DataBlockSize {
+        /// The data block.
+        lba: u64,
+        /// The size found.
+        found: u32,
+        /// The size its position in the file requires.
+        expected: u32,
+    },
+    /// [`Volume::resolve_link`] was handed something that is not a link
+    /// and not a resolved object either.
+    NotALink {
+        /// The block read.
+        lba: u64,
+        /// Its secondary type.
+        found: i32,
+    },
+    /// A hard link whose `real_entry` is zero: a link to nothing. The
+    /// filesystem never writes one; a validator finding one has found an
+    /// interrupted delete.
+    LinkTargetMissing {
+        /// The link's header block.
+        lba: u64,
+    },
+    /// A soft link reached where a resolved object was required. Not an
+    /// error in the volume: soft links store a *path*, and resolving a
+    /// path is the caller's job, not this crate's. See
+    /// [`Volume::read_softlink`].
+    SoftLinkNotResolved {
+        /// The soft link's header block.
+        lba: u64,
+    },
 }
 
 /// Which copy of the dostype an [`Error::VariantMismatch`] came from.
@@ -205,6 +315,63 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
             Self::NameTooLong { len, max } => {
                 write!(f, "name of {len} bytes exceeds this variant's {max}")
             }
+            Self::WrongBlockType {
+                lba,
+                found,
+                expected,
+            } => write!(f, "block {lba} has type {found}, expected {expected}"),
+            Self::OwnKeyMismatch { lba, found } => {
+                write!(f, "block {lba} calls itself block {found}")
+            }
+            Self::BlockOwnerMismatch {
+                lba,
+                found,
+                expected,
+            } => write!(
+                f,
+                "block {lba} belongs to block {found}, but block {expected} pointed at it"
+            ),
+            Self::DataPointerCount { lba, high_seq, max } => write!(
+                f,
+                "block {lba} claims {high_seq} data pointers, table holds {max}"
+            ),
+            Self::DataPointerHole { lba, seq } => {
+                write!(f, "block {lba} has no pointer for data block {seq}")
+            }
+            Self::FileSizeMismatch {
+                lba,
+                byte_size,
+                blocks,
+                expected,
+            } => write!(
+                f,
+                "file {lba} is {byte_size} bytes ({expected} data blocks) but has {blocks}"
+            ),
+            Self::DataBlockSequence {
+                lba,
+                found,
+                expected,
+            } => write!(
+                f,
+                "data block {lba} is sequence {found}, expected {expected}"
+            ),
+            Self::DataBlockSize {
+                lba,
+                found,
+                expected,
+            } => write!(
+                f,
+                "data block {lba} holds {found} bytes, expected {expected}"
+            ),
+            Self::NotALink { lba, found } => write!(
+                f,
+                "block {lba} (secondary type {found}) is not a link to resolve"
+            ),
+            Self::LinkTargetMissing { lba } => write!(f, "hard link {lba} points at nothing"),
+            Self::SoftLinkNotResolved { lba } => write!(
+                f,
+                "block {lba} is a soft link; its path is the caller's to resolve"
+            ),
         }
     }
 }
@@ -235,11 +402,11 @@ impl<E: std::error::Error + 'static> std::error::Error for Error<E> {
 /// An AmigaDOS `DateStamp`, raw: days since 1978-01-01, minutes past
 /// midnight, and ticks (1/50 s) past the minute.
 ///
-/// Deliberately not converted to a calendar date here. The conversion
-/// needs the platform's leap-year handling and a target date type, both
-/// of which are the consumer's decisions; the three longwords are what
-/// the disk holds, and losing them to a lossy conversion in the parser
-/// would be the wrong trade.
+/// Stored as the disk stores it — three longwords, no date type, no
+/// timezone — because that is what the volume actually contains and a
+/// parser that only hands back a converted value has thrown away the
+/// bytes. [`DateStamp::to_calendar`] does the conversion when the caller
+/// wants it, with the leap-year rules stated rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DateStamp {
     /// Days since 1978-01-01.
@@ -431,6 +598,30 @@ pub struct Entry {
     /// [`Entry::comment`] is empty because the comment did not fit
     /// beside the name.
     pub comment_block: u32,
+    /// Hard links only, longword −11: the block of the object this link
+    /// really names. Zero on anything that is not a link — and zero on a
+    /// hard link is a link to nothing, which
+    /// [`Volume::resolve_link`] refuses rather than reads.
+    pub real_entry: u32,
+}
+
+impl Entry {
+    /// The protection longword as a typed view, with the low nibble's
+    /// inverted sense handled once. See [`Protection`].
+    pub fn protection_bits(&self) -> Protection {
+        Protection::from_bits(self.protection)
+    }
+
+    /// The owner's UID: the protection-adjacent longword's high word.
+    /// Zero on plain FFS.
+    pub fn uid(&self) -> u16 {
+        (self.owner >> 16) as u16
+    }
+
+    /// The owner's GID: the low word of the same longword.
+    pub fn gid(&self) -> u16 {
+        self.owner as u16
+    }
 }
 
 /// Split an LNFS `NaC` field into its two BCPL strings.
@@ -499,6 +690,14 @@ fn parse_entry(block: &[u8], lba: u64, variant: Variant) -> Result<Entry, EntryE
         extension: be32(block, tail(bs, TL_EXTENSION)),
         next_link: be32(block, tail(bs, TL_NEXT_LINK)),
         comment_block,
+        // Longword −11 is the link target only in a link block; in a
+        // plain file or directory it is a spare longword the filesystem
+        // leaves zero, and reporting whatever it holds as a target would
+        // be inventing a link.
+        real_entry: match kind {
+            EntryKind::LinkFile | EntryKind::LinkDir => be32(block, tail(bs, TL_REAL_ENTRY)),
+            _ => 0,
+        },
     })
 }
 
@@ -548,12 +747,12 @@ pub fn read_boot_dostype<S: crate::BlockSource>(src: &mut S) -> Result<u32, Erro
 /// An opened volume: a block source, the variant it is being read as,
 /// and its parsed root.
 pub struct Volume<S: crate::BlockSource> {
-    src: S,
-    variant: Variant,
-    block_size: usize,
-    block_count: u64,
-    root: RootBlock,
-    buf: Vec<u8>,
+    pub(crate) src: S,
+    pub(crate) variant: Variant,
+    pub(crate) block_size: usize,
+    pub(crate) block_count: u64,
+    pub(crate) root: RootBlock,
+    pub(crate) buf: Vec<u8>,
 }
 
 impl<S: crate::BlockSource> Volume<S> {
@@ -682,15 +881,22 @@ impl<S: crate::BlockSource> Volume<S> {
         }
     }
 
-    /// Read `lba` into the scratch buffer and verify its checksum.
-    fn read_checked(&mut self, lba: u64) -> Result<(), Error<S::Error>> {
+    /// Read `lba` into the scratch buffer, range-checked, with no
+    /// checksum: for FFS data blocks, which are raw payload with no
+    /// checksum longword to verify.
+    pub(crate) fn read_raw(&mut self, lba: u64) -> Result<(), Error<S::Error>> {
         if lba >= self.block_count {
             return Err(Error::LbaOutOfRange {
                 lba,
                 block_count: self.block_count,
             });
         }
-        self.src.read_block(lba, &mut self.buf).map_err(Error::Io)?;
+        self.src.read_block(lba, &mut self.buf).map_err(Error::Io)
+    }
+
+    /// Read `lba` into the scratch buffer and verify its checksum.
+    pub(crate) fn read_checked(&mut self, lba: u64) -> Result<(), Error<S::Error>> {
+        self.read_raw(lba)?;
         if !checksum_ok(&self.buf) {
             return Err(Error::Checksum { lba });
         }
@@ -794,6 +1000,15 @@ impl<S: crate::BlockSource> Volume<S> {
 
     /// Resolve a `/`-separated path relative to `dir_lba`. Empty
     /// components are skipped, so a trailing slash is harmless.
+    ///
+    /// Links are **not** followed. A hard link component is returned as
+    /// the link entry it is ([`Volume::resolve_link`] follows it); a soft
+    /// link is returned as itself, because resolving one means re-entering
+    /// path resolution possibly on another volume, through assigns and
+    /// device names this crate has never heard of. That is `DosPacket`
+    /// work and lives in the consumer — see [`Volume::read_softlink`].
+    /// Walking *through* a link mid-path therefore stops at the link, and
+    /// the caller decides what to do next.
     pub fn lookup_path(
         &mut self,
         dir_lba: u64,
@@ -818,7 +1033,11 @@ impl<S: crate::BlockSource> Volume<S> {
     /// a damaged volume actually produces, and the length bound keeps
     /// that set from growing without limit on a volume whose blocks all
     /// point somewhere new.
-    fn guard_chain(&self, visited: &mut Vec<u64>, lba: u64) -> Result<(), Error<S::Error>> {
+    pub(crate) fn guard_chain(
+        &self,
+        visited: &mut Vec<u64>,
+        lba: u64,
+    ) -> Result<(), Error<S::Error>> {
         if visited.contains(&lba) {
             return Err(Error::ChainCycle { lba });
         }

@@ -38,16 +38,16 @@ plan, which owns everything outside the partition.
       resolves no directory entry. Accepting a variant's dostype
       without implementing its layout is this format's signature trap;
       this crate refuses what it cannot parse instead.
-- [ ] **File reading**: FFS data-block chains via file-header block
+- [x] **File reading**: FFS data-block chains via file-header block
       lists and extension blocks; OFS data blocks with their headers
       (and use those headers to *verify*, since they're there).
-- [ ] **Metadata**: protection bits — the full 32-bit long, including
+- [x] **Metadata**: protection bits — the full 32-bit long, including
       the group/other RWED bits — comments, dates (ticks since
       1978-01-01, the 1900-leap-year rules), and the owner longword
       (UID/GID). Owner and the extended bits are first-class, not
       "where present": muFS is in scope (below), and plain FFS carries
       the same fields zeroed.
-- [ ] **Hard/soft links**: link chains resolved, loops refused.
+- [x] **Hard/soft links**: link chains resolved, loops refused.
 - [ ] **Dircache blocks** (`DOS\4`/`DOS\5`): read them, but treat the
       hash chains as authoritative — caches go stale, and a reader
       that trusts a stale cache invents a directory that isn't there.
