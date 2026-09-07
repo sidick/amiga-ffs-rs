@@ -21,6 +21,12 @@ plan, which owns everything outside the partition.
 
 ## Milestone 1 — read
 
+**Landed** (commits `db33576`, `76989f3`, `a837b68`): the read side is
+complete — every variant, every block size, 82 tests green on stable
+and MSRV across both feature sets, and the xdftool differential leg
+passing on all eight variants. One box below stays open for the parts
+of the differential suite that need more than `cargo test` can reach.
+
 - [x] **Root block**: locate (from geometry / reserved blocks), parse
       name, dates, hash table, bitmap pointers. Detect the variant from
       the *partition's* dostype but verify against what the volume
@@ -122,7 +128,7 @@ plan, which owns everything outside the partition.
 
 ## Milestone 2 — create
 
-Write code with nothing to corrupt: format a fresh volume, populate
+**Next up.** Write code with nothing to corrupt: format a fresh volume, populate
 from a host tree, read it straight back. The API Copperline (dynamic
 OFS/FFS drives from directories) and amibake (dir→hdf) actually want.
 
@@ -199,14 +205,18 @@ Gated on the milestone-1 validator and differential suite.
 
 ## Cross-cutting
 
-- [ ] Errors: `Display` everywhere, `std::error::Error` under `std`
+- [x] Errors: `Display` everywhere, `std::error::Error` under `std` —
+      `Error<E>` and every `validate()` `Finding` state their
+      consequence, and the transport error survives via `source()`
 - [ ] Fuzzing: parse arbitrary volumes without panic; fuzz the hash
       chains and name lengths specifically
 - [ ] CI: stable + MSRV 1.63, `--no-default-features`, clippy
       `-D warnings`, rustfmt, docs; differential job where fixtures
       are buildable
 - [ ] crates.io publish at read-complete; `#![deny(missing_docs)]`
-      once the surface settles
+      once the surface settles. Read-complete is *reached* — the gate
+      now is deciding the surface is one worth freezing, which is
+      worth a pass over the API after M2 shapes the write side
 
 ## Non-goals
 
