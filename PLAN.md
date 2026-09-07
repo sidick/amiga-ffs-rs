@@ -42,15 +42,6 @@ plan, which owns everything outside the partition.
       (UID/GID). Owner and the extended bits are first-class, not
       "where present": muFS is in scope (below), and plain FFS carries
       the same fields zeroed.
-- [ ] **muFS**: the MultiUser filesystem is *in scope* — it is not
-      another family but FFS with the owner field and extended
-      permission bits actually used and enforced. Same blocks, same
-      hashing, same chains. Work item: survey the dostype values real
-      muFS volumes carry (`muFS` = 0x6D754653 is documented; confirm
-      whether per-variant `muF\x` forms exist in the wild) and map
-      them onto the same `Variant` axes rather than a parallel enum.
-      Enforcement semantics (who may read what) stay with the
-      consumer — this crate reports ownership, it doesn't police it.
 - [ ] **Hard/soft links**: link chains resolved, loops refused.
 - [ ] **Dircache blocks** (`DOS\4`/`DOS\5`): read them, but treat the
       hash chains as authoritative — caches go stale, and a reader
@@ -105,6 +96,21 @@ Gated on the milestone-1 validator and differential suite.
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
       don't-care fields — dates, allocation order).
+
+## In scope, not scheduled
+
+- **muFS**: the MultiUser filesystem is explicitly in scope for this
+  crate — it is not another family but FFS with the owner field and
+  extended permission bits actually used and enforced; same blocks,
+  same hashing, same chains. Deferred, not excluded: no milestone
+  depends on it, and the metadata work above (owner longword and full
+  protection long read as first-class on *every* variant) means adding
+  it later is dostype acceptance plus a survey, not a rework. That
+  survey — which dostype values real muFS volumes carry (`muFS` =
+  0x6D754653 is documented; whether per-variant `muF\x` forms exist in
+  the wild) — happens when the add-on does. Enforcement semantics stay
+  with the consumer either way: the crate reports ownership, it doesn't
+  police it.
 
 ## Cross-cutting
 
