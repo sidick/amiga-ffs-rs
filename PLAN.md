@@ -21,14 +21,14 @@ plan, which owns everything outside the partition.
 
 ## Milestone 1 — read
 
-- [ ] **Root block**: locate (from geometry / reserved blocks), parse
+- [x] **Root block**: locate (from geometry / reserved blocks), parse
       name, dates, hash table, bitmap pointers. Detect the variant from
       the *partition's* dostype but verify against what the volume
       actually contains — mismatches exist and must be diagnosable.
-- [ ] **Directory traversal**: hash-chain walk for lookup by name
+- [x] **Directory traversal**: hash-chain walk for lookup by name
       (both fold tables), full enumeration for listing. Classic
       entries first.
-- [ ] **Long-filename entries** (`DOS\6`/`DOS\7`): the different
+- [x] **Long-filename entries** (`DOS\6`/`DOS\7`): the different
       header-block name layout. **Regression to assert from day one:
       every name on a long-name volume non-empty** — the exact failure
       now observed in *two* independent readers against the same

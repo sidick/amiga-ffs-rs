@@ -26,17 +26,35 @@
 //!
 //! # Status
 //!
-//! Primitives only so far: DOS-type/variant model, block checksums
-//! (standard and boot-block), BCPL strings, and the two name-hash
-//! functions with their case-folding rules. These are the pieces
-//! everything else stands on, and the pieces where a subtle mistake
-//! (the wrong `toupper` table, a hash off by the length byte) produces
-//! a filesystem that *mostly* works — so they come first, with tests,
-//! before any structure that depends on them.
+//! Primitives — DOS-type/variant model, block checksums (standard and
+//! boot-block), BCPL strings, and the two name-hash functions with their
+//! case-folding rules — plus the first structural layer: [`layout`]
+//! (every on-disk offset, for both the classic and the long-name name
+//! layouts) and [`read`] (boot block, root block, directory traversal).
+//! These are the pieces everything else stands on, and the pieces where
+//! a subtle mistake — the wrong `toupper` table, a hash off by the
+//! length byte, a name read at the classic offset on a `DOS\7` volume —
+//! produces a filesystem that *mostly* works. So they come first, with
+//! tests, before any structure that depends on them.
+//!
+//! Not here yet: file data, link resolution, dircache blocks, bitmaps,
+//! `validate()`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
+
+pub mod layout;
+pub mod read;
+
+pub use layout::{
+    ST_FILE, ST_LINKDIR, ST_LINKFILE, ST_ROOT, ST_SOFTLINK, ST_USERDIR, T_DATA, T_DIRCACHE,
+    T_HEADER, T_LIST,
+};
+pub use read::{
+    canonical_root_lba, names_equal, read_boot_dostype, resolve_variant, verify_root_block,
+    DateStamp, DostypeSource, Entry, EntryKind, Error, RootBlock, Volume, DEFAULT_RESERVED,
+};
 
 /// Anything that can produce fixed-size blocks by LBA.
 ///
@@ -345,6 +363,7 @@ mod tests {
         // Latin-1 letters fold only under intl.
         assert_eq!(classic_toupper(0xE9), 0xE9); // é stays é
         assert_eq!(intl_toupper(0xE9), 0xC9); // é -> É
+
         // ÷ (0xF7) is not a letter and never folds.
         assert_eq!(intl_toupper(0xF7), 0xF7);
         // ÿ (0xFF) has no Latin-1 uppercase; the tables leave it alone.
@@ -369,7 +388,11 @@ mod tests {
             name_hash(b"CAF\xC9", intl_toupper, t)
         );
         // And every hash lands inside the table.
-        for name in [&b"S"[..], b"Startup-Sequence", b"a very long file name indeed"] {
+        for name in [
+            &b"S"[..],
+            b"Startup-Sequence",
+            b"a very long file name indeed",
+        ] {
             assert!(name_hash(name, intl_toupper, t) < t);
         }
     }
