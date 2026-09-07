@@ -470,7 +470,16 @@ them.
   (the walk records and continues by design, and read-only is when
   someone most wants the driver); refuse-or-repair gates only the
   write side. `bitmap_flag == 0` is the cheap early signal that a
-  full walk is warranted before anyone pays for one.
+  full walk is warranted before anyone pays for one. And a mount that
+  came up read-only *because* validation found something must say so
+  distinctly from one the user asked to be read-only: `EROFS` on the
+  first write is technically correct and tells them nothing, while a
+  mount-time log naming the findings — and the repair option that
+  would clear them — turns "the driver refused" into "the driver
+  protected the image". Which is the whole point of `Report` being
+  typed findings rather than a boolean: the adapter can *say what it
+  saw*, and every finding already states its consequence in its
+  `Display`.
 
 - **Resize** (grow/shrink an existing volume in place): gated on the
   M3 allocator and mutation discipline. The filesystem half only — the
