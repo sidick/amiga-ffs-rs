@@ -955,3 +955,239 @@ fn xdftool_accepts_a_volume_this_crate_repaired() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mutation, differentially
+// ---------------------------------------------------------------------------
+
+/// Populate an ADF-sized image with this crate: a small tree for a
+/// mutation test to change.
+fn mutable_adf(scratch: &Scratch, variant: Variant, name: &str) -> PathBuf {
+    let disk = ImageDisk::blank(ADF_BLOCKS);
+    let opts = FormatOptions::new(variant, ADF_BLOCKS, b"Mutated");
+    let mut pop = Populator::new(disk, &opts).expect("populate");
+    let root = pop.root_lba();
+    let meta = Metadata::new();
+    let devs = pop.create_dir(root, b"Devs", &meta).expect("makedir");
+    pop.create_file(devs, b"system-configuration", &meta, &pattern(232))
+        .expect("write");
+    pop.create_file(root, b"Doomed", &meta, &pattern(4000))
+        .expect("write");
+    pop.create_file(root, b"Renameable", &meta, &pattern(1500))
+        .expect("write");
+    let disk = pop.finish().expect("finish");
+    let path = scratch.path(name);
+    disk.save(&path);
+    path
+}
+
+/// The oracle reads what a [`Mutator`] left behind.
+///
+/// This is the claim no amount of reading our own bytes back can make: an
+/// implementation sharing no code with this one mounts a volume whose
+/// hash chains have had entries spliced into and out of them, lists the
+/// tree we think is there, reads every byte of a file we created *and* of
+/// one that was already there when we started, and then writes into the
+/// same volume — allocating from a bitmap we edited in place.
+#[test]
+fn xdftool_reads_a_volume_this_crate_mutated() {
+    let argv = oracle!();
+    let scratch = Scratch::new("mutate");
+
+    for (variant, tag) in [(Variant::Ffs, "dos1"), (Variant::FfsIntl, "dos3")] {
+        let image = mutable_adf(&scratch, variant, &format!("{tag}.adf"));
+        let created = pattern(9000);
+
+        // Every operation this wave implements, against a volume that
+        // already had a tree on it.
+        let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+        let root = vol.root_lba();
+        let mut m = Mutator::open(vol).expect("mutator");
+        let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+        m.create_dir(devs, b"Keymaps", &Metadata::new())
+            .expect("create_dir");
+        let keymaps = m.volume().lookup(devs, b"Keymaps").unwrap().unwrap().lba;
+        m.create_file(keymaps, b"usa1", &Metadata::new(), &created)
+            .expect("create_file");
+        m.rename(root, b"Renameable", devs, b"Renamed")
+            .expect("rename");
+        m.delete(root, b"Doomed").expect("delete");
+        let renamed = m.volume().lookup(devs, b"Renamed").unwrap().unwrap().lba;
+        m.set_metadata(
+            renamed,
+            &MetaUpdate::new().protection(meta::FIBF_WRITE | meta::FIBF_DELETE),
+        )
+        .expect("set_metadata");
+        vol = m.into_volume();
+        assert!(vol.validate().is_clean(), "{variant:?}: our own validator");
+        vol.into_inner().save(&image);
+        let path = image.to_str().unwrap();
+
+        // The oracle's listing agrees with the tree we asked for.
+        let listing = run(&argv, &[path, "list"]);
+        for present in ["Keymaps", "usa1", "Renamed", "system-configuration"] {
+            assert!(
+                listing.contains(present),
+                "{variant:?}: xdftool cannot see {present}:\n{listing}"
+            );
+        }
+        for gone in ["Doomed", "Renameable"] {
+            assert!(
+                !listing.contains(gone),
+                "{variant:?}: xdftool still sees the deleted {gone}:\n{listing}"
+            );
+        }
+
+        // ...and every byte of the file we created, and of one that was
+        // there before we started, comes back through it.
+        for (amiga, want) in [
+            ("Devs/Keymaps/usa1", created.clone()),
+            ("Devs/system-configuration", pattern(232)),
+        ] {
+            let back = scratch.path("back");
+            run(&argv, &[path, "read", amiga, back.to_str().unwrap()]);
+            assert_eq!(std::fs::read(&back).unwrap(), want, "{variant:?}: {amiga}");
+        }
+
+        // The bitmap we edited in place is one the oracle can allocate
+        // from: it writes a file of its own, and the result still
+        // validates here.
+        let host = scratch.path("theirs");
+        std::fs::write(&host, pattern(2000)).unwrap();
+        run(&argv, &[path, "write", host.to_str().unwrap(), "Theirs"]);
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after xdftool wrote into our mutated volume: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+        let theirs = vol.lookup(root, b"Theirs").unwrap().unwrap().lba;
+        assert_eq!(vol.read_file(theirs).unwrap(), pattern(2000));
+    }
+}
+
+/// The same operation sequence, applied through both implementations,
+/// must produce the same *tree*.
+///
+/// Not the same image: the two allocate differently (this crate scans
+/// forward from a hint, xdftool always from the bottom of the bitmap),
+/// and dates are the caller's to supply here and the wall clock's there.
+/// Those are the documented don't-cares. What must agree is everything
+/// the filesystem is *for* — which entries exist, in which directories,
+/// of which kind, of which length, holding which bytes — and, because
+/// both implementations wrote it, how many blocks the volume has left.
+#[test]
+fn the_same_operation_sequence_through_both_implementations_agrees() {
+    let argv = oracle!();
+    let scratch = Scratch::new("both");
+
+    for (variant, tag) in [(Variant::Ffs, "DOS1"), (Variant::FfsIntl, "DOS3")] {
+        let payload = pattern(5000);
+        let host = scratch.path("payload");
+        std::fs::write(&host, &payload).unwrap();
+        let small = scratch.path("small");
+        std::fs::write(&small, b"hello").unwrap();
+
+        // Theirs: format, makedir, two writes, then delete one of them.
+        let theirs = scratch.path(&format!("theirs-{tag}.adf"));
+        run(
+            &argv,
+            &[
+                "-f",
+                theirs.to_str().unwrap(),
+                "format",
+                "Both",
+                tag,
+                "+",
+                "makedir",
+                "Devs",
+                "+",
+                "write",
+                host.to_str().unwrap(),
+                "Devs/Payload",
+                "+",
+                "write",
+                small.to_str().unwrap(),
+                "Doomed",
+                "+",
+                "delete",
+                "Doomed",
+                "+",
+                "write",
+                small.to_str().unwrap(),
+                "Small",
+            ],
+        );
+
+        // Ours: the identical sequence through format() and a Mutator --
+        // deliberately *not* through the Populator, because a populator
+        // cannot delete and the point of the exercise is the delete.
+        let ours = scratch.path(&format!("ours-{tag}.adf"));
+        {
+            let mut disk = ImageDisk::blank(ADF_BLOCKS);
+            let opts = FormatOptions::new(variant, ADF_BLOCKS, b"Both");
+            amiga_ffs::format(&mut disk, &opts).expect("format");
+            let vol = Volume::open(disk, None).expect("open");
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).expect("mutator");
+            let meta = Metadata::new();
+            let devs = m.create_dir(root, b"Devs", &meta).expect("makedir");
+            m.create_file(devs, b"Payload", &meta, &payload)
+                .expect("write");
+            m.create_file(root, b"Doomed", &meta, b"hello")
+                .expect("write");
+            m.delete(root, b"Doomed").expect("delete");
+            m.create_file(root, b"Small", &meta, b"hello")
+                .expect("write");
+            m.into_volume().into_inner().save(&ours);
+        }
+
+        // The trees agree.
+        let mut a = Volume::open(ImageDisk::open(&ours), None).unwrap();
+        let mut b = Volume::open(ImageDisk::open(&theirs), None).unwrap();
+        let (ra, rb) = (a.root_lba(), b.root_lba());
+        assert_eq!(
+            walk(&mut a, ra, ""),
+            walk(&mut b, rb, ""),
+            "{variant:?}: the two trees differ"
+        );
+        for path in ["Devs/Payload", "Small"] {
+            let ea = a.lookup_path(ra, path.as_bytes()).unwrap().unwrap();
+            let eb = b.lookup_path(rb, path.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                a.read_file(ea.lba).unwrap(),
+                b.read_file(eb.lba).unwrap(),
+                "{variant:?}: {path} differs"
+            );
+        }
+
+        // ...and so does the accounting, which is the part a delete that
+        // leaked would get wrong. The *blocks* differ (allocation order
+        // is a don't-care); how many are in use does not.
+        assert!(a.validate().is_clean(), "{variant:?}: ours");
+        assert!(b.validate().is_clean(), "{variant:?}: theirs");
+        assert_eq!(
+            a.read_bitmap().unwrap().allocated_count(),
+            b.read_bitmap().unwrap().allocated_count(),
+            "{variant:?}: the two volumes disagree about how much is in use"
+        );
+
+        // And the oracle can still read what we wrote, after the delete.
+        let back = scratch.path("back");
+        run(
+            &argv,
+            &[
+                ours.to_str().unwrap(),
+                "read",
+                "Devs/Payload",
+                back.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(std::fs::read(&back).unwrap(), payload, "{variant:?}");
+    }
+}

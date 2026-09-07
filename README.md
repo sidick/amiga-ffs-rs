@@ -44,9 +44,26 @@ let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"Workbench");
 let disk = amiga_ffs::populate::populate_from_tree(disk, &opts, Path::new("./tree"))?;
 ```
 
-`Populator` is append-only, over a volume this crate just formatted;
-**mutating** a volume that already has something in it — delete, rename,
-truncate, append — is milestone 3. See `PLAN.md`.
+`Populator` is append-only, over a volume this crate just formatted.
+**Changing a volume that already exists** is milestone 3, and most of it
+is here: `Allocator` hands out blocks from a volume's own bitmap with the
+mark-then-use ordering in the types (an allocation is not a block number
+until its bitmap page is on the disk), `Volume::repair()` rebuilds a
+bitmap the way the ROM's disk-validator does, and `Mutator` creates,
+deletes, renames and re-describes entries — hash chains spliced under both
+fold tables, `T_COMMENT` blocks moving in and out as an LNFS name grows,
+`DOS\4`/`DOS\5` dircaches regenerated from the chains they cache, and a
+write order whose worst crash outcome is a leaked block rather than a
+block with two owners. Writing, appending to and truncating a file's data
+is what remains. See `PLAN.md`.
+
+```rust
+let mut m = Mutator::open(Volume::open(disk, None)?)?;
+let dir = m.create_dir(root, b"Devs", &Metadata::new())?;
+m.create_file(dir, b"system-configuration", &Metadata::new(), &bytes)?;
+m.rename(root, b"Old", dir, b"New")?;
+m.delete(root, b"Doomed")?;
+```
 
 ## Why this exists
 

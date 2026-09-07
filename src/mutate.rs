@@ -1,0 +1,1444 @@
+//! Creating, deleting and renaming entries in a volume that already
+//! exists.
+//!
+//! [`Populator`](crate::Populator) writes into a volume this crate has
+//! just formatted, over an extent it *knows* is free. [`Mutator`] is the
+//! other case, and the one milestone 3 is about: a volume somebody else
+//! wrote — the ROM's FFS, xdftool, a guest that crashed mid-write — opened
+//! read-write, changed in place. Every block it hands out comes from that
+//! volume's own bitmap through [`Allocator`], every block it gives back
+//! goes there too, and the order the writes go down in is the whole of the
+//! crash safety, because the format has no journal.
+//!
+//! # What it will not touch
+//!
+//! A volume whose root says `bitmap_flag == 0` is refused outright
+//! ([`AllocError::BitmapInvalid`], surfaced as [`MutateError::Alloc`]).
+//! Those bits are whatever an interrupted update left behind and an
+//! allocator acting on them hands out blocks a file is using;
+//! [`Volume::repair`](crate::Volume::repair) is the operation that turns
+//! such a volume back into one there is something to allocate from. That
+//! refusal is inherited from the allocator rather than reimplemented here.
+//!
+//! # Write order, per operation
+//!
+//! Three rules, applied everywhere, each stated again at the operation
+//! that uses it:
+//!
+//! 1. **Bitmap first when allocating.** A block is marked, the page
+//!    carrying its bit is flushed, and only then may its number appear in
+//!    anybody's pointer — which [`Allocator::reference`] enforces by
+//!    refusing until the flush has happened. Crash anywhere in that order
+//!    and the block is allocated and unreachable: a leak
+//!    ([`Finding::OrphanBlock`](crate::Finding::OrphanBlock)), which a
+//!    [`repair`](crate::repair) fixes.
+//! 2. **Content before the pointer that reaches it.** Data blocks,
+//!    extension blocks, comment blocks and the header itself are complete
+//!    on the disk before the parent's hash slot names the header. The last
+//!    write of a create is a single longword in the parent, and until it
+//!    lands nothing in the directory has changed.
+//! 3. **Bitmap last when freeing.** The entry is spliced out of its
+//!    parent's chain (and out of its target's link chain, where it is a
+//!    link) and *that* write is on the disk before a single bit is
+//!    cleared. Crash anywhere in that order and the blocks are, again,
+//!    leaked rather than handed to a second owner.
+//!
+//! Every intermediate state is therefore either the old volume, the new
+//! volume, or the old volume plus some leaked blocks. What never happens
+//! is [`Finding::ReachableButFree`](crate::Finding::ReachableButFree) —
+//! and unlike a populate, the bitmap flag stays −1 throughout, because at
+//! no point does the bitmap claim a reachable block is free. The crash
+//! sweep in `tests/volumes.rs` asserts exactly that, at every prefix of
+//! every operation's writes.
+//!
+//! # Dircaches: regenerated, never patched
+//!
+//! On `DOS\4`/`DOS\5` the affected directory's whole cache chain is
+//! **rebuilt from its hash chains** after every create, delete, rename and
+//! metadata change — blocks reused where the new chain is the same length
+//! or shorter, allocated where it grew, freed where it shrank. Surgical
+//! editing of one record would be less I/O and one more place to leave the
+//! cache disagreeing with the chains; regeneration cannot, because the
+//! chains are the input. PLAN's rule for this milestone is "update or
+//! clear, never leave stale", and after every operation here
+//! [`validate`](crate::Volume::validate) reports zero
+//! [`DircacheStale`](crate::Finding::DircacheStale) findings.
+//!
+//! The chain is written **backwards**, last block first, so a cache block
+//! is on the disk before the pointer naming it is — the same rule as
+//! everywhere else. A crash mid-regeneration leaves a cache that is stale,
+//! which is what a cache written by any of the many tools that do not know
+//! about `DOS\4` leaves too, and what `validate` reports and a rebuild
+//! fixes.
+//!
+//! # Dates: yes, the parent is stamped — when there is a clock to stamp
+//! it with
+//!
+//! The question "does creating a file touch its *parent's* DateStamp"
+//! has an answer on real volumes, and it took reading four
+//! implementations to be sure of it:
+//!
+//! - **amitools' `xdftool`** (the oracle this crate's tests run against)
+//!   stamps both, on every create and every delete:
+//!   `ADFSDir._create_node` and `_delete` each end in
+//!   `update_dir_mod_time()` — the parent's longword −23 — followed by
+//!   `volume.update_disk_time()` — the root's longword −10.
+//! - **Linux `affs`** stamps the parent too:
+//!   `affs_insert_hash` and `affs_remove_hash` (`fs/affs/amigaffs.c`)
+//!   both end with `inode_set_mtime_to_ts(dir, …); mark_inode_dirty(dir)`,
+//!   which `affs_write_inode` writes to `tail->change` (−23) or, for the
+//!   root, `root_change` (also −23). It does *not* stamp the root's −10
+//!   per operation: that happens in `affs_commit_super`, on sync and
+//!   unmount.
+//! - **ADFlib** stamps the parent in `adfCreateEntry` only when the new
+//!   entry becomes a hash slot's head (the collision path forgets), and
+//!   `adfRemoveEntry` never stamps at all — an inconsistency, not a
+//!   convention.
+//! - **AROS's `afs.handler`** does not stamp on create or delete, and
+//!   stamps *every ancestor up to the root* on a write.
+//!
+//! So the rule implemented here is amitools': **the parent directory's
+//! own DateStamp and the root's `disk_altered` (−10), on every create,
+//! delete and rename**; the format date (−7) is left alone forever. When
+//! the parent *is* the root, its DateStamp is the root's `dir_altered`,
+//! which is the same longword −23 an entry uses.
+//!
+//! [`Mutator::set_metadata`] stamps neither, on the same authority: what
+//! changed is the entry, not the directory's contents, and `xdftool
+//! protect` writes the entry's block and nothing else. The entry's own
+//! date is the caller's, through [`MetaUpdate::date`].
+//!
+//! The catch is that this crate is `no_std` and has no clock, so it
+//! cannot invent a "now". [`Mutator::clock`] supplies one, and **until it
+//! is set no date is written at all** — a deliberate refusal to put a
+//! wrong date on the disk rather than a decision not to keep dates. Under
+//! `std`, `populate::datestamp_from_system_time(SystemTime::now())` is
+//! the one line that supplies it.
+//!
+//! [`AllocError::BitmapInvalid`]: crate::AllocError::BitmapInvalid
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
+
+use crate::allocator::{AllocError, Allocation, Allocator};
+use crate::build::{
+    build_comment_block, build_data_block, build_dircache_block, dircache_record, finish_checksum,
+    needs_comment_block, write_date, write_entry_header, write_name_and_comment, CacheFacts,
+    EntryFields,
+};
+use crate::format::{check_name_bytes, div_ceil, wr32, wr_date, NameProblem};
+use crate::layout::*;
+use crate::populate::Metadata;
+use crate::read::{DateStamp, Entry, EntryKind, Volume};
+use crate::{be32, checksum_ok, hash_table_size, name_hash};
+use crate::{BlockMedium, Transport, MAX_NAME_CLASSIC, MAX_NAME_LONG};
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Everything a [`Mutator`] refuses, and why.
+///
+/// Generic over the medium's error for the same reason every other error
+/// type in this crate is: "why did the block access fail" is a question
+/// only the transport can answer, and flattening it throws the answer
+/// away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutateError<E> {
+    /// A write to the medium failed.
+    Io(E),
+    /// The read side refused something, kept whole — a bad checksum, a
+    /// pointer out of range, a chain that revisits a block, a file whose
+    /// length and extent disagree.
+    Read(crate::read::Error<E>),
+    /// The allocator refused: an invalid bitmap, a full volume, a double
+    /// free, a block used as a pointer target before its bitmap page was
+    /// on the disk.
+    Alloc(AllocError<E>),
+    /// An empty name.
+    NameEmpty,
+    /// A name longer than the variant can store: 30 bytes on
+    /// `DOS\0`–`DOS\5`, 107 on `DOS\6`/`DOS\7`.
+    NameTooLong {
+        /// The length offered.
+        len: usize,
+        /// The variant's maximum.
+        max: usize,
+    },
+    /// A byte AmigaDOS cannot have in a name.
+    NameInvalidByte {
+        /// The offending byte.
+        byte: u8,
+        /// Where it was.
+        index: usize,
+    },
+    /// A comment longer than [`COMMENT_MAX`].
+    CommentTooLong {
+        /// The length offered.
+        len: usize,
+        /// The maximum, [`COMMENT_MAX`].
+        max: usize,
+    },
+    /// The block offered as a directory is not one.
+    NotADirectory {
+        /// The block.
+        lba: u64,
+        /// Its secondary type.
+        found: i32,
+    },
+    /// No entry of that name in that directory.
+    NotFound {
+        /// The directory searched.
+        parent: u64,
+        /// The name, raw Latin-1.
+        name: Vec<u8>,
+    },
+    /// The target directory already holds this name, under the volume's
+    /// own fold table — so `Foo` and `FOO` collide everywhere, and `café`
+    /// and `CAFÉ` collide on the international variants.
+    DuplicateName {
+        /// The directory.
+        parent: u64,
+        /// The name, raw Latin-1.
+        name: Vec<u8>,
+    },
+    /// A directory with entries in it. Deleting one would leak its whole
+    /// subtree, which is a recoverable state and still not one to produce
+    /// on purpose.
+    DirectoryNotEmpty {
+        /// The directory.
+        lba: u64,
+    },
+    /// The entry being deleted is the target of at least one hard link.
+    /// See [`Mutator::delete`] for why this is a refusal.
+    LinkedTo {
+        /// The entry.
+        lba: u64,
+        /// The first link naming it, from longword −10.
+        link: u32,
+    },
+    /// A directory renamed into itself or into its own subtree, which
+    /// would detach the subtree from the root and make a cycle out of it.
+    IntoOwnSubtree {
+        /// The directory being moved.
+        entry: u64,
+        /// The proposed new parent.
+        parent: u64,
+    },
+    /// An operation aimed at the volume root, which is not a directory
+    /// entry: it has no name field at the entry offset, no protection, no
+    /// comment, and nothing to unlink it from.
+    IsRoot {
+        /// The root block.
+        lba: u64,
+    },
+    /// The entry is not in the hash chain its own name hashes to, so
+    /// there is no pointer to splice it out of. The state
+    /// [`Finding::WrongChainSlot`](crate::Finding::WrongChainSlot)
+    /// reports; putting it right is [`repair`](crate::repair)'s job, not
+    /// something to guess at while holding a delete half-done.
+    NotInChain {
+        /// The directory.
+        dir: u64,
+        /// The entry that should have been in it.
+        lba: u64,
+    },
+    /// A hard link that is not in its target's link chain — the same
+    /// shape as [`MutateError::NotInChain`], one chain over.
+    NotInLinkChain {
+        /// The link.
+        lba: u64,
+        /// The object it names.
+        target: u64,
+    },
+}
+
+impl<E: fmt::Display> fmt::Display for MutateError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "block write failed: {e}"),
+            Self::Read(e) => write!(f, "{e}"),
+            Self::Alloc(e) => write!(f, "{e}"),
+            Self::NameEmpty => f.write_str("an entry name is required"),
+            Self::NameTooLong { len, max } => {
+                write!(f, "name of {len} bytes exceeds this variant's {max}")
+            }
+            Self::NameInvalidByte { byte, index } => write!(
+                f,
+                "byte {byte:#04x} at index {index} cannot appear in a name"
+            ),
+            Self::CommentTooLong { len, max } => {
+                write!(f, "comment of {len} bytes exceeds {max}")
+            }
+            Self::NotADirectory { lba, found } => {
+                write!(f, "block {lba} (secondary type {found}) is not a directory")
+            }
+            Self::NotFound { parent, name } => write!(
+                f,
+                "directory {parent} holds no entry named {:?}",
+                Latin1(name)
+            ),
+            Self::DuplicateName { parent, name } => write!(
+                f,
+                "directory {parent} already holds a name folding to {:?}",
+                Latin1(name)
+            ),
+            Self::DirectoryNotEmpty { lba } => {
+                write!(f, "directory {lba} is not empty")
+            }
+            Self::LinkedTo { lba, link } => write!(
+                f,
+                "block {lba} is the target of hard link {link}; deleting it would leave the \
+                 link pointing at nothing"
+            ),
+            Self::IntoOwnSubtree { entry, parent } => write!(
+                f,
+                "directory {entry} cannot be moved into block {parent}, which is inside it"
+            ),
+            Self::IsRoot { lba } => {
+                write!(f, "block {lba} is the volume root, not a directory entry")
+            }
+            Self::NotInChain { dir, lba } => write!(
+                f,
+                "block {lba} is not in the hash chain of directory {dir} its name hashes to"
+            ),
+            Self::NotInLinkChain { lba, target } => write!(
+                f,
+                "hard link {lba} is not in the link chain of the object {target} it names"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for MutateError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Read(e) => Some(e),
+            Self::Alloc(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl<E> From<crate::read::Error<E>> for MutateError<E> {
+    fn from(e: crate::read::Error<E>) -> Self {
+        Self::Read(e)
+    }
+}
+
+impl<E> From<AllocError<E>> for MutateError<E> {
+    fn from(e: AllocError<E>) -> Self {
+        match e {
+            AllocError::Read(e) => Self::Read(e),
+            other => Self::Alloc(other),
+        }
+    }
+}
+
+/// Latin-1 bytes rendered for a message, with anything unprintable
+/// escaped. Names are not UTF-8 and pretending otherwise in an error
+/// message is how a diagnostic becomes a second bug.
+struct Latin1<'a>(&'a [u8]);
+
+impl fmt::Debug for Latin1<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"")?;
+        for &b in self.0 {
+            match b {
+                0x20..=0x7E => write!(f, "{}", b as char)?,
+                _ => write!(f, "\\x{b:02x}")?,
+            }
+        }
+        f.write_str("\"")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata updates
+// ---------------------------------------------------------------------------
+
+/// Which of an entry's four metadata fields to change.
+///
+/// Every field is optional and `None` means "leave it alone", which is the
+/// difference between this and [`Metadata`]: the latter describes an entry
+/// being created, where every field has a value whether the caller thought
+/// about it or not, and this describes a change to one that exists, where
+/// "the caller did not mention the comment" and "the caller wants no
+/// comment" are different instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetaUpdate<'a> {
+    /// The full 32-bit protection longword, group and other bits
+    /// included.
+    pub protection: Option<u32>,
+    /// The comment, raw Latin-1, at most [`COMMENT_MAX`] bytes. An empty
+    /// slice removes the comment — and, on LNFS, frees the overflow block
+    /// that was holding it.
+    pub comment: Option<&'a [u8]>,
+    /// The entry's DateStamp.
+    pub date: Option<DateStamp>,
+    /// The raw owner longword: UID in the high word, GID in the low.
+    pub owner: Option<u32>,
+}
+
+impl<'a> MetaUpdate<'a> {
+    /// Change nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the protection longword.
+    pub fn protection(mut self, protection: u32) -> Self {
+        self.protection = Some(protection);
+        self
+    }
+
+    /// Set the comment; an empty slice removes it.
+    pub fn comment(mut self, comment: &'a [u8]) -> Self {
+        self.comment = Some(comment);
+        self
+    }
+
+    /// Set the DateStamp.
+    pub fn date(mut self, date: DateStamp) -> Self {
+        self.date = Some(date);
+        self
+    }
+
+    /// Set the owner longword.
+    pub fn owner(mut self, owner: u32) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The mutator
+// ---------------------------------------------------------------------------
+
+/// A volume open for change: the [`Volume`] and an [`Allocator`] over its
+/// bitmap.
+///
+/// The pair is the whole type. Holding the allocator across operations is
+/// the only reason this is a session rather than a set of methods on
+/// [`Volume`]: reading a 2 GB volume's bitmap costs a hundred block reads
+/// and doing it once per created file would dominate everything else.
+/// Nothing else is cached — every operation re-reads the blocks it is
+/// about to change, because the volume is the truth and a second copy of
+/// it here would be a second thing to keep in step.
+///
+/// **Every public operation leaves the volume consistent**, bitmap
+/// flushed and (on `DOS\6`/`DOS\7`) `NumBlocksUsed` stamped, so there is
+/// no `finish()` to forget: [`Mutator::into_volume`] simply hands the
+/// volume back. That is the opposite of [`Populator`](crate::Populator),
+/// which deliberately marks the volume mid-update for its whole session —
+/// and it is affordable here precisely because this module never lets the
+/// bitmap say "free" about a block something reaches.
+pub struct Mutator<S: BlockMedium> {
+    vol: Volume<S>,
+    alloc: Allocator<Transport<S>>,
+    clock: Option<DateStamp>,
+}
+
+impl<S: BlockMedium> Mutator<S> {
+    /// Open a volume for mutation, reading its bitmap.
+    ///
+    /// Refuses a volume whose `bitmap_flag` is 0 — see this module's
+    /// documentation, and [`Allocator::load`], which is where the refusal
+    /// actually lives.
+    pub fn open(mut vol: Volume<S>) -> Result<Self, MutateError<Transport<S>>> {
+        let alloc = Allocator::load(&mut vol)?;
+        Ok(Self {
+            vol,
+            alloc,
+            clock: None,
+        })
+    }
+
+    /// Set the session's notion of "now".
+    ///
+    /// With one set, every operation stamps the affected directory's
+    /// DateStamp and the root's `disk_altered`/`dir_altered`, the way a
+    /// real filesystem does. Without one — the default — those dates are
+    /// left untouched, because a `no_std` crate has no clock and a made-up
+    /// date on disk is worse than an old true one.
+    pub fn clock(mut self, now: DateStamp) -> Self {
+        self.clock = Some(now);
+        self
+    }
+
+    /// The volume, for reading: lookups, listings, file contents.
+    pub fn volume(&mut self) -> &mut Volume<S> {
+        &mut self.vol
+    }
+
+    /// The allocator, for its accounting.
+    pub fn allocator(&self) -> &Allocator<Transport<S>> {
+        &self.alloc
+    }
+
+    /// Hand the volume back.
+    ///
+    /// No flush is needed and none is done: every operation already
+    /// finished by flushing the bitmap pages it dirtied.
+    pub fn into_volume(self) -> Volume<S> {
+        self.vol
+    }
+
+    /// The longest name this volume's variant can store.
+    pub fn max_name_len(&self) -> usize {
+        if self.vol.variant().has_long_names() {
+            MAX_NAME_LONG
+        } else {
+            MAX_NAME_CLASSIC
+        }
+    }
+
+    // -- creating ----------------------------------------------------------
+
+    /// Create a directory in `parent`.
+    ///
+    /// Write order: the new directory's own (empty) `T_DIRCACHE` block
+    /// where the variant has them — allocated, its bitmap page flushed,
+    /// and written before the header that names it — then the header
+    /// block complete with its hash chain pointing at the slot's old head,
+    /// then the one longword in `parent` that puts it in the directory.
+    /// Everything before that last write is unreachable, so an
+    /// interruption leaks and nothing more. The parent's dircache is
+    /// regenerated afterwards, because a cache record naming an entry that
+    /// is not in the chains is worse than one missing an entry that is.
+    pub fn create_dir(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let prep = self.prepare(parent, name, meta)?;
+        let bs = self.bs();
+        let mut hdr = vec![0u8; bs];
+
+        // A directory on DOS\4/DOS\5 has a cache block from birth: an
+        // empty cache is not a null pointer, and the oracle's directories
+        // have one too.
+        if self.vol.variant().has_dircache() {
+            let dc = self.alloc.allocate_near(prep.lba)?;
+            self.flush()?;
+            let dc = self.alloc.reference(&dc)?;
+            let mut buf = vec![0u8; bs];
+            build_dircache_block(&mut buf, dc, prep.lba, &[], 0, 0);
+            self.write(dc, &buf)?;
+            wr32(&mut hdr, tail(bs, TL_EXTENSION), dc as u32);
+        }
+
+        self.emit(&prep, EntryKind::Directory, 0, &mut hdr)
+    }
+
+    /// Create a file in `parent` from bytes already in memory.
+    ///
+    /// Write order: every block the file needs — header, data blocks,
+    /// `T_LIST` extension blocks, an LNFS overflow comment block — is
+    /// allocated *first* and the bitmap flushed once, so every pointer
+    /// written afterwards names a block the disk already agrees is taken
+    /// ([`Allocator::reference`] refuses otherwise). Then the data blocks,
+    /// then the extension blocks that point at them, then the header that
+    /// points at those, then the parent's hash slot. Each write only ever
+    /// names blocks already on the disk.
+    ///
+    /// The whole file is held by the caller rather than streamed: append
+    /// and truncate — and with them the streaming writer that shares their
+    /// machinery — are wave 3 of this milestone.
+    /// [`Populator::create_file_with`](crate::Populator::create_file_with)
+    /// is the streaming form for a volume being built from nothing.
+    pub fn create_file(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+        data: &[u8],
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let prep = self.prepare(parent, name, meta)?;
+        let bs = self.bs();
+        let ffs = self.vol.variant().is_ffs();
+        let payload = data_payload_size(bs, ffs);
+        let slots = hash_table_size(bs) as usize;
+        let n_data = div_ceil(data.len() as u64, payload as u64) as usize;
+        // The header's own table holds the first `slots` pointers; every
+        // extension block another `slots`.
+        let n_ext = n_data.saturating_sub(slots);
+        let n_ext = n_ext / slots + usize::from(n_ext % slots != 0);
+
+        // Everything up front, then one flush: after this point every
+        // block number below is durable, so `reference` never refuses and
+        // no pointer can name a block the bitmap still calls free.
+        let mut data_at: Vec<Allocation> = Vec::with_capacity(n_data);
+        let mut ext_at: Vec<Allocation> = Vec::with_capacity(n_ext);
+        let mut hint = prep.lba;
+        for i in 0..n_data {
+            if i >= slots && (i - slots) % slots == 0 {
+                let a = self.alloc.allocate_near(hint)?;
+                hint = a.block();
+                ext_at.push(a);
+            }
+            let a = self.alloc.allocate_near(hint)?;
+            hint = a.block();
+            data_at.push(a);
+        }
+        self.flush()?;
+
+        let mut data_lba = Vec::with_capacity(n_data);
+        for a in &data_at {
+            data_lba.push(self.alloc.reference(a)?);
+        }
+        let mut ext_lba = Vec::with_capacity(n_ext);
+        for a in &ext_at {
+            ext_lba.push(self.alloc.reference(a)?);
+        }
+
+        let mut buf = vec![0u8; bs];
+        for (i, &lba) in data_lba.iter().enumerate() {
+            let from = i * payload;
+            let to = (from + payload).min(data.len());
+            let next = data_lba.get(i + 1).copied().unwrap_or(0) as u32;
+            build_data_block(&mut buf, prep.lba, i as u32 + 1, &data[from..to], next, ffs);
+            self.write(lba, &buf)?;
+        }
+
+        let mut hdr = vec![0u8; bs];
+        for (k, &lba) in ext_lba.iter().enumerate() {
+            let first = slots + k * slots;
+            let count = (n_data - first).min(slots);
+            let mut eb = vec![0u8; bs];
+            wr32(&mut eb, OFF_TYPE, T_LIST);
+            wr32(&mut eb, OFF_OWN_KEY, lba as u32);
+            wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
+            wr32(&mut eb, tail(bs, TL_PARENT), prep.lba as u32);
+            wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
+            wr32(
+                &mut eb,
+                tail(bs, TL_EXTENSION),
+                ext_lba.get(k + 1).copied().unwrap_or(0) as u32,
+            );
+            for i in 0..count {
+                let off = data_pointer_offset(bs, i as u32 + 1);
+                wr32(&mut eb, off, data_lba[first + i] as u32);
+            }
+            finish_checksum(&mut eb);
+            self.write(lba, &eb)?;
+        }
+
+        let in_header = n_data.min(slots);
+        wr32(&mut hdr, OFF_HIGH_SEQ, in_header as u32);
+        wr32(
+            &mut hdr,
+            OFF_FIRST_DATA,
+            data_lba.first().copied().unwrap_or(0) as u32,
+        );
+        for (i, &lba) in data_lba.iter().take(in_header).enumerate() {
+            wr32(&mut hdr, data_pointer_offset(bs, i as u32 + 1), lba as u32);
+        }
+        wr32(
+            &mut hdr,
+            tail(bs, TL_EXTENSION),
+            ext_lba.first().copied().unwrap_or(0) as u32,
+        );
+
+        self.emit(&prep, EntryKind::File, data.len() as u32, &mut hdr)
+    }
+
+    // -- deleting ----------------------------------------------------------
+
+    /// Delete `name` from `parent`, and return how many blocks came back.
+    ///
+    /// Write order, and the reason for it: the entry is spliced out of the
+    /// **metadata** first — out of its target's link chain if it is a hard
+    /// link, then out of its parent's hash chain, then the parent's
+    /// dircache is regenerated — and only after all of that is a single
+    /// bit cleared in the bitmap. A crash before the unlink changes
+    /// nothing; a crash after it leaks the blocks, which
+    /// [`repair`](crate::repair) reclaims. The other order would leave the
+    /// bitmap calling a block free while a live directory still pointed at
+    /// it, and the *next* allocation would then give one file's block to
+    /// another.
+    ///
+    /// # What it refuses
+    ///
+    /// - A **directory with anything in it**
+    ///   ([`MutateError::DirectoryNotEmpty`]): AmigaDOS refuses this too,
+    ///   and deleting it here would leak the entire subtree.
+    /// - An entry that is the **target of a hard link**
+    ///   ([`MutateError::LinkedTo`]) — the interesting one, and the one
+    ///   worth stating the evidence for, because the two implementations
+    ///   that handle it at all *do not agree on what the volume looks
+    ///   like afterwards*:
+    ///
+    ///   - **AmigaOS** promotes. Its own documentation is explicit: "if
+    ///     the object a hard link points to is deleted, then the first
+    ///     hard link in the chain is altered so that it becomes the new
+    ///     file header block. The original file header block is then
+    ///     freed." The object's header block therefore *changes number*,
+    ///     which invalidates every cached block pointer to it — including
+    ///     the `parent` longword in every child of a promoted directory.
+    ///   - **Linux `affs`** does the opposite, and says why in a comment:
+    ///     "we can't remove the head of the link, as its blocknr is still
+    ///     used as ino, so we remove the block of the first link
+    ///     instead" (`affs_remove_link`, `fs/affs/amigaffs.c`). It keeps
+    ///     the original block, `memcpy`s the *link's* 32-byte name into
+    ///     it, `affs_insert_hash`es it into the **link's** directory, and
+    ///     frees the link's block. The file survives — under a different
+    ///     name, in a different directory from the one it was deleted
+    ///     from.
+    ///   - **ADFlib** refuses links outright (`adfRemoveEntry`:
+    ///     "secType %d not supported"), **amitools** has no hard-link
+    ///     code at all, and **AROS's `afs.handler`** defines
+    ///     `BLK_ORIGINAL`/`BLK_LINKCHAIN` and never reads them, so its
+    ///     `deleteObject` leaves the links dangling.
+    ///
+    ///   Two shipping behaviours that produce different volumes, three
+    ///   implementations that do neither, and either of the two requires
+    ///   several blocks rewritten with no ordering that makes an
+    ///   interruption harmless — a crash halfway through a promotion
+    ///   leaves either two blocks claiming one data chain or a directory
+    ///   whose children's `parent` longwords name a freed block. So this
+    ///   wave refuses, in the type, and leaves the choice where it can
+    ///   still be made: deleting the *links* first and then the target
+    ///   works today and is exactly what the refusal points a caller at.
+    ///   Dangling links, which are what a silent success would produce,
+    ///   are the one outcome ruled out.
+    /// - A **file whose chain does not read** — the error comes back from
+    ///   [`Volume::file_chain`](crate::Volume::file_chain) as
+    ///   [`MutateError::Read`]. Freeing a set of blocks this code could
+    ///   not enumerate with confidence is the one unrecoverable mistake
+    ///   available here, so a damaged file is repair's to sort out, not a
+    ///   delete's to guess at.
+    pub fn delete(&mut self, parent: u64, name: &[u8]) -> Result<u64, MutateError<Transport<S>>> {
+        let entry = self.expect_entry(parent, name)?;
+        let free = self.blocks_of(&entry)?;
+
+        // A link is spliced out of its target's chain while it is still
+        // reachable from the directory: the other order would leave the
+        // target naming a block that is about to be freed.
+        if matches!(entry.kind, EntryKind::LinkFile | EntryKind::LinkDir) {
+            self.unlink_from_link_chain(&entry)?;
+        } else if entry.next_link != 0 {
+            return Err(MutateError::LinkedTo {
+                lba: entry.lba,
+                link: entry.next_link,
+            });
+        }
+
+        self.unlink(parent, &entry)?;
+        self.refresh_dircache(parent)?;
+        self.touch(parent)?;
+
+        for lba in &free {
+            self.alloc.free(*lba)?;
+        }
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(free.len() as u64)
+    }
+
+    // -- renaming ----------------------------------------------------------
+
+    /// Move and/or rename an entry, within one directory or between two on
+    /// the same volume.
+    ///
+    /// Write order: unlink from the old chain, rewrite the header (new
+    /// name, new parent, new chain pointer), link into the new chain,
+    /// regenerate both dircaches, then flush the bitmap if a comment block
+    /// was allocated or freed. The entry is unreachable in the middle of
+    /// that, which is the point: linking it into the new chain first would
+    /// put one block in two chains with one `hash_chain` longword to serve
+    /// both, and a crash there would leave a directory that enumerates a
+    /// file twice.
+    ///
+    /// Renaming to the **same name in different case** works and is the
+    /// operation FFS is unusual for supporting: the name hashes to the
+    /// same slot under the volume's fold table, the duplicate check sees
+    /// the entry is itself rather than a collision, and the stored bytes
+    /// change while lookups keep matching. The new head of the target slot
+    /// is deliberately read *after* the unlink, since for a same-slot
+    /// rename the unlink is what changed it.
+    ///
+    /// On LNFS a rename can move the comment: the name and comment share
+    /// one 112-byte field, so a longer name pushes the comment out into a
+    /// [`T_COMMENT`] block (allocated, flushed and written before the
+    /// header points at it) and a shorter one pulls it back inline (the
+    /// block freed *after* the header stopped pointing at it).
+    ///
+    /// # What it refuses
+    ///
+    /// A name already in the target directory, the root, and a directory
+    /// moved into its own subtree — the last checked by walking `parent`
+    /// pointers upward from the proposed new parent with a cycle guard,
+    /// because the volume may already contain the loop this is trying not
+    /// to create.
+    pub fn rename(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+    ) -> Result<(), MutateError<Transport<S>>> {
+        let entry = self.expect_entry(parent, name)?;
+        self.check_name(new_name)?;
+        self.expect_directory(new_parent)?;
+        if let Some(clash) = self.vol.lookup(new_parent, new_name)? {
+            if clash.lba != entry.lba {
+                return Err(MutateError::DuplicateName {
+                    parent: new_parent,
+                    name: new_name.to_vec(),
+                });
+            }
+        }
+        if entry.kind.is_directory() {
+            self.refuse_own_subtree(&entry, new_parent)?;
+        }
+
+        let bs = self.bs();
+        let variant = self.vol.variant();
+        let comment = self.vol.comment(&entry)?;
+
+        // Where the comment has to live under the *new* name.
+        let want_block = needs_comment_block(variant, new_name.len(), comment.len());
+        let mut drop_block = 0u32;
+        let mut comment_block = entry.comment_block;
+        if want_block && entry.comment_block == 0 {
+            let a = self.alloc.allocate_near(entry.lba)?;
+            self.flush()?;
+            let cb = self.alloc.reference(&a)?;
+            let mut buf = vec![0u8; bs];
+            build_comment_block(&mut buf, cb, entry.lba, &comment);
+            self.write(cb, &buf)?;
+            comment_block = cb as u32;
+        } else if !want_block && entry.comment_block != 0 {
+            drop_block = entry.comment_block;
+            comment_block = 0;
+        }
+
+        self.unlink(parent, &entry)?;
+
+        // After the unlink, because for a rename within one slot the
+        // unlink is exactly what changed this slot's head.
+        let slot = self.slot_of(new_name);
+        let head = self.vol.hash_table(new_parent)?[slot];
+
+        let mut hdr = self.get(entry.lba)?;
+        write_name_and_comment(&mut hdr, variant, new_name, &comment, comment_block);
+        wr32(&mut hdr, tail(bs, TL_HASH_CHAIN), head);
+        wr32(&mut hdr, tail(bs, TL_PARENT), new_parent as u32);
+        self.put(entry.lba, &mut hdr)?;
+
+        let mut dir = self.get(new_parent)?;
+        wr32(&mut dir, OFF_HASH_TABLE + slot * 4, entry.lba as u32);
+        self.put(new_parent, &mut dir)?;
+
+        self.refresh_dircache(parent)?;
+        if new_parent != parent {
+            self.refresh_dircache(new_parent)?;
+        }
+        self.touch(parent)?;
+        if new_parent != parent {
+            self.touch(new_parent)?;
+        }
+
+        if drop_block != 0 {
+            self.alloc.free(drop_block as u64)?;
+        }
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(())
+    }
+
+    // -- metadata ----------------------------------------------------------
+
+    /// Change an entry's protection, comment, date or owner in place.
+    ///
+    /// One header write for all four fields, checksum recomputed — the
+    /// block is rewritten whole, so there is no intermediate state in
+    /// which some fields have changed and others have not.
+    ///
+    /// The comment is the only field that can cost a block. On the classic
+    /// layout it has a field of its own and never does. On LNFS it shares
+    /// the name's 112 bytes, so setting a long comment on an entry with a
+    /// long name allocates a [`T_COMMENT`] block (bitmap flushed, block
+    /// written, *then* the header points at it) and clearing it frees the
+    /// block (header rewritten first, bit cleared after) — the same
+    /// mark-then-use and unlink-then-free ordering as everything else
+    /// here.
+    ///
+    /// The parent's dircache is regenerated afterwards, since a record
+    /// caches protection, owner, date, size and comment as well as the
+    /// name.
+    pub fn set_metadata(
+        &mut self,
+        lba: u64,
+        update: &MetaUpdate<'_>,
+    ) -> Result<(), MutateError<Transport<S>>> {
+        if lba == self.vol.root_lba() {
+            return Err(MutateError::IsRoot { lba });
+        }
+        let entry = self.vol.entry_at(lba)?;
+        let bs = self.bs();
+        let variant = self.vol.variant();
+
+        let existing = self.vol.comment(&entry)?;
+        let comment: &[u8] = match update.comment {
+            Some(c) => c,
+            None => &existing,
+        };
+        if comment.len() > COMMENT_MAX {
+            return Err(MutateError::CommentTooLong {
+                len: comment.len(),
+                max: COMMENT_MAX,
+            });
+        }
+
+        let want_block = needs_comment_block(variant, entry.name.len(), comment.len());
+        let mut comment_block = entry.comment_block;
+        let mut drop_block = 0u32;
+        if want_block {
+            // An existing overflow block is reused: it already names this
+            // header, and rewriting its text in place is one write either
+            // way.
+            let cb = if entry.comment_block != 0 {
+                entry.comment_block as u64
+            } else {
+                let a = self.alloc.allocate_near(lba)?;
+                self.flush()?;
+                self.alloc.reference(&a)?
+            };
+            let mut buf = vec![0u8; bs];
+            build_comment_block(&mut buf, cb, lba, comment);
+            self.write(cb, &buf)?;
+            comment_block = cb as u32;
+        } else if entry.comment_block != 0 {
+            drop_block = entry.comment_block;
+            comment_block = 0;
+        }
+
+        let mut hdr = self.get(lba)?;
+        if let Some(p) = update.protection {
+            wr32(&mut hdr, tail(bs, TL_PROTECTION), p);
+        }
+        if let Some(o) = update.owner {
+            wr32(&mut hdr, tail(bs, TL_OWNER), o);
+        }
+        if let Some(d) = update.date {
+            write_date(&mut hdr, variant, d);
+        }
+        write_name_and_comment(&mut hdr, variant, &entry.name, comment, comment_block);
+        self.put(lba, &mut hdr)?;
+
+        if drop_block != 0 {
+            self.alloc.free(drop_block as u64)?;
+        }
+        self.refresh_dircache(entry.parent as u64)?;
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(())
+    }
+
+    // -- shared machinery --------------------------------------------------
+
+    fn bs(&self) -> usize {
+        self.vol.block_size()
+    }
+
+    /// The hash slot a name lands in on this volume, under its own fold
+    /// table.
+    fn slot_of(&self, name: &[u8]) -> usize {
+        let fold = self.vol.variant().fold();
+        name_hash(name, fold, hash_table_size(self.bs())) as usize
+    }
+
+    fn check_name(&self, name: &[u8]) -> Result<(), MutateError<Transport<S>>> {
+        check_name_bytes(name, self.max_name_len()).map_err(|p| match p {
+            NameProblem::Empty => MutateError::NameEmpty,
+            NameProblem::TooLong { len, max } => MutateError::NameTooLong { len, max },
+            NameProblem::InvalidByte { byte, index } => {
+                MutateError::NameInvalidByte { byte, index }
+            }
+        })
+    }
+
+    fn expect_directory(&mut self, lba: u64) -> Result<(), MutateError<Transport<S>>> {
+        if lba == self.vol.root_lba() {
+            return Ok(());
+        }
+        let entry = self.vol.entry_at(lba)?;
+        if !entry.kind.is_directory() {
+            return Err(MutateError::NotADirectory {
+                lba,
+                found: entry.kind.secondary_type(),
+            });
+        }
+        Ok(())
+    }
+
+    fn expect_entry(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+    ) -> Result<Entry, MutateError<Transport<S>>> {
+        self.expect_directory(parent)?;
+        match self.vol.lookup(parent, name)? {
+            Some(e) => Ok(e),
+            None => Err(MutateError::NotFound {
+                parent,
+                name: name.to_vec(),
+            }),
+        }
+    }
+
+    /// Everything a create must settle before a block is allocated: the
+    /// name and comment are legal, the parent is a directory, the name is
+    /// not already there — and then the header block and, where the LNFS
+    /// merged field cannot hold both, the comment block.
+    fn prepare<'a>(
+        &mut self,
+        parent: u64,
+        name: &'a [u8],
+        meta: &'a Metadata<'a>,
+    ) -> Result<Prepared<'a>, MutateError<Transport<S>>> {
+        self.check_name(name)?;
+        if meta.comment.len() > COMMENT_MAX {
+            return Err(MutateError::CommentTooLong {
+                len: meta.comment.len(),
+                max: COMMENT_MAX,
+            });
+        }
+        self.expect_directory(parent)?;
+        if self.vol.lookup(parent, name)?.is_some() {
+            return Err(MutateError::DuplicateName {
+                parent,
+                name: name.to_vec(),
+            });
+        }
+
+        let a = self.alloc.allocate_near(parent)?;
+        self.flush()?;
+        let lba = self.alloc.reference(&a)?;
+
+        let comment_block =
+            if needs_comment_block(self.vol.variant(), name.len(), meta.comment.len()) {
+                let cb = self.alloc.allocate_near(lba)?;
+                self.flush()?;
+                let cb = self.alloc.reference(&cb)?;
+                let mut buf = vec![0u8; self.bs()];
+                build_comment_block(&mut buf, cb, lba, meta.comment);
+                self.write(cb, &buf)?;
+                cb as u32
+            } else {
+                0
+            };
+
+        Ok(Prepared {
+            lba,
+            parent,
+            comment_block,
+            name,
+            meta,
+        })
+    }
+
+    /// Finish a create: write the header, chain it into its parent, then
+    /// bring the advisory records up to date.
+    ///
+    /// The parent's hash slot is the last authoritative write, and the
+    /// only one that changes what the directory contains.
+    fn emit(
+        &mut self,
+        prep: &Prepared<'_>,
+        kind: EntryKind,
+        byte_size: u32,
+        hdr: &mut [u8],
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let (lba, parent) = (prep.lba, prep.parent);
+        let slot = self.slot_of(prep.name);
+        // Head insertion, as the oracle does it: three names hashing to
+        // one slot come back newest-first off a volume xdftool wrote.
+        let head = self.vol.hash_table(parent)?[slot];
+        write_entry_header(
+            hdr,
+            self.vol.variant(),
+            &EntryFields {
+                lba,
+                parent,
+                kind,
+                byte_size,
+                hash_chain: head,
+                name: prep.name,
+                meta: prep.meta,
+                comment_block: prep.comment_block,
+            },
+        );
+        self.write(lba, hdr)?;
+
+        // The one authoritative write: until this longword lands, the
+        // directory has not changed and everything above it is a leak.
+        let mut dir = self.get(parent)?;
+        wr32(&mut dir, OFF_HASH_TABLE + slot * 4, lba as u32);
+        self.put(parent, &mut dir)?;
+
+        self.refresh_dircache(parent)?;
+        self.touch(parent)?;
+        self.stamp_blocks_used()?;
+        Ok(lba)
+    }
+
+    /// Every block an entry owns: its header, its overflow comment, and
+    /// its contents — a file's extension and data blocks, a directory's
+    /// dircache chain.
+    ///
+    /// This is the set [`Mutator::delete`] frees, so it is also where the
+    /// non-empty-directory refusal lives: the check and the enumeration
+    /// are the same walk, and separating them would let them disagree.
+    fn blocks_of(&mut self, entry: &Entry) -> Result<Vec<u64>, MutateError<Transport<S>>> {
+        let mut out = vec![entry.lba];
+        if entry.comment_block != 0 {
+            out.push(entry.comment_block as u64);
+        }
+        match entry.kind {
+            EntryKind::Directory => {
+                if self.vol.hash_table(entry.lba)?.iter().any(|&s| s != 0) {
+                    return Err(MutateError::DirectoryNotEmpty { lba: entry.lba });
+                }
+                out.extend(self.vol.read_dircache(entry.lba)?.blocks);
+            }
+            EntryKind::File => {
+                let chain = self.vol.file_chain(entry.lba)?;
+                out.extend(chain.extensions.iter().map(|&e| e as u64));
+                out.extend(chain.blocks.iter().map(|&b| b as u64));
+            }
+            // A link owns its header and nothing else — the data and the
+            // hash table are the target's — and a soft link owns its
+            // header and the path inside it.
+            EntryKind::LinkFile | EntryKind::LinkDir | EntryKind::SoftLink => {}
+        }
+        Ok(out)
+    }
+
+    /// Splice an entry out of its parent's hash chain: the directory's
+    /// own slot when it is the head, the previous entry's longword −4
+    /// otherwise.
+    ///
+    /// The successor is re-read from the entry's block rather than taken
+    /// from the caller's [`Entry`], so an entry that has been re-chained
+    /// since it was looked up cannot be spliced with a stale pointer.
+    fn unlink(&mut self, dir: u64, entry: &Entry) -> Result<(), MutateError<Transport<S>>> {
+        let bs = self.bs();
+        let block_count = self.vol.block_count();
+        let slot = self.slot_of(&entry.name);
+        let mut next = self.vol.hash_table(dir)?[slot];
+        let mut prev = 0u64;
+        let mut steps = 0u64;
+        while next != 0 && next as u64 != entry.lba {
+            steps += 1;
+            if steps > block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
+                    lba: next as u64,
+                }));
+            }
+            let e = self.vol.entry_at(next as u64)?;
+            prev = next as u64;
+            next = e.hash_chain;
+        }
+        if next == 0 {
+            return Err(MutateError::NotInChain {
+                dir,
+                lba: entry.lba,
+            });
+        }
+        let successor = self.vol.entry_at(entry.lba)?.hash_chain;
+        if prev == 0 {
+            let mut buf = self.get(dir)?;
+            wr32(&mut buf, OFF_HASH_TABLE + slot * 4, successor);
+            self.put(dir, &mut buf)
+        } else {
+            let mut buf = self.get(prev)?;
+            wr32(&mut buf, tail(bs, TL_HASH_CHAIN), successor);
+            self.put(prev, &mut buf)
+        }
+    }
+
+    /// Splice a hard link out of the chain of links naming its target:
+    /// walk longword −10 from the target, and write the link's own −10
+    /// into whichever block pointed at it.
+    ///
+    /// Done *before* the link leaves its directory, so at no point does a
+    /// live object's link chain name a block that is on its way to being
+    /// freed.
+    fn unlink_from_link_chain(&mut self, link: &Entry) -> Result<(), MutateError<Transport<S>>> {
+        let bs = self.bs();
+        let block_count = self.vol.block_count();
+        let target = link.real_entry as u64;
+        if target == 0 {
+            return Err(MutateError::Read(crate::read::Error::LinkTargetMissing {
+                lba: link.lba,
+            }));
+        }
+        let mut prev = target;
+        let mut steps = 0u64;
+        loop {
+            let mut buf = self.get(prev)?;
+            let next = be32(&buf, tail(bs, TL_NEXT_LINK));
+            if next == 0 {
+                return Err(MutateError::NotInLinkChain {
+                    lba: link.lba,
+                    target,
+                });
+            }
+            if next as u64 == link.lba {
+                wr32(&mut buf, tail(bs, TL_NEXT_LINK), link.next_link);
+                return self.put(prev, &mut buf);
+            }
+            steps += 1;
+            if steps > block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
+                    lba: next as u64,
+                }));
+            }
+            prev = next as u64;
+        }
+    }
+
+    /// Refuse moving a directory into itself or into anything below it.
+    ///
+    /// Walks `parent` pointers upward from the proposed new parent, with
+    /// a visited set *and* a length bound: the volume may already contain
+    /// the loop this is trying not to create, and a cycle check that
+    /// hangs on a damaged volume is not a cycle check.
+    fn refuse_own_subtree(
+        &mut self,
+        entry: &Entry,
+        new_parent: u64,
+    ) -> Result<(), MutateError<Transport<S>>> {
+        let root = self.vol.root_lba();
+        let block_count = self.vol.block_count();
+        let mut here = new_parent;
+        let mut visited: Vec<u64> = Vec::new();
+        loop {
+            if here == entry.lba {
+                return Err(MutateError::IntoOwnSubtree {
+                    entry: entry.lba,
+                    parent: new_parent,
+                });
+            }
+            if here == root || here == 0 {
+                return Ok(());
+            }
+            if visited.contains(&here) || visited.len() as u64 >= block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainCycle {
+                    lba: here,
+                }));
+            }
+            visited.push(here);
+            here = self.vol.entry_at(here)?.parent as u64;
+        }
+    }
+
+    // -- the dircache ------------------------------------------------------
+
+    /// Rebuild a directory's whole dircache chain from its hash chains.
+    ///
+    /// The chains are the input, so the result cannot disagree with them
+    /// — which is the entire argument for regenerating rather than
+    /// patching, and why
+    /// [`validate`](crate::Volume::validate) reports no
+    /// [`DircacheStale`](crate::Finding::DircacheStale) finding after any
+    /// operation in this module.
+    ///
+    /// Blocks are reused where the new chain is no longer than the old,
+    /// allocated where it grew (bitmap flushed before the pointer naming
+    /// them is written) and freed where it shrank (after the shortened
+    /// chain is on the disk). The blocks are written **backwards**, last
+    /// first, so every `next` pointer names a block that is already
+    /// there.
+    ///
+    /// A no-op on the six variants without dircaches, so callers do not
+    /// have to ask.
+    fn refresh_dircache(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
+        if !self.vol.variant().has_dircache() {
+            return Ok(());
+        }
+        let bs = self.bs();
+        let capacity = bs - OFF_DIRCACHE_RECORDS_START;
+
+        // The facts, from the authority.
+        let entries = self.vol.read_dir(dir)?;
+        let mut pages: Vec<(Vec<u8>, u32)> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut count = 0u32;
+        for e in &entries {
+            let comment = self.vol.comment(e)?;
+            let record = dircache_record(&CacheFacts {
+                entry: e.lba,
+                byte_size: e.byte_size,
+                protection: e.protection,
+                owner: e.owner,
+                date: e.date,
+                kind: e.kind,
+                name: &e.name,
+                comment: &comment,
+            });
+            if cur.len() + record.len() > capacity {
+                pages.push((core::mem::take(&mut cur), count));
+                count = 0;
+            }
+            cur.extend_from_slice(&record);
+            count += 1;
+        }
+        // Always at least one block, even for an empty directory: an
+        // empty cache is not a null pointer, and every directory this
+        // crate or the oracle creates has one from birth.
+        pages.push((cur, count));
+
+        let old = self.vol.read_dircache(dir)?.blocks;
+        let mut blocks = old.clone();
+        if pages.len() > blocks.len() {
+            let mut fresh = Vec::new();
+            let mut hint = dir;
+            for _ in blocks.len()..pages.len() {
+                let a = self.alloc.allocate_near(hint)?;
+                hint = a.block();
+                fresh.push(a);
+            }
+            self.flush()?;
+            for a in &fresh {
+                blocks.push(self.alloc.reference(a)?);
+            }
+        }
+
+        for (i, (records, count)) in pages.iter().enumerate().rev() {
+            let next = if i + 1 < pages.len() {
+                blocks[i + 1]
+            } else {
+                0
+            };
+            let mut buf = vec![0u8; bs];
+            build_dircache_block(&mut buf, blocks[i], dir, records, *count, next);
+            self.write(blocks[i], &buf)?;
+        }
+
+        // A directory that had no cache at all — one created by a tool
+        // that did not know about DOS\4 — gets its pointer now, after the
+        // block it names is on the disk.
+        if old.is_empty() {
+            let mut buf = self.get(dir)?;
+            wr32(&mut buf, tail(bs, TL_EXTENSION), blocks[0] as u32);
+            self.put(dir, &mut buf)?;
+        }
+
+        for &lba in blocks.iter().skip(pages.len()) {
+            self.alloc.free(lba)?;
+        }
+        self.flush()
+    }
+
+    // -- dates -------------------------------------------------------------
+
+    /// Stamp a directory's DateStamp and the root's `disk_altered`, if
+    /// this session has a clock. See the module documentation for the
+    /// four implementations this rule was read out of.
+    fn touch(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
+        let now = match self.clock {
+            Some(now) => now,
+            None => return Ok(()),
+        };
+        let bs = self.bs();
+        let root = self.vol.root_lba();
+        let variant = self.vol.variant();
+        if dir != root {
+            let mut buf = self.get(dir)?;
+            write_date(&mut buf, variant, now);
+            self.put(dir, &mut buf)?;
+        }
+        let mut buf = self.get(root)?;
+        if dir == root {
+            // The root's "directory altered" is longword −23, which is
+            // exactly where a classic entry keeps its own date; the root
+            // does not move on LNFS.
+            wr_date(&mut buf, tail(bs, TL_ROOT_DIR_ALTERED), now);
+        }
+        wr_date(&mut buf, tail(bs, TL_ROOT_DISK_ALTERED), now);
+        self.put(root, &mut buf)
+    }
+
+    // -- block I/O and the bitmap ------------------------------------------
+
+    /// Read a metadata block whole, checksum verified.
+    fn get(&mut self, lba: u64) -> Result<Vec<u8>, MutateError<Transport<S>>> {
+        self.vol.read_raw(lba)?;
+        if !checksum_ok(&self.vol.buf) {
+            return Err(MutateError::Read(crate::read::Error::Checksum { lba }));
+        }
+        Ok(self.vol.buf.clone())
+    }
+
+    /// Fix a metadata block's checksum at longword 5 and write it back.
+    fn put(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), MutateError<Transport<S>>> {
+        finish_checksum(buf);
+        self.write(lba, buf)?;
+        // The `Volume`'s parsed root is a copy of the bytes as they were;
+        // writing the root has just invalidated it, and every later
+        // `hash_table(root)` would otherwise answer from the stale one.
+        if lba == self.vol.root_lba() {
+            self.vol.reload_root()?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), MutateError<Transport<S>>> {
+        if lba >= self.vol.block_count() {
+            return Err(MutateError::Read(crate::read::Error::LbaOutOfRange {
+                lba,
+                block_count: self.vol.block_count(),
+            }));
+        }
+        self.vol.src.write_block(lba, buf).map_err(MutateError::Io)
+    }
+
+    /// Get every dirty bitmap page onto the disk.
+    ///
+    /// The hinge of the whole ordering: after this returns,
+    /// [`Allocator::reference`] will hand out the blocks just allocated,
+    /// and before it does it refuses them.
+    fn flush(&mut self) -> Result<(), MutateError<Transport<S>>> {
+        self.alloc.flush(&mut self.vol.src)?;
+        Ok(())
+    }
+
+    /// Refresh the LNFS root's `NumBlocksUsed`, which is the only piece
+    /// of allocation accounting the format keeps outside the bitmap.
+    ///
+    /// A no-op on the six variants that have no such field, rather than a
+    /// redundant root write on every operation.
+    fn stamp_blocks_used(&mut self) -> Result<(), MutateError<Transport<S>>> {
+        let variant = self.vol.variant();
+        if !variant.has_long_names() {
+            return Ok(());
+        }
+        let root = self.vol.root_lba();
+        self.alloc
+            .mark_bitmap_valid(&mut self.vol.src, root, variant)?;
+        self.vol.reload_root()?;
+        Ok(())
+    }
+}
+
+/// What [`Mutator::prepare`] settled before anything was written.
+///
+/// It carries the caller's `name` and metadata onward rather than making
+/// [`Mutator::emit`] take them again: they were already validated here,
+/// and a second copy of the argument list is a second chance to pass them
+/// in a different order.
+struct Prepared<'a> {
+    lba: u64,
+    parent: u64,
+    comment_block: u32,
+    name: &'a [u8],
+    meta: &'a Metadata<'a>,
+}

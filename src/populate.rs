@@ -89,9 +89,12 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bitmap::pack_ranges;
+use crate::build::{
+    build_comment_block, build_data_block, build_dircache_block, dircache_record, dircache_used,
+    needs_comment_block, write_entry_header, CacheFacts, EntryFields,
+};
 use crate::format::{
-    check_name_bytes, format, wr32, wr_bcpl, wr_date, FormatError, FormatLayout, FormatOptions,
-    NameProblem,
+    check_name_bytes, format, wr32, FormatError, FormatLayout, FormatOptions, NameProblem,
 };
 use crate::layout::*;
 use crate::read::{DateStamp, EntryKind};
@@ -812,19 +815,15 @@ impl<S: BlockMedium> Populator<S> {
         // The comment goes in its own block only when the name left no
         // room beside it — which can only happen on LNFS, where the two
         // share one 112-byte field.
-        let comment_block =
-            if self.variant.has_long_names() && 1 + name.len() + 1 + meta.comment.len() > NAC_LEN {
-                let cb = self.alloc()?;
-                self.buf.iter_mut().for_each(|b| *b = 0);
-                wr32(&mut self.buf, OFF_TYPE, T_COMMENT);
-                wr32(&mut self.buf, OFF_OWN_KEY, cb as u32);
-                wr32(&mut self.buf, OFF_COMMENT_HEADER_KEY, lba as u32);
-                wr_bcpl(&mut self.buf, OFF_COMMENT_TEXT, meta.comment);
-                self.put_checked(cb)?;
-                cb as u32
-            } else {
-                0
-            };
+        let comment_block = if needs_comment_block(self.variant, name.len(), meta.comment.len()) {
+            let cb = self.alloc()?;
+            let mut buf = vec![0u8; self.block_size];
+            build_comment_block(&mut buf, cb, lba, meta.comment);
+            self.write(cb, &buf)?;
+            cb as u32
+        } else {
+            0
+        };
 
         Ok(Prepared {
             lba,
@@ -849,44 +848,21 @@ impl<S: BlockMedium> Populator<S> {
         byte_size: u32,
         hdr: &mut [u8],
     ) -> Result<u64, PopulateError<Transport<S>>> {
-        let bs = self.block_size;
         let (lba, parent, name, meta) = (prep.lba, prep.parent, prep.name, prep.meta);
-        wr32(hdr, OFF_TYPE, T_HEADER);
-        wr32(hdr, OFF_OWN_KEY, lba as u32);
-        wr32(hdr, tail(bs, TL_OWNER), meta.owner);
-        wr32(hdr, tail(bs, TL_PROTECTION), meta.protection);
-        if matches!(kind, EntryKind::File) {
-            wr32(hdr, tail(bs, TL_BYTE_SIZE), byte_size);
-        }
-        if self.variant.has_long_names() {
-            let off = tail(bs, TL_NAC);
-            wr_bcpl(hdr, off, name);
-            let after = off + 1 + name.len();
-            if prep.comment_block == 0 {
-                wr_bcpl(hdr, after, meta.comment);
-            } else {
-                // The inline comment is left empty and longword −18 names
-                // the block that has it — the exact state an LNFS volume
-                // is in when a long name crowded the comment out, and the
-                // one a reader must not mistake for "no comment".
-                hdr[after] = 0;
-                wr32(hdr, tail(bs, TL_COMMENT_BLOCK), prep.comment_block);
-            }
-            wr_date(hdr, tail(bs, TL_DATE_LONG), meta.date);
-        } else {
-            wr_bcpl(hdr, tail(bs, TL_NAME), name);
-            wr_bcpl(hdr, tail(bs, TL_COMMENT), meta.comment);
-            wr_date(hdr, tail(bs, TL_DATE), meta.date);
-        }
-        wr32(hdr, tail(bs, TL_HASH_CHAIN), prep.head);
-        wr32(hdr, tail(bs, TL_PARENT), parent as u32);
-        wr32(
+        write_entry_header(
             hdr,
-            tail(bs, TL_SECONDARY_TYPE),
-            kind.secondary_type() as u32,
+            self.variant,
+            &EntryFields {
+                lba,
+                parent,
+                kind,
+                byte_size,
+                hash_chain: prep.head,
+                name,
+                meta,
+                comment_block: prep.comment_block,
+            },
         );
-        let ck = checksum_compute(hdr, CHECKSUM_INDEX);
-        wr32(hdr, OFF_CHECKSUM, ck);
         self.write(lba, hdr)?;
 
         // Head insertion, as the oracle does it: the new entry takes the
@@ -919,7 +895,16 @@ impl<S: BlockMedium> Populator<S> {
         byte_size: u32,
     ) -> Result<(), PopulateError<Transport<S>>> {
         let bs = self.block_size;
-        let record = dircache_record(entry, byte_size, meta, kind, name);
+        let record = dircache_record(&CacheFacts {
+            entry,
+            byte_size,
+            protection: meta.protection,
+            owner: meta.owner,
+            date: meta.date,
+            kind,
+            name,
+            comment: meta.comment,
+        });
 
         self.read_checked(dir)?;
         let mut block = be32(&self.buf, tail(bs, TL_EXTENSION)) as u64;
@@ -962,19 +947,11 @@ impl<S: BlockMedium> Populator<S> {
         dir: u64,
         record: &[u8],
     ) -> Result<(), PopulateError<Transport<S>>> {
-        self.buf.iter_mut().for_each(|b| *b = 0);
-        wr32(&mut self.buf, OFF_TYPE, T_DIRCACHE);
-        wr32(&mut self.buf, OFF_OWN_KEY, lba as u32);
-        wr32(&mut self.buf, OFF_DIRCACHE_PARENT, dir as u32);
-        wr32(
-            &mut self.buf,
-            OFF_DIRCACHE_RECORDS,
-            u32::from(!record.is_empty()),
-        );
-        wr32(&mut self.buf, OFF_DIRCACHE_NEXT, 0);
-        let start = OFF_DIRCACHE_RECORDS_START;
-        self.buf[start..start + record.len()].copy_from_slice(record);
-        self.put_checked(lba)
+        let mut buf = core::mem::take(&mut self.buf);
+        build_dircache_block(&mut buf, lba, dir, record, u32::from(!record.is_empty()), 0);
+        let r = self.write(lba, &buf);
+        self.buf = buf;
+        r
     }
 
     /// One data block: raw payload on FFS, six longwords of header and a
@@ -988,19 +965,11 @@ impl<S: BlockMedium> Populator<S> {
         next: u32,
         ffs: bool,
     ) -> Result<(), PopulateError<Transport<S>>> {
-        self.buf.iter_mut().for_each(|b| *b = 0);
-        if ffs {
-            self.buf[..data.len()].copy_from_slice(data);
-            self.put(lba)
-        } else {
-            wr32(&mut self.buf, OFF_TYPE, T_DATA);
-            wr32(&mut self.buf, OFF_DATA_HEADER_KEY, header as u32);
-            wr32(&mut self.buf, OFF_DATA_SEQ, seq);
-            wr32(&mut self.buf, OFF_DATA_SIZE, data.len() as u32);
-            wr32(&mut self.buf, OFF_DATA_NEXT, next);
-            self.buf[OFF_DATA_PAYLOAD..OFF_DATA_PAYLOAD + data.len()].copy_from_slice(data);
-            self.put_checked(lba)
-        }
+        let mut buf = core::mem::take(&mut self.buf);
+        build_data_block(&mut buf, header, seq, data, next, ffs);
+        let r = self.write(lba, &buf);
+        self.buf = buf;
+        r
     }
 
     /// The name and hash chain of an entry, for the duplicate check.
@@ -1137,65 +1106,6 @@ fn fill<F: FnMut(&mut [u8]) -> usize>(chunk: &mut F, buf: &mut [u8]) -> usize {
         got += n.min(buf.len() - got);
     }
     got
-}
-
-/// Where the records in a dircache block end: walk `count` of them,
-/// because their lengths depend on the two counted strings inside them.
-fn dircache_used(block: &[u8], count: u32) -> usize {
-    let mut off = OFF_DIRCACHE_RECORDS_START;
-    for _ in 0..count {
-        if off + DIRCACHE_RECORD_MIN > block.len() {
-            return block.len();
-        }
-        let name_len = block[off + DC_NAME_LEN] as usize;
-        if off + DIRCACHE_RECORD_FIXED + name_len >= block.len() {
-            return block.len();
-        }
-        let comment_len = block[off + DIRCACHE_RECORD_FIXED + name_len] as usize;
-        off += dircache_record_len(name_len, comment_len);
-    }
-    off
-}
-
-/// Pack one dircache record.
-///
-/// The `DateStamp` is narrowed to three *words* — the format's own
-/// narrowing, not this crate's — so a cached date runs out in 2157 where
-/// the header block's runs out in 11.7 million. Truncating rather than
-/// clamping is what AmigaDOS does, and the cache is advisory anyway:
-/// [`Volume::validate`](crate::Volume::validate) never compares dates,
-/// and nothing in this crate resolves anything through a cache.
-fn dircache_record(
-    entry: u64,
-    byte_size: u32,
-    meta: &Metadata<'_>,
-    kind: EntryKind,
-    name: &[u8],
-) -> Vec<u8> {
-    let mut r = vec![0u8; dircache_record_len(name.len(), meta.comment.len())];
-    wr32(&mut r, DC_ENTRY, entry as u32);
-    wr32(&mut r, DC_SIZE, byte_size);
-    wr32(&mut r, DC_PROTECTION, meta.protection);
-    wr16(&mut r, DC_UID, (meta.owner >> 16) as u16);
-    wr16(&mut r, DC_GID, meta.owner as u16);
-    wr16(&mut r, DC_DAYS, meta.date.days as u16);
-    wr16(&mut r, DC_MINS, meta.date.mins as u16);
-    wr16(&mut r, DC_TICKS, meta.date.ticks as u16);
-    // xdftool leaves this byte zero on every record it writes; filling it
-    // in is strictly more information, and a validator reads a zero as
-    // "not recorded" rather than as a disagreement either way.
-    r[DC_TYPE] = kind.secondary_type() as i8 as u8;
-    r[DC_NAME_LEN] = name.len() as u8;
-    let n = DIRCACHE_RECORD_FIXED;
-    r[n..n + name.len()].copy_from_slice(name);
-    r[n + name.len()] = meta.comment.len() as u8;
-    let c = n + name.len() + 1;
-    r[c..c + meta.comment.len()].copy_from_slice(meta.comment);
-    r
-}
-
-fn wr16(block: &mut [u8], off: usize, v: u16) {
-    block[off..off + 2].copy_from_slice(&v.to_be_bytes());
 }
 
 // ---------------------------------------------------------------------------

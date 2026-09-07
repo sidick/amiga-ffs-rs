@@ -4492,3 +4492,1179 @@ fn an_interrupted_repair_leaves_a_volume_that_refuses_to_be_allocated_from() {
         assert_tree_intact(&mut vol);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mutation: create, delete, rename, set_metadata in existing volumes
+// ---------------------------------------------------------------------------
+
+use amiga_ffs::{MetaUpdate, MutateError, Mutator};
+
+/// Open a populated volume for mutation, do something to it, and hand the
+/// volume back. Every operation is complete when it returns, so there is
+/// no `finish()` here and none in the API.
+fn mutating(vol: Volume<MemDisk>, f: impl FnOnce(&mut Mutator<MemDisk>)) -> Volume<MemDisk> {
+    let mut m = Mutator::open(vol).expect("open mutator");
+    f(&mut m);
+    m.into_volume()
+}
+
+/// Fail loudly with the findings spelled out: a bare `assert!(clean)` on a
+/// validator whose whole point is typed findings tells you nothing.
+fn assert_clean(vol: &mut Volume<MemDisk>, what: &str) {
+    let report = vol.validate();
+    assert!(
+        report.is_clean(),
+        "{what}: {:#?}",
+        report
+            .findings
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A volume with a little tree already on it, opened for mutation — the
+/// case this whole wave is about: blocks somebody else allocated, a
+/// bitmap that has to be believed and updated rather than rewritten.
+fn mutable(variant: Variant, bs: usize, nblocks: u64) -> Volume<MemDisk> {
+    populated(variant, bs, nblocks, allocatable_tree)
+}
+
+/// The property this wave is for: entries created in a volume that
+/// already existed read back identical, the volume validates clean, and
+/// the bitmap accounts for exactly the blocks the walk reaches.
+#[test]
+fn creating_in_an_existing_volume_round_trips_on_every_variant_and_block_size() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let vol = mutable(variant, bs, nblocks);
+            let root = vol.root_lba();
+            let big = pattern(
+                hash_table_size(bs) as usize * data_payload_size(bs, variant.is_ffs()) + 3000,
+            );
+
+            let mut made = Vec::new();
+            let mut vol = mutating(vol, |m| {
+                let meta = Metadata::new().comment(b"a comment").protection(0x55);
+                let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+                made.push(m.create_dir(devs, b"Nested", &meta).unwrap());
+                let nested = *made.last().unwrap();
+                made.push(
+                    m.create_file(nested, b"deep", &meta, b"deep bytes")
+                        .unwrap(),
+                );
+                made.push(m.create_file(root, b"Crosser", &meta, &big).unwrap());
+                made.push(m.create_file(root, b"Empty", &meta, b"").unwrap());
+            });
+
+            assert_clean(&mut vol, &format!("{variant:?} @{bs}"));
+            let devs = vol.lookup(root, b"Devs").unwrap().unwrap().lba;
+            let nested = vol.lookup(devs, b"Nested").unwrap().unwrap();
+            assert_eq!(nested.kind, EntryKind::Directory);
+            assert_eq!(nested.protection, 0x55);
+            assert_eq!(vol.comment(&nested).unwrap(), b"a comment");
+            let deep = vol.lookup(nested.lba, b"deep").unwrap().unwrap();
+            assert_eq!(vol.read_file(deep.lba).unwrap(), b"deep bytes");
+            let crosser = vol.lookup(root, b"Crosser").unwrap().unwrap();
+            assert_eq!(vol.read_file(crosser.lba).unwrap(), big);
+            let empty = vol.lookup(root, b"Empty").unwrap().unwrap();
+            assert_eq!(empty.byte_size, 0);
+            assert_eq!(vol.read_file(empty.lba).unwrap(), b"");
+
+            // The tree that was already there is untouched, byte for byte.
+            assert_tree_intact(&mut vol);
+
+            // Reachable and allocated are two independent tallies of the
+            // same fact, and a mutation that leaked would separate them.
+            let report = vol.validate();
+            assert_eq!(report.summary.reachable, report.summary.allocated);
+            assert_eq!(report.summary.orphans, 0);
+            assert_eq!(report.summary.reachable_but_free, 0);
+            // A file that needed one is proof the extension-block path ran.
+            assert!(report.summary.extension_blocks >= 1);
+        }
+    }
+}
+
+/// Head insertion again, this time into a chain that already exists on a
+/// volume this crate did not write in one pass: the oracle-verified order
+/// is newest-first, and a mutator that appended instead would still pass
+/// every lookup.
+#[test]
+fn a_created_entry_takes_the_head_of_an_existing_chain() {
+    // AAA, AEU and AFH all hash to slot 54 of a 72-slot table.
+    let t = hash_table_size(512);
+    for n in [&b"AAA"[..], b"AEU", b"AFH"] {
+        assert_eq!(name_hash(n, intl_toupper, t), 54);
+    }
+    let vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"AAA", &Metadata::new(), b"one")
+            .unwrap();
+    });
+    let root = vol.root_lba();
+
+    let mut vol = mutating(vol, |m| {
+        m.create_file(root, b"AEU", &Metadata::new(), b"two")
+            .unwrap();
+        m.create_file(root, b"AFH", &Metadata::new(), b"three")
+            .unwrap();
+    });
+
+    let head = vol.root().hash_table[54];
+    let first = vol.entry_at(head as u64).unwrap();
+    assert_eq!(first.name, b"AFH");
+    let second = vol.entry_at(first.hash_chain as u64).unwrap();
+    assert_eq!(second.name, b"AEU");
+    let third = vol.entry_at(second.hash_chain as u64).unwrap();
+    assert_eq!(third.name, b"AAA");
+    assert_eq!(third.hash_chain, 0);
+    assert_clean(&mut vol, "three colliding names");
+}
+
+/// No leaks in the happy path, stated as an equation: a create followed
+/// by the matching delete returns the volume to the *exact* set of blocks
+/// it had before, on every variant and both block sizes. Anything the
+/// create allocated and the delete forgot — an extension block, an
+/// overflow comment, a dircache block the chain grew into — shows up here
+/// and nowhere else.
+#[test]
+fn a_create_and_its_delete_return_the_volume_to_the_same_blocks() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut vol = mutable(variant, bs, nblocks);
+            let root = vol.root_lba();
+            let before = allocated_set(&mut vol);
+            let comment = &b"a comment long enough to be worth carrying about with us"[..];
+            // On LNFS this name plus that comment does not fit the merged
+            // field, so the create allocates a T_COMMENT block too.
+            let long: Vec<u8> = if variant.has_long_names() {
+                vec![b'L'; 100]
+            } else {
+                b"Ordinary".to_vec()
+            };
+            let big = pattern(
+                hash_table_size(bs) as usize * data_payload_size(bs, variant.is_ffs()) + 100,
+            );
+
+            let mut vol = mutating(vol, |m| {
+                let meta = Metadata::new().comment(comment);
+                m.create_dir(root, b"Doomed", &meta).unwrap();
+                m.create_file(root, &long, &meta, &big).unwrap();
+            });
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after create"));
+            assert!(allocated_set(&mut vol).len() > before.len());
+
+            let mut vol = mutating(vol, |m| {
+                m.delete(root, b"Doomed").unwrap();
+                m.delete(root, &long).unwrap();
+            });
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after delete"));
+            assert_eq!(
+                allocated_set(&mut vol),
+                before,
+                "{variant:?} @{bs}: create+delete did not round-trip the bitmap"
+            );
+            assert_tree_intact(&mut vol);
+        }
+    }
+}
+
+/// Splicing a chain has three cases and they are all different code: the
+/// head lives in the directory's hash table, everything else lives in the
+/// previous entry's longword −4, and the tail is the one whose successor
+/// is 0.
+#[test]
+fn delete_splices_the_head_the_middle_and_the_tail_of_a_chain() {
+    // Written AAA, AEU, AFH, the chain reads AFH -> AEU -> AAA.
+    for (victim, survivors) in [
+        (&b"AFH"[..], [&b"AEU"[..], b"AAA"]),
+        (b"AEU", [b"AFH", b"AAA"]),
+        (b"AAA", [b"AFH", b"AEU"]),
+    ] {
+        let vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+            let root = pop.root_lba();
+            for n in [&b"AAA"[..], b"AEU", b"AFH"] {
+                pop.create_file(root, n, &Metadata::new(), n).unwrap();
+            }
+        });
+        let root = vol.root_lba();
+        let mut vol = mutating(vol, |m| {
+            m.delete(root, victim).unwrap();
+        });
+
+        assert_clean(&mut vol, "after splicing a chain");
+        assert!(vol.lookup(root, victim).unwrap().is_none());
+        for name in survivors {
+            let e = vol
+                .lookup(root, name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{:?} gone after deleting {:?}", name, victim));
+            assert_eq!(vol.read_file(e.lba).unwrap(), name);
+        }
+        assert_eq!(vol.read_dir(root).unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn delete_refuses_a_directory_with_anything_in_it() {
+    let vol = mutable(Variant::FfsIntl, 512, 1760);
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    assert!(matches!(
+        m.delete(root, b"Devs"),
+        Err(MutateError::DirectoryNotEmpty { .. })
+    ));
+    // And the refusal changed nothing: the volume is still exactly there.
+    let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+    m.delete(devs, b"system-configuration").unwrap();
+    m.delete(root, b"Devs").unwrap();
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, "after emptying and deleting");
+    assert!(vol.lookup(root, b"Devs").unwrap().is_none());
+}
+
+#[test]
+fn delete_refuses_a_hard_links_target_and_frees_the_links_themselves() {
+    // A volume with a hard link, built by hand: the crate has no
+    // link-creating API yet, and what is under test is the refusal.
+    let nblocks = 1760;
+    let mut b = Builder::new(Variant::FfsIntl, 512, nblocks, b"Linked");
+    let root_lba = b.root_lba();
+    let f = b.add_file(root_lba, b"Real", b"", b"contents");
+    b.add_hard_link(root_lba, b"Alias", EntryKind::LinkFile, f.header);
+    b.add_soft_link(root_lba, b"Elsewhere", b"Work:Tools/Ed");
+    b.add_bitmap(true);
+    let vol = Volume::open_with(b.finish(), None, nblocks, 2).unwrap();
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    assert!(matches!(
+        m.delete(root, b"Real"),
+        Err(MutateError::LinkedTo { .. })
+    ));
+
+    // Deleting the link first works, and takes the link out of the
+    // target's chain -- which is what makes the target deletable.
+    m.delete(root, b"Alias").unwrap();
+    assert_eq!(
+        m.volume().lookup(root, b"Real").unwrap().unwrap().next_link,
+        0
+    );
+    m.delete(root, b"Real").unwrap();
+
+    // A soft link is a header block and the path inside it: nothing to
+    // splice, one block to give back.
+    let soft = m.volume().lookup(root, b"Elsewhere").unwrap().unwrap().lba;
+    assert_eq!(m.volume().read_softlink(soft).unwrap(), b"Work:Tools/Ed");
+    m.delete(root, b"Elsewhere").unwrap();
+
+    let mut vol = m.into_volume();
+    assert_clean(
+        &mut vol,
+        "after deleting a link, its target and a soft link",
+    );
+    assert!(vol.read_dir(root).unwrap().is_empty());
+}
+
+#[test]
+fn rename_moves_an_entry_within_and_between_directories() {
+    for variant in ALL_VARIANTS {
+        let vol = mutable(variant, 512, 1760);
+        let root = vol.root_lba();
+        let mut vol = mutating(vol, |m| {
+            let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+            // Within one directory.
+            m.rename(root, b"Small", root, b"Tiny").unwrap();
+            // And across two, keeping the name.
+            m.rename(root, b"Payload", devs, b"Payload").unwrap();
+        });
+
+        assert_clean(&mut vol, &format!("{variant:?} after renames"));
+        assert!(vol.lookup(root, b"Small").unwrap().is_none());
+        let tiny = vol.lookup(root, b"Tiny").unwrap().unwrap();
+        assert_eq!(vol.read_file(tiny.lba).unwrap(), b"hello");
+        assert!(vol.lookup(root, b"Payload").unwrap().is_none());
+        let devs = vol.lookup(root, b"Devs").unwrap().unwrap().lba;
+        let moved = vol.lookup(devs, b"Payload").unwrap().unwrap();
+        assert_eq!(moved.parent as u64, devs);
+        assert_eq!(vol.read_file(moved.lba).unwrap(), pattern(9000));
+    }
+}
+
+/// The rename FFS is unusual for supporting: same name, different case.
+/// The name hashes to the same slot, so the entry leaves and re-enters
+/// one chain, and the stored bytes change while every lookup keeps
+/// matching.
+#[test]
+fn a_case_only_rename_changes_the_stored_bytes_and_nothing_else() {
+    for variant in ALL_VARIANTS {
+        let vol = mutable(variant, 512, 1760);
+        let root = vol.root_lba();
+        let before = {
+            let mut v = vol;
+            let s = allocated_set(&mut v);
+            v = mutating(v, |m| {
+                m.rename(root, b"Small", root, b"SMALL").unwrap();
+            });
+            let after = allocated_set(&mut v);
+            assert_eq!(s, after, "{variant:?}: a rename allocated something");
+            v
+        };
+        let mut vol = before;
+        assert_clean(&mut vol, &format!("{variant:?} after a case-only rename"));
+        let e = vol.lookup(root, b"small").unwrap().unwrap();
+        assert_eq!(e.name, b"SMALL", "{variant:?}: case was not preserved");
+        assert_eq!(vol.read_file(e.lba).unwrap(), b"hello");
+    }
+}
+
+/// Latin-1 under both fold tables: `Café` and `CAFÉ` are one name on the
+/// international variants and two on `DOS\0`/`DOS\1`, and a rename has to
+/// agree with whichever table the volume uses — in the duplicate check
+/// and in the hash slot alike.
+#[test]
+fn renaming_latin1_respects_the_volumes_own_fold_table() {
+    for variant in [Variant::Ffs, Variant::FfsIntl] {
+        let vol = populated(variant, 512, 1760, |pop| {
+            let root = pop.root_lba();
+            let m = Metadata::new();
+            pop.create_file(root, b"caf\xE9", &m, b"lower").unwrap();
+            pop.create_file(root, b"Other", &m, b"other").unwrap();
+        });
+        let root = vol.root_lba();
+        let mut m = Mutator::open(vol).unwrap();
+
+        let clash = m.rename(root, b"Other", root, b"CAF\xC9");
+        if variant.is_intl() {
+            // Folds together: the name is taken.
+            assert!(matches!(clash, Err(MutateError::DuplicateName { .. })));
+        } else {
+            // Does not fold: two different names, both legal.
+            clash.unwrap();
+        }
+        // And the entry itself renames to its own upper case either way.
+        m.rename(root, b"caf\xE9", root, b"CAF\xC9").ok();
+        let mut vol = m.into_volume();
+        assert_clean(&mut vol, &format!("{variant:?} latin-1 rename"));
+    }
+}
+
+#[test]
+fn rename_refuses_a_duplicate_and_a_directory_moved_into_itself() {
+    let vol = mutable(Variant::FfsIntl, 512, 1760);
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+    let inner = m.create_dir(devs, b"Inner", &Metadata::new()).unwrap();
+
+    assert!(matches!(
+        m.rename(root, b"Small", root, b"Payload"),
+        Err(MutateError::DuplicateName { .. })
+    ));
+    // A directory into itself...
+    assert!(matches!(
+        m.rename(root, b"Devs", devs, b"Devs"),
+        Err(MutateError::IntoOwnSubtree { .. })
+    ));
+    // ...and into its own subtree, which needs the ancestry walk.
+    assert!(matches!(
+        m.rename(root, b"Devs", inner, b"Devs"),
+        Err(MutateError::IntoOwnSubtree { .. })
+    ));
+    // The other direction is fine: a child moved out to the root.
+    m.rename(devs, b"Inner", root, b"Inner").unwrap();
+
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, "after refused renames");
+    assert!(vol.lookup(root, b"Inner").unwrap().is_some());
+    assert!(vol.lookup(devs, b"Inner").unwrap().is_none());
+}
+
+/// The LNFS boundary, both ways. The name and comment share one 112-byte
+/// field, so growing the name past what is left pushes the comment into a
+/// `T_COMMENT` block, and shrinking it pulls the comment back inline and
+/// frees the block. The comment survives both crossings unchanged, and
+/// the block accounting says exactly one block moved.
+#[test]
+fn an_lnfs_rename_moves_the_comment_across_the_boundary_in_both_directions() {
+    for variant in [Variant::OfsIntlLongname, Variant::FfsIntlLongname] {
+        let comment = &b"seventy-nine characters is the most any Amiga comment has ever been"[..];
+        let short = &b"Short"[..];
+        let long: Vec<u8> = vec![b'L'; 100];
+
+        let vol = populated(variant, 512, 1760, |pop| {
+            let root = pop.root_lba();
+            pop.create_file(root, short, &Metadata::new().comment(comment), b"body")
+                .unwrap();
+        });
+        let root = vol.root_lba();
+        let mut vol = vol;
+        let inline = allocated_set(&mut vol).len();
+        {
+            let e = vol.lookup(root, short).unwrap().unwrap();
+            assert_eq!(e.comment_block, 0, "the comment should start inline");
+            assert_eq!(vol.comment(&e).unwrap(), comment);
+        }
+
+        // Inline -> overflow.
+        let mut vol = mutating(vol, |m| {
+            m.rename(root, short, root, &long).unwrap();
+        });
+        assert_clean(&mut vol, &format!("{variant:?} after growing the name"));
+        let e = vol.lookup(root, &long).unwrap().unwrap();
+        assert_ne!(e.comment_block, 0, "the comment should have moved out");
+        assert!(e.comment.is_empty(), "the inline comment must be empty");
+        assert_eq!(vol.comment(&e).unwrap(), comment);
+        assert_eq!(allocated_set(&mut vol).len(), inline + 1);
+
+        // Overflow -> inline, and the block comes back.
+        let mut vol = mutating(vol, |m| {
+            m.rename(root, &long, root, short).unwrap();
+        });
+        assert_clean(&mut vol, &format!("{variant:?} after shrinking the name"));
+        let e = vol.lookup(root, short).unwrap().unwrap();
+        assert_eq!(e.comment_block, 0);
+        assert_eq!(vol.comment(&e).unwrap(), comment);
+        assert_eq!(vol.read_file(e.lba).unwrap(), b"body");
+        assert_eq!(allocated_set(&mut vol).len(), inline);
+    }
+}
+
+#[test]
+fn set_metadata_changes_four_fields_in_place_on_every_variant() {
+    let comment = &b"a replacement comment"[..];
+    let date = DateStamp {
+        days: 9000,
+        mins: 61,
+        ticks: 25,
+    };
+    for variant in ALL_VARIANTS {
+        let vol = mutable(variant, 512, 1760);
+        let root = vol.root_lba();
+        let mut vol = mutating(vol, |m| {
+            let small = m.volume().lookup(root, b"Small").unwrap().unwrap().lba;
+            let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+            m.set_metadata(
+                small,
+                &MetaUpdate::new()
+                    .protection(0x1234_5678)
+                    .comment(comment)
+                    .date(date)
+                    .owner(0x0007_0009),
+            )
+            .unwrap();
+            // Directories too, and one field at a time is a different
+            // path from all four at once.
+            m.set_metadata(devs, &MetaUpdate::new().protection(0xF))
+                .unwrap();
+        });
+
+        assert_clean(&mut vol, &format!("{variant:?} after set_metadata"));
+        let small = vol.lookup(root, b"Small").unwrap().unwrap();
+        assert_eq!(small.protection, 0x1234_5678);
+        assert_eq!(small.owner, 0x0007_0009);
+        assert_eq!(small.date, date);
+        assert_eq!(small.uid(), 7);
+        assert_eq!(small.gid(), 9);
+        assert_eq!(vol.comment(&small).unwrap(), comment);
+        assert_eq!(vol.read_file(small.lba).unwrap(), b"hello");
+        let devs = vol.lookup(root, b"Devs").unwrap().unwrap();
+        assert_eq!(devs.protection, 0xF);
+        assert!(vol.comment(&devs).unwrap().is_empty());
+    }
+}
+
+/// On LNFS, setting a long comment on a long-named entry has to allocate
+/// the overflow block, and clearing it has to give the block back.
+#[test]
+fn set_metadata_allocates_and_frees_an_lnfs_comment_block() {
+    let long: Vec<u8> = vec![b'N'; 100];
+    let comment = &b"long enough not to fit beside a hundred-byte name"[..];
+    let vol = populated(Variant::FfsIntlLongname, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, &long, &Metadata::new(), b"body")
+            .unwrap();
+    });
+    let root = vol.root_lba();
+    let mut vol = vol;
+    let bare = allocated_set(&mut vol).len();
+
+    let mut vol = mutating(vol, |m| {
+        let e = m.volume().lookup(root, &long).unwrap().unwrap().lba;
+        m.set_metadata(e, &MetaUpdate::new().comment(comment))
+            .unwrap();
+    });
+    assert_clean(&mut vol, "after setting an overflowing comment");
+    let e = vol.lookup(root, &long).unwrap().unwrap();
+    assert_ne!(e.comment_block, 0);
+    assert_eq!(vol.comment(&e).unwrap(), comment);
+    assert_eq!(allocated_set(&mut vol).len(), bare + 1);
+
+    let mut vol = mutating(vol, |m| {
+        let e = m.volume().lookup(root, &long).unwrap().unwrap().lba;
+        m.set_metadata(e, &MetaUpdate::new().comment(b"")).unwrap();
+    });
+    assert_clean(&mut vol, "after clearing it again");
+    let e = vol.lookup(root, &long).unwrap().unwrap();
+    assert_eq!(e.comment_block, 0);
+    assert!(vol.comment(&e).unwrap().is_empty());
+    assert_eq!(allocated_set(&mut vol).len(), bare);
+}
+
+/// PLAN's rule for dircaches in this milestone is "update or clear, never
+/// leave stale", and `validate()` is what decides whether it was kept:
+/// every one of the six ways a cache can disagree with its chains is a
+/// `DircacheStale` finding, and after every operation here there are none.
+#[test]
+fn every_mutation_leaves_the_dircache_agreeing_with_the_chains() {
+    for variant in [Variant::OfsIntlDircache, Variant::FfsIntlDircache] {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let vol = mutable(variant, bs, nblocks);
+            let root = vol.root_lba();
+
+            // Enough entries in one directory to spill the cache chain
+            // into a second block and back out of it again: a 512-byte
+            // block holds about nineteen records.
+            let mut vol = mutating(vol, |m| {
+                for i in 0..30u32 {
+                    let name = format!("entry{i:04}");
+                    m.create_file(root, name.as_bytes(), &Metadata::new(), b"x")
+                        .unwrap();
+                }
+            });
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after 30 creates"));
+            let cache = vol.read_dircache(root).unwrap();
+            assert!(
+                cache.blocks.len() > 1 || bs > 512,
+                "the cache chain should have spilled at 512 bytes"
+            );
+            assert_eq!(cache.records.len(), vol.read_dir(root).unwrap().len());
+
+            let mut vol = mutating(vol, |m| {
+                for i in 0..25u32 {
+                    let name = format!("entry{i:04}");
+                    m.delete(root, name.as_bytes()).unwrap();
+                }
+                m.rename(root, b"entry0029", root, b"renamed").unwrap();
+                let e = m.volume().lookup(root, b"Small").unwrap().unwrap().lba;
+                m.set_metadata(e, &MetaUpdate::new().comment(b"cached too"))
+                    .unwrap();
+            });
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after deletes"));
+
+            // The cache is not merely *consistent*, it is the listing: a
+            // record per entry, with the metadata a `List` would print.
+            let entries = vol.read_dir(root).unwrap();
+            let cache = vol.read_dircache(root).unwrap();
+            assert_eq!(cache.records.len(), entries.len());
+            let small = entries.iter().find(|e| e.name == b"Small").unwrap();
+            let record = cache
+                .records
+                .iter()
+                .find(|r| r.entry as u64 == small.lba)
+                .expect("Small is cached");
+            assert_eq!(record.comment, b"cached too");
+            assert_eq!(record.name, b"Small");
+            assert_eq!(record.size, small.byte_size);
+        }
+    }
+}
+
+/// With a clock set, the parent's DateStamp and the root's `disk_altered`
+/// move on every change -- the rule amitools' xdftool follows. Without
+/// one, nothing is written, because a `no_std` crate has no "now" and an
+/// invented date is worse than an old true one.
+#[test]
+fn dates_move_only_when_the_session_has_been_given_a_clock() {
+    let now = DateStamp {
+        days: 12345,
+        mins: 678,
+        ticks: 9,
+    };
+    for variant in ALL_VARIANTS {
+        let vol = mutable(variant, 512, 1760);
+        let root = vol.root_lba();
+        let before = (vol.root().dir_altered, vol.root().disk_altered);
+
+        // No clock: the dates are exactly as they were.
+        let mut vol = mutating(vol, |m| {
+            m.create_file(root, b"Undated", &Metadata::new(), b"x")
+                .unwrap();
+        });
+        assert_eq!((vol.root().dir_altered, vol.root().disk_altered), before);
+        let devs_before = vol.lookup(root, b"Devs").unwrap().unwrap().date;
+
+        let mut vol = {
+            let mut m = Mutator::open(vol).unwrap().clock(now);
+            let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+            m.create_file(devs, b"Dated", &Metadata::new(), b"x")
+                .unwrap();
+            m.into_volume()
+        };
+        // The parent moved, and so did the volume's own "altered".
+        let devs = vol.lookup(root, b"Devs").unwrap().unwrap();
+        assert_ne!(devs.date, devs_before, "{variant:?}: parent not stamped");
+        assert_eq!(devs.date, now);
+        assert_eq!(vol.root().disk_altered, now);
+        // The root's "directory altered" only moves when the root is the
+        // directory that changed.
+        assert_eq!(vol.root().dir_altered, before.0);
+        assert_clean(&mut vol, &format!("{variant:?} with a clock"));
+
+        let mut vol = {
+            let mut m = Mutator::open(vol).unwrap().clock(now);
+            m.delete(root, b"Undated").unwrap();
+            m.into_volume()
+        };
+        assert_eq!(vol.root().dir_altered, now);
+        assert_eq!(vol.root().disk_made, {
+            let mut fresh = mutable(variant, 512, 1760);
+            let made = fresh.root().disk_made;
+            let _ = fresh.validate();
+            made
+        });
+        assert_clean(&mut vol, &format!("{variant:?} after a dated delete"));
+    }
+}
+
+/// Names and comments are checked against the variant's own limits before
+/// a block is allocated, so a refusal costs nothing and leaves nothing.
+#[test]
+fn a_mutator_checks_names_and_comments_before_it_allocates() {
+    for variant in [Variant::FfsIntl, Variant::FfsIntlLongname] {
+        let vol = mutable(variant, 512, 1760);
+        let root = vol.root_lba();
+        let mut vol = vol;
+        let before = allocated_set(&mut vol);
+        let mut m = Mutator::open(vol).unwrap();
+        let meta = Metadata::new();
+
+        assert!(matches!(
+            m.create_file(root, b"", &meta, b""),
+            Err(MutateError::NameEmpty)
+        ));
+        assert!(matches!(
+            m.create_file(root, b"has/slash", &meta, b""),
+            Err(MutateError::NameInvalidByte { byte: b'/', .. })
+        ));
+        assert!(matches!(
+            m.create_file(root, b"colon:here", &meta, b""),
+            Err(MutateError::NameInvalidByte { byte: b':', .. })
+        ));
+        let over = vec![b'x'; m.max_name_len() + 1];
+        assert!(matches!(
+            m.create_file(root, &over, &meta, b""),
+            Err(MutateError::NameTooLong { .. })
+        ));
+        let comment = vec![b'c'; COMMENT_MAX + 1];
+        assert!(matches!(
+            m.create_file(root, b"Fine", &Metadata::new().comment(&comment), b""),
+            Err(MutateError::CommentTooLong { .. })
+        ));
+        assert!(matches!(
+            m.create_file(root, b"Small", &meta, b""),
+            Err(MutateError::DuplicateName { .. })
+        ));
+        assert!(matches!(
+            m.delete(root, b"NoSuchThing"),
+            Err(MutateError::NotFound { .. })
+        ));
+        assert!(matches!(
+            m.set_metadata(root, &MetaUpdate::new().protection(0)),
+            Err(MutateError::IsRoot { .. })
+        ));
+        // Creating inside a file, rather than a directory.
+        let small = m.volume().lookup(root, b"Small").unwrap().unwrap().lba;
+        assert!(matches!(
+            m.create_dir(small, b"Nope", &meta),
+            Err(MutateError::NotADirectory { .. })
+        ));
+
+        let mut vol = m.into_volume();
+        assert_eq!(
+            allocated_set(&mut vol),
+            before,
+            "{variant:?}: a refusal allocated a block"
+        );
+        assert_clean(&mut vol, &format!("{variant:?} after refusals"));
+    }
+}
+
+#[test]
+fn a_mutator_refuses_a_volume_whose_bitmap_is_mid_update() {
+    // Repair's territory, not a mutator's guess -- and the refusal comes
+    // from the allocator, which is the one place it is decided.
+    let nblocks = 1760;
+    let disk = MemDisk::blank(512, nblocks);
+    let opts = FormatOptions::new(Variant::FfsIntl, nblocks, b"Interrupted");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    pop.create_file(root, b"Half", &Metadata::new(), &pattern(5000))
+        .unwrap();
+    let disk = pop.abandon();
+
+    let vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    assert!(matches!(
+        Mutator::open(vol),
+        Err(MutateError::Alloc(AllocError::BitmapInvalid))
+    ));
+}
+
+/// The crash-shape claim for this wave, checked at every point rather
+/// than at one convenient one: stop the medium after *n* writes, for
+/// every n a mutation session takes, and the damage must always be
+/// leak-shaped.
+///
+/// `OrphanBlock` is allowed -- a block marked allocated that nothing
+/// reaches is space lost and nothing worse. `ReachableButFree` is never
+/// allowed: it is the state in which the next allocation hands a block to
+/// a second owner. `DircacheStale` is allowed on the two variants that
+/// have caches, and only there: a cache is advisory, a half-written one
+/// is what every dircache-unaware tool leaves behind, and `validate()`
+/// reporting it is the mechanism by which it gets rebuilt. Everything
+/// else -- a bad checksum on a reachable block, a half-linked entry, a
+/// chain that will not walk -- is a failure.
+#[test]
+fn an_interrupted_mutation_leaks_and_never_double_allocates() {
+    for variant in [
+        Variant::Ffs,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        let nblocks = 1760;
+        let session = |vol: Volume<MemDisk>| -> (Volume<MemDisk>, bool) {
+            let mut m = match Mutator::open(vol) {
+                Ok(m) => m,
+                Err(_) => unreachable!("the bitmap is valid at the start of every prefix"),
+            };
+            let root = m.volume().root_lba();
+            let comment = &b"a comment that will not fit beside a long name at all, honestly"[..];
+            let meta = Metadata::new().comment(comment);
+            let long: Vec<u8> = if variant.has_long_names() {
+                vec![b'L'; 100]
+            } else {
+                b"Created".to_vec()
+            };
+            let ok = m.create_dir(root, b"Fresh", &Metadata::new()).is_ok()
+                & m.create_file(root, &long, &meta, &pattern(4000)).is_ok()
+                & m.rename(root, b"Small", root, b"Renamed").is_ok()
+                & m.delete(root, b"Payload").is_ok();
+            (m.into_volume(), ok)
+        };
+
+        let total = {
+            let mut vol = mutable(variant, 512, nblocks);
+            vol.source_mut().clear_log();
+            let (vol, ok) = session(vol);
+            assert!(ok, "{variant:?}: the uninterrupted session must succeed");
+            vol.into_inner().write_log().len()
+        };
+        assert!(total > 10, "{variant:?}: the session writes {total} blocks");
+
+        let mut crashed = 0;
+        for n in 0..=total {
+            let mut vol = mutable(variant, 512, nblocks);
+            vol.source_mut().clear_log();
+            vol.source_mut().fail_after(n);
+            let (vol, ok) = session(vol);
+            if !ok {
+                crashed += 1;
+            }
+            let disk = vol.into_inner();
+
+            let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+            let report = vol.validate();
+            for finding in &report.findings {
+                let excusable = matches!(finding, Finding::OrphanBlock { .. })
+                    || (variant.has_dircache() && matches!(finding, Finding::DircacheStale { .. }));
+                assert!(
+                    excusable,
+                    "{variant:?}: crash after {n} writes left {finding}"
+                );
+            }
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "{variant:?}: crash after {n} writes"
+            );
+
+            // Every entry still reachable is *whole*: the walk above
+            // already refused a bad checksum or an unfollowable chain, and
+            // this reads the bytes of whatever files are still there.
+            let root = vol.root_lba();
+            for entry in vol.read_dir(root).unwrap() {
+                if entry.kind == EntryKind::File {
+                    vol.read_file(entry.lba).unwrap();
+                }
+            }
+        }
+        assert!(crashed > 0, "{variant:?}: no prefix actually failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mutation against a model
+// ---------------------------------------------------------------------------
+
+/// What the model remembers about one entry. Everything here is
+/// independently checkable on the volume, which is the point: the model
+/// is a second implementation of "what should be on the disk", written in
+/// the least similar way available.
+#[derive(Clone, Debug)]
+struct MEntry {
+    name: Vec<u8>,
+    lba: u64,
+    kind: EntryKind,
+    data: Vec<u8>,
+    comment: Vec<u8>,
+    protection: u32,
+}
+
+/// The tree as a `BTreeMap` of `BTreeMap`s — deterministic iteration, so
+/// a failing seed reproduces exactly.
+struct Model {
+    /// Directory block -> folded name -> entry.
+    dirs: std::collections::BTreeMap<u64, std::collections::BTreeMap<Vec<u8>, MEntry>>,
+    /// Directory block -> its parent, for the ancestry check.
+    parent: std::collections::BTreeMap<u64, u64>,
+    root: u64,
+}
+
+impl Model {
+    fn new(root: u64) -> Self {
+        let mut dirs = std::collections::BTreeMap::new();
+        dirs.insert(root, std::collections::BTreeMap::new());
+        Self {
+            dirs,
+            parent: std::collections::BTreeMap::new(),
+            root,
+        }
+    }
+
+    fn dir_list(&self) -> Vec<u64> {
+        self.dirs.keys().copied().collect()
+    }
+
+    /// Every entry, as (parent, folded key), for picking a victim.
+    fn entry_list(&self) -> Vec<(u64, Vec<u8>)> {
+        let mut v = Vec::new();
+        for (&dir, entries) in &self.dirs {
+            for key in entries.keys() {
+                v.push((dir, key.clone()));
+            }
+        }
+        v
+    }
+
+    /// Is `maybe_below` inside `dir` (or `dir` itself)? The check
+    /// `rename` makes on the volume, made again here so the test only
+    /// ever asks for renames that must succeed.
+    fn inside(&self, dir: u64, maybe_below: u64) -> bool {
+        let mut here = maybe_below;
+        loop {
+            if here == dir {
+                return true;
+            }
+            if here == self.root {
+                return false;
+            }
+            match self.parent.get(&here) {
+                Some(&p) => here = p,
+                None => return false,
+            }
+        }
+    }
+}
+
+fn folded(name: &[u8], fold: fn(u8) -> u8) -> Vec<u8> {
+    name.iter().map(|&c| fold(c)).collect()
+}
+
+/// A name from an alphabet chosen to exercise both fold tables: ASCII
+/// letters in both cases, digits, and the two Latin-1 letters that fold
+/// only on the international variants.
+fn mutation_name(rng: &mut Rng, max: usize) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"abcdefgHIJKLM0123\xE9\xC9-";
+    // Lengths that cross the 30-byte classic limit where the variant
+    // allows it, and cluster short where collisions are likely -- short
+    // names out of a small alphabet is how hash collisions happen.
+    let span = if rng.below(4) == 0 { max } else { max.min(12) };
+    let len = 1 + rng.below(span);
+    (0..len)
+        .map(|_| ALPHABET[rng.below(ALPHABET.len())])
+        .collect()
+}
+
+/// Read the volume back and compare it, entry by entry and byte by byte,
+/// to the model.
+fn verify_model(vol: &mut Volume<MemDisk>, model: &Model, what: &str) {
+    for (&dir, entries) in &model.dirs {
+        let listed = vol.read_dir(dir).expect("read_dir");
+        assert_eq!(
+            listed.len(),
+            entries.len(),
+            "{what}: directory {dir} holds {:?}, model says {:?}",
+            listed.iter().map(|e| Latin1(&e.name)).collect::<Vec<_>>(),
+            entries
+                .values()
+                .map(|e| Latin1(&e.name))
+                .collect::<Vec<_>>()
+        );
+        for e in entries.values() {
+            let found = vol
+                .lookup(dir, &e.name)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{what}: {:?} not found in {dir}", Latin1(&e.name)));
+            assert_eq!(found.lba, e.lba, "{what}: {:?} moved", Latin1(&e.name));
+            // Byte for byte, not under the fold table: case is preserved
+            // on disk, and a writer that upper-cased what it stored would
+            // still pass every lookup.
+            assert_eq!(found.name, e.name, "{what}: case not preserved");
+            assert_eq!(found.kind, e.kind, "{what}: {:?}", Latin1(&e.name));
+            assert_eq!(found.parent as u64, dir, "{what}: {:?}", Latin1(&e.name));
+            assert_eq!(
+                found.protection,
+                e.protection,
+                "{what}: {:?} protection",
+                Latin1(&e.name)
+            );
+            assert_eq!(
+                vol.comment(&found).expect("comment"),
+                e.comment,
+                "{what}: {:?} comment",
+                Latin1(&e.name)
+            );
+            if e.kind == EntryKind::File {
+                assert_eq!(found.byte_size as usize, e.data.len());
+                assert_eq!(
+                    vol.read_file(found.lba).expect("read_file"),
+                    e.data,
+                    "{what}: {:?} contents",
+                    Latin1(&e.name)
+                );
+            }
+        }
+    }
+}
+
+/// The property test for the whole wave: a random interleave of creates,
+/// deletes, renames and metadata changes against a model of the same
+/// tree, on every variant at two block sizes. After each batch the whole
+/// tree is compared field by field and byte by byte, and the volume must
+/// validate with zero findings — no stale dircache, no leaked block, no
+/// entry in the wrong chain.
+///
+/// Only *legal* operations are issued: the model knows which names are
+/// taken, which directories are empty and which moves would make a cycle,
+/// so every call is expected to succeed and a refusal is a failure. The
+/// refusals have their own tests; this one is about the volume ending up
+/// exactly as asked.
+#[test]
+fn a_random_interleave_of_mutations_agrees_with_a_model() {
+    for (v, variant) in ALL_VARIANTS.into_iter().enumerate() {
+        for (b, bs) in [512usize, 4096].into_iter().enumerate() {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut rng = Rng::new(0x03DE_1000 + (v * 16 + b) as u64);
+            let fold = variant.fold();
+            let max_name = if variant.has_long_names() {
+                MAX_NAME_LONG
+            } else {
+                MAX_NAME_CLASSIC
+            };
+
+            let vol = populated(variant, bs, nblocks, |_| {});
+            let root = vol.root_lba();
+            let empty = {
+                let mut v = vol;
+                let set = allocated_set(&mut v);
+                (v, set)
+            };
+            let (vol, before) = empty;
+            let mut model = Model::new(root);
+            let mut m = Mutator::open(vol).expect("mutator");
+            let mut counts = [0usize; 5];
+
+            for batch in 0..5 {
+                for _ in 0..20 {
+                    let dirs = model.dir_list();
+                    let dir = dirs[rng.below(dirs.len())];
+                    match rng.below(10) {
+                        // Create a file.
+                        0..=3 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let data = pattern(rng.below(3000));
+                            let comment = if rng.below(3) == 0 {
+                                b"a comment, which on LNFS may not fit beside the name".to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            let protection = rng.next() as u32;
+                            let meta = Metadata::new().comment(&comment).protection(protection);
+                            let lba = m
+                                .create_file(dir, &name, &meta, &data)
+                                .expect("create_file");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::File,
+                                    data,
+                                    comment,
+                                    protection,
+                                },
+                            );
+                            counts[0] += 1;
+                        }
+                        // Create a directory.
+                        4..=5 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let protection = rng.next() as u32;
+                            let meta = Metadata::new().protection(protection);
+                            let lba = m.create_dir(dir, &name, &meta).expect("create_dir");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::Directory,
+                                    data: Vec::new(),
+                                    comment: Vec::new(),
+                                    protection,
+                                },
+                            );
+                            model.dirs.insert(lba, Default::default());
+                            model.parent.insert(lba, dir);
+                            counts[1] += 1;
+                        }
+                        // Delete something deletable.
+                        6..=7 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let e = model.dirs[&dir][&key].clone();
+                            if e.kind == EntryKind::Directory && !model.dirs[&e.lba].is_empty() {
+                                continue;
+                            }
+                            m.delete(dir, &e.name).expect("delete");
+                            model.dirs.get_mut(&dir).unwrap().remove(&key);
+                            if e.kind == EntryKind::Directory {
+                                model.dirs.remove(&e.lba);
+                                model.parent.remove(&e.lba);
+                            }
+                            counts[2] += 1;
+                        }
+                        // Rename, sometimes to another directory.
+                        8 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (from, key) = all[rng.below(all.len())].clone();
+                            let e = model.dirs[&from][&key].clone();
+                            let dirs = model.dir_list();
+                            let to = dirs[rng.below(dirs.len())];
+                            if e.kind == EntryKind::Directory && model.inside(e.lba, to) {
+                                continue;
+                            }
+                            let name = mutation_name(&mut rng, max_name);
+                            let new_key = folded(&name, fold);
+                            if model.dirs[&to].contains_key(&new_key)
+                                && !(to == from && new_key == key)
+                            {
+                                continue;
+                            }
+                            m.rename(from, &e.name, to, &name).expect("rename");
+                            model.dirs.get_mut(&from).unwrap().remove(&key);
+                            let mut moved = e.clone();
+                            moved.name = name;
+                            if moved.kind == EntryKind::Directory {
+                                model.parent.insert(moved.lba, to);
+                            }
+                            model.dirs.get_mut(&to).unwrap().insert(new_key, moved);
+                            counts[3] += 1;
+                        }
+                        // Change metadata.
+                        _ => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let protection = rng.next() as u32;
+                            let comment: Vec<u8> = match rng.below(3) {
+                                0 => Vec::new(),
+                                1 => b"short".to_vec(),
+                                _ => vec![b'c'; COMMENT_MAX],
+                            };
+                            let e = model.dirs.get_mut(&dir).unwrap().get_mut(&key).unwrap();
+                            m.set_metadata(
+                                e.lba,
+                                &MetaUpdate::new().protection(protection).comment(&comment),
+                            )
+                            .expect("set_metadata");
+                            e.protection = protection;
+                            e.comment = comment;
+                            counts[4] += 1;
+                        }
+                    }
+                }
+
+                let what = format!("{variant:?} @{bs} batch {batch}");
+                verify_model(m.volume(), &model, &what);
+                assert_clean(m.volume(), &what);
+            }
+
+            // Every operation was exercised, on every variant: a seed
+            // that quietly stopped deleting would otherwise still pass.
+            for (i, n) in counts.iter().enumerate() {
+                assert!(*n > 0, "{variant:?} @{bs}: operation {i} never ran");
+            }
+
+            // And the whole tree back off again returns the volume to the
+            // blocks a freshly formatted one had -- the strongest form of
+            // "no leaks in the happy path" available.
+            let mut vol = m.into_volume();
+            let mut m = Mutator::open(vol).expect("mutator");
+            loop {
+                let all = model.entry_list();
+                let mut removed = false;
+                for (dir, key) in all {
+                    let e = model.dirs[&dir][&key].clone();
+                    if e.kind == EntryKind::Directory && !model.dirs[&e.lba].is_empty() {
+                        continue;
+                    }
+                    m.delete(dir, &e.name).expect("delete");
+                    model.dirs.get_mut(&dir).unwrap().remove(&key);
+                    if e.kind == EntryKind::Directory {
+                        model.dirs.remove(&e.lba);
+                        model.parent.remove(&e.lba);
+                    }
+                    removed = true;
+                }
+                if !removed {
+                    break;
+                }
+            }
+            vol = m.into_volume();
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} emptied"));
+            assert_eq!(
+                allocated_set(&mut vol),
+                before,
+                "{variant:?} @{bs}: emptying the volume did not return every block"
+            );
+        }
+    }
+}

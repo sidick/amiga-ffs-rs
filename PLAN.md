@@ -310,9 +310,11 @@ it under a real Kickstart 3.1.
 ## Milestone 3 — mutate
 
 **In progress.** Wave 1 — the allocator and the validator's repair half,
-the two pieces everything else in this milestone stands on — is landed;
-waves 2 (create/delete/rename) and 3 (file write/append/truncate) consume
-them.
+the two pieces everything else in this milestone stands on — is landed,
+and so is wave 2: create, delete, rename and set-metadata in volumes this
+crate did not write, through `Mutator`. Wave 3 (file write/append/
+truncate) is what is left, and it is the reason two boxes below stay
+open.
 
 - [x] **Allocator**: bitmap-based block allocation with the volume's
       own policy quirks documented as discovered. `src/allocator.rs`,
@@ -373,18 +375,157 @@ them.
       and a crash sweep that stops the medium after every prefix of a
       session's writes: the damage is always leak-shaped (`OrphanBlock`
       allowed) and `ReachableButFree` never appears.
-- [ ] **Create/delete/rename** in existing volumes: hash-chain
+- [x] **Create/delete/rename** in existing volumes: hash-chain
       insertion/removal under both fold tables, dircache invalidation
-      (`DOS\4`/`5`: update or clear, never leave stale).
+      (`DOS\4`/`5`: update or clear, never leave stale). `Mutator` in
+      `src/mutate.rs` — a session holding a `Volume` and an `Allocator`,
+      because reading a 2 GB volume's bitmap once per created file would
+      dominate everything else, and holding nothing *but* those two,
+      because a cached anything is a second copy of the volume to keep in
+      step. Every public operation leaves the volume consistent, so there
+      is no `finish()` to forget: that is affordable here and not in
+      `Populator` precisely because nothing in this module ever lets the
+      bitmap say "free" about a block something reaches, so the flag stays
+      −1 throughout.
+
+      **Block assembly moved to a shared module** (`src/build.rs`,
+      crate-private): the header block's two name layouts, the `T_COMMENT`
+      block, the OFS/FFS data block, the dircache block and its records.
+      `Populator` was refactored onto it rather than copied from — a
+      second implementation of "where does an LNFS comment go" is a second
+      chance to put it at the classic offset, which is the mistake this
+      crate exists to not make.
+
+      Four decisions worth stating.
+
+      **Deleting the target of a hard link is refused**
+      (`MutateError::LinkedTo`), and the reason is that the two shipping
+      implementations produce *different volumes*. AmigaOS promotes — its
+      own documentation: "if the object a hard link points to is deleted,
+      then the first hard link in the chain is altered so that it becomes
+      the new file header block. The original file header block is then
+      freed" — so the object's header block changes number, invalidating
+      every pointer to it including its children's `parent` longwords.
+      Linux's `affs` does the opposite and says why: "we can't remove the
+      head of the link, as its blocknr is still used as ino, so we remove
+      the block of the first link instead" (`affs_remove_link`), so it
+      keeps the original block, copies the *link's* name into it,
+      re-inserts it into the **link's** directory and frees the link — the
+      file survives under another name in another directory. ADFlib
+      refuses links outright, amitools has no link code at all, and AROS's
+      `afs.handler` defines `BLK_ORIGINAL`/`BLK_LINKCHAIN` and never reads
+      them, so its delete leaves the links dangling. Either shipping
+      behaviour rewrites several blocks with no ordering that makes an
+      interruption harmless. Refusing keeps the choice open and rules out
+      the one outcome nobody wants; deleting the links first and then the
+      target works today, and is what the refusal points a caller at.
+      Deleting a *link* is implemented: it is spliced out of its target's
+      −10 chain while still reachable from its directory, then unlinked,
+      then freed.
+
+      **Dircaches are regenerated, not patched.** The affected directory's
+      whole chain is rebuilt from its hash chains after every create,
+      delete, rename and metadata change, reusing blocks where the chain
+      is no longer than before, allocating where it grew and freeing where
+      it shrank. Surgical editing would be less I/O and one more place to
+      leave the cache disagreeing with the chains; regeneration cannot,
+      because the chains are the input. The chain is written *backwards*,
+      last block first, so a `next` pointer never names a block that is
+      not there yet. Every mutation test asserts zero `DircacheStale`
+      findings afterwards.
+
+      **The parent's date is stamped — when the caller supplies a clock.**
+      The question was settled by reading four implementations, which do
+      not agree. amitools' `xdftool` stamps the parent's longword −23 *and*
+      the root's −10 on every create and delete (`ADFSDir._create_node`
+      and `_delete` both end in `update_dir_mod_time()` +
+      `volume.update_disk_time()`). Linux's `affs` stamps the parent
+      (`affs_insert_hash`/`affs_remove_hash` both mark the directory inode
+      dirty, which `affs_write_inode` writes to `change`/`root_change`,
+      −23) but writes the root's −10 only from `affs_commit_super`, on
+      sync and unmount. ADFlib stamps the parent in `adfCreateEntry` only
+      when the entry becomes a slot's head and never in `adfRemoveEntry`.
+      AROS stamps nothing on create or delete and every ancestor up to the
+      root on a *write*. This crate follows amitools, the closest thing to
+      a real-Amiga reference among them — but it is `no_std` and has no
+      clock, so `Mutator::clock` supplies "now" and **until it is set no
+      date is written at all**: a wrong date on the disk is worse than an
+      old true one.
+
+      **A rename unlinks before it relinks.** The entry is unreachable in
+      between — a leak, recoverable — where the other order would put one
+      block in two chains with one `hash_chain` longword to serve both.
+      The new slot's head is read *after* the unlink, because for a
+      same-slot rename (which is what a change of case is) the unlink is
+      exactly what changed it. Renaming a directory into its own subtree
+      is refused by walking `parent` pointers upward with a cycle guard,
+      since the volume may already contain the loop.
+
+      Tested by: creates into an existing tree on every variant ×
+      {512, 4096} with a file that crosses an extension block; head/middle
+      /tail chain splicing; the refusals (non-empty directory, duplicate,
+      linked-to, own subtree, bad names, the root); case-only and Latin-1
+      renames under both fold tables; LNFS renames crossing the merged
+      field's capacity in both directions, with the comment moving
+      inline↔overflow and the block count moving with it; `set_metadata`
+      on every variant; dircache agreement after 30 creates, 25 deletes, a
+      rename and a metadata change at two block sizes; **a create and its
+      delete returning the volume to byte-identical block accounting**; a
+      seeded random interleave of all five operations against a
+      `BTreeMap` model on all eight variants × {512, 4096}, compared field
+      by field and byte by byte after every batch and emptied back down to
+      the blocks a fresh format had; a crash sweep (below); and a
+      differential leg where xdftool lists a mutated volume, reads every
+      byte out of it, writes into the bitmap this crate edited in place —
+      and where the same operation sequence run through both
+      implementations produces the same tree, the same file bytes and the
+      same used-block count.
 - [ ] **File write/append/truncate**: FFS chains and OFS headers both.
 - [ ] **Crash-shape discipline**: data blocks before metadata, chain
       pointers flipped last, bitmap updated in an order that at worst
       *leaks* blocks (validator-recoverable) rather than double-uses
       them. The format has no journal; ordering is all there is.
+
+      **Held open for wave 3, and only for wave 3.** Every write path that
+      exists is swept: `tests/volumes.rs` stops the medium after each
+      successive write of an allocator session (wave 1), of a repair
+      (wave 1) and of a mutation session that creates a directory, creates
+      a file with an overflowing comment, renames and deletes (wave 2), on
+      a plain, a dircache and a long-name variant. The damage is always
+      leak-shaped: `OrphanBlock` is allowed, `ReachableButFree` never
+      appears, every entry still reachable still reads, and — the one
+      addition this wave needed — `DircacheStale` is allowed on the two
+      variants that have caches and nowhere else, because a cache is
+      advisory, a half-written one is what every dircache-unaware tool
+      leaves behind, and `validate()` saying so is the mechanism by which
+      it gets rebuilt.
+
+      What wave 3 must add before this is ticked: the same sweep over
+      **file write, append and truncate** — data blocks down before the
+      pointer table naming them, `high_seq` and `byte_size` moved in an
+      order that never claims a block the chain does not have, and the
+      truncate direction's frees after the header shrinks rather than
+      before. That is the one ordering in the format where the *content*
+      block and the *metadata* block are both being changed at once, and
+      it is the reason the box is not being ticked on the entry
+      operations alone.
 - [ ] **Differential mutation tests**: same operation sequence applied
       through this crate and through the guest's own filesystem on a
       copy; resulting volumes must agree (allowing documented
       don't-care fields — dates, allocation order).
+
+      **Partly landed** — the oracle leg is done and the guest leg is
+      not. `tests/differential.rs` runs the same sequence (makedir, two
+      writes, a delete, a write) through xdftool and through `Mutator`,
+      and the resulting trees agree entry for entry, byte for byte, and
+      on the used-block count; separately, xdftool lists, reads and
+      *writes into* a volume this crate mutated. The don't-cares are the
+      two predicted ones and no others: allocation order (this crate
+      scans forward from a hint, xdftool from the bottom of the bitmap)
+      and dates (the caller's to supply here, the wall clock's there).
+      What remains is the same exercise against a guest's own FFS
+      handler under Copperline, which is the milestone-1 differential
+      box's remaining leg too and needs the same fixture pipeline.
 - [x] **Validator repair**: the write-side half of `validate()`, doing
       what the ROM disk-validator does. `Volume::repair()` in
       `src/repair.rs`, and the first consumer of the allocator.

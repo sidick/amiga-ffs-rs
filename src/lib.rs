@@ -42,8 +42,10 @@
 //! [`populate`] (filling one: directories, files, metadata, and a
 //! host directory tree under `std`), [`allocator`] (block allocation
 //! against a volume that already has something in it, with the
-//! mark-then-use ordering in the types) and [`repair`] (rebuilding a
-//! bitmap from the same walk [`validate`] performs).
+//! mark-then-use ordering in the types), [`repair`] (rebuilding a
+//! bitmap from the same walk [`validate`] performs) and [`mutate`]
+//! (creating, deleting, renaming and re-describing entries in a volume
+//! that already exists).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -61,17 +63,21 @@
 //! `populate::populate_from_tree` turning a host directory into an image
 //! in one call under the `std` feature.
 //!
-//! Milestone 3 (mutate) is in progress, and its foundation is here:
-//! [`Allocator`] hands out blocks from an existing volume's own bitmap —
-//! refusing one that is mid-update, tracking dirty pages, and making the
-//! crash ordering visible in the types ([`Allocation::block`] to write a
-//! block, [`Allocator::reference`] to point at one, and it refuses until
-//! the bitmap page is on the disk) — and [`Volume::repair`] rebuilds a
-//! damaged bitmap from the reachability walk, adding allocation and never
-//! removing it. What is still *not* here: creating, deleting and renaming
-//! entries in an existing volume, and writing or truncating a file's data.
-//! Those are the waves that consume the allocator, and [`Populator`] stays
-//! deliberately shaped so that it never has to do any of them.
+//! Milestone 3 (mutate) is in progress. [`Allocator`] hands out blocks
+//! from an existing volume's own bitmap — refusing one that is
+//! mid-update, tracking dirty pages, and making the crash ordering
+//! visible in the types ([`Allocation::block`] to write a block,
+//! [`Allocator::reference`] to point at one, and it refuses until the
+//! bitmap page is on the disk) — and [`Volume::repair`] rebuilds a damaged
+//! bitmap from the reachability walk, adding allocation and never removing
+//! it. On top of those, [`Mutator`] creates, deletes and renames entries
+//! in a volume this crate did not write, and changes their metadata:
+//! hash-chain splicing under both fold tables, `T_COMMENT` blocks moving
+//! in and out as an LNFS name grows past what the merged field holds,
+//! `DOS\4`/`DOS\5` dircaches regenerated from the chains they cache, and
+//! a write order at every step whose worst crash outcome is a leak.
+//! What is still *not* here: writing, appending to or truncating a file's
+//! data, which is the last wave.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -79,11 +85,20 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod bitmap;
+/// Pure block assembly, shared by the two writers.
+///
+/// Deliberately crate-private: it is the *shape* of a header block, a
+/// comment block, a data block and a dircache record, factored out of
+/// [`populate`] when [`mutate`] turned out to need exactly the same bytes.
+/// Two copies of that would be two chances to put an LNFS comment at the
+/// classic offset.
+mod build;
 pub mod dircache;
 pub mod file;
 pub mod format;
 pub mod layout;
 pub mod meta;
+pub mod mutate;
 pub mod populate;
 pub mod read;
 pub mod repair;
@@ -104,6 +119,7 @@ pub use bitmap::Bitmap;
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
 pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
+pub use mutate::{MetaUpdate, MutateError, Mutator};
 pub use populate::{Metadata, PopulateError, Populator};
 pub use repair::{Action, RepairOptions, RepairReport};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
