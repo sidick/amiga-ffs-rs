@@ -36,8 +36,21 @@ plan, which owns everything outside the partition.
 - [ ] **File reading**: FFS data-block chains via file-header block
       lists and extension blocks; OFS data blocks with their headers
       (and use those headers to *verify*, since they're there).
-- [ ] **Metadata**: protection bits, comments, dates (ticks since
-      1978-01-01, the 1900-leap-year rules), UID/GID where present.
+- [ ] **Metadata**: protection bits — the full 32-bit long, including
+      the group/other RWED bits — comments, dates (ticks since
+      1978-01-01, the 1900-leap-year rules), and the owner longword
+      (UID/GID). Owner and the extended bits are first-class, not
+      "where present": muFS is in scope (below), and plain FFS carries
+      the same fields zeroed.
+- [ ] **muFS**: the MultiUser filesystem is *in scope* — it is not
+      another family but FFS with the owner field and extended
+      permission bits actually used and enforced. Same blocks, same
+      hashing, same chains. Work item: survey the dostype values real
+      muFS volumes carry (`muFS` = 0x6D754653 is documented; confirm
+      whether per-variant `muF\x` forms exist in the wild) and map
+      them onto the same `Variant` axes rather than a parallel enum.
+      Enforcement semantics (who may read what) stay with the
+      consumer — this crate reports ownership, it doesn't police it.
 - [ ] **Hard/soft links**: link chains resolved, loops refused.
 - [ ] **Dircache blocks** (`DOS\4`/`DOS\5`): read them, but treat the
       hash chains as authoritative — caches go stale, and a reader
@@ -107,8 +120,10 @@ Gated on the milestone-1 validator and differential suite.
 ## Non-goals
 
 - **Partition tables** — amiga-rdb's job, composed via the seam.
-- **Other filesystem families** (PFS3, SFS, muFS) — own crates, per
-  the one-family-per-crate rule.
+- **Other filesystem families** (PFS3, SFS) — own crates, per the
+  one-family-per-crate rule. (muFS is *not* on this list: it is FFS
+  with the owner/permission fields used, and is in scope — see
+  milestone 1.)
 - **Hunk loading, bootblock execution** — bytes in, bytes out.
 - **A VFS/handler layer** — DosPacket semantics live in the consumer
   (m68k-machine's transport card, a FUSE wrapper, whatever); this
