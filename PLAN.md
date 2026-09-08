@@ -939,6 +939,65 @@ observe.
 
 ## In scope, not scheduled
 
+- **Block layout policy, and compaction** — one subject, at two points
+  in a volume's life. The premise: this crate's output is not only
+  emulator images. It writes filesystems that land on **real Amiga
+  hardware** — CF cards, real drives, real floppies — where a seek is a
+  head stepping across a platter and costs milliseconds, not an offset
+  into a host file costing nothing. Layout is therefore a durable
+  property of every image shipped, not a tuning detail.
+
+  The format itself is the evidence. The root sits at the *midpoint* of
+  the volume — the whole reason `canonical_root_lba` exists and the
+  reason a resize has to move it — so that a seek to the root is on
+  average half a disk from anywhere. On a DD floppy (80 cylinders × 2
+  heads × 11 sectors = 1760 blocks, so 22 blocks to a cylinder) block
+  880 is dead centre, and a file laid contiguously inside one cylinder
+  costs *zero* head steps to read where the same file scattered costs a
+  step per block. A design that put its root in the middle was designed
+  around seek.
+
+  So, in the order they should be built:
+
+  1. **Policy at creation.** `format` and `Populator` already produce
+     contiguous files, but by accident of a forward-cursor allocator
+     rather than by stated policy. Make it a policy with the reasoning
+     attached and the allocator hint-driven: a file's data adjacent to
+     its header, a directory's children near the directory, the
+     metadata a boot touches clustered near the root. This is where
+     most of the value is, because it costs nothing at build time and
+     every image gets it.
+  2. **Compaction of an existing volume** — the same policy applied
+     retroactively, which is the defragmenter. Relocating a block is
+     copy-then-flip (allocate, write content, update the one pointer
+     that names it, free the old), so every intermediate state is the
+     old volume plus a leak: *safer* than the in-place file overwrite
+     this crate already ships, and covered by the M3 allocator's
+     mark-then-use discipline and `repair()`. Two tiers, very different
+     in cost: **data blocks only** touches just that file's own header
+     and extension tables, and gets most of the benefit; **header
+     blocks** additionally require re-pointing the parent's hash chain,
+     the children's parent longwords, `real_entry`/`next_link` chains
+     and the dircache record — doable (resize does the root-move
+     version of exactly this) but where the bugs would live.
+  3. **Which closes resize's real gap.** `resize()` today refuses a
+     shrink when user data occupies the new root's target
+     (`RootTargetOccupied`), so on a volume packed from `reserved`
+     upward — this crate's own allocator's normal output — the
+     achievable minimum can be about twice the theoretical floor.
+     Relocation is precisely what turns that refusal into a move, and
+     makes `minimum_size()` report the floor rather than what the
+     current implementation will accept. Compaction is not merely a
+     companion to shrink; it is what lets shrink reach its limit.
+
+  **Survey before designing the policy**, the way the allocator and the
+  LNFS layout were surveyed: ReOrg and the other commercial Amiga
+  defragmenters had opinions tuned against real drives and real FFS
+  read-ahead, and those opinions are worth more than first principles.
+  One modern wrinkle for the notes: CF and SD-via-adapter have no seek
+  cost but do have erase blocks, so contiguity still pays while
+  cylinder-alignment reasoning does not transfer.
+
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and
   extended permission bits actually used and enforced; same blocks,
