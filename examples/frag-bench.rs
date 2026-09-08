@@ -14,7 +14,7 @@
 
 use amiga_ffs::format::FormatOptions;
 use amiga_ffs::mutate::Mutator;
-use amiga_ffs::populate::Metadata;
+use amiga_ffs::populate::{Metadata, Populator};
 use amiga_ffs::{BlockSink, BlockSource, Variant, Volume};
 
 const BLOCKS: u64 = 1760; // DD floppy
@@ -61,14 +61,44 @@ fn blank() -> MemDisk {
     MemDisk(vec![0u8; (BLOCKS * 512) as usize])
 }
 
-/// Describe a file's data-block layout: how many ascending runs it takes,
+/// The full sequence of blocks a streaming read actually touches, in
+/// fetch order: data blocks, with each `T_LIST` extension block spliced
+/// in exactly where a reader fetches it -- between the last data block
+/// of the table it closes and the first data block of the table it
+/// opens. Counting runs over `FileChain::blocks` alone is a metric that
+/// can lie: an extension block placed *between* two data blocks in LBA
+/// order reads as a broken run even when nothing is out of place on
+/// disk, and (as this experiment exists to check) an extension block
+/// placed *away* from the stream costs real seeks that a data-pointer-
+/// only count would miss entirely. This is what a "1 run" claim has to
+/// mean instead: the head never seeks, table boundary or not.
+fn read_path_sequence(chain: &amiga_ffs::FileChain, block_size: usize) -> Vec<u32> {
+    let slots = amiga_ffs::hash_table_size(block_size) as usize;
+    let mut out = Vec::with_capacity(chain.blocks.len() + chain.extensions.len());
+    for (i, &b) in chain.blocks.iter().enumerate() {
+        out.push(b);
+        // A table has `slots` data pointers; the block fetched right
+        // after the last one in a table is the extension block that
+        // opens the next table, if there is one.
+        if (i + 1) % slots == 0 {
+            let ext_index = (i + 1) / slots - 1;
+            if let Some(&ext) = chain.extensions.get(ext_index) {
+                out.push(ext);
+            }
+        }
+    }
+    out
+}
+
+/// Describe a file's on-disk read-path layout: how many ascending runs
+/// it takes (data blocks and extension blocks together, in fetch order),
 /// and how far the head would travel reading it in order.
 fn describe(disk: MemDisk, name: &[u8]) -> (MemDisk, String) {
     let mut vol = Volume::open(disk, None).expect("open");
     let root = vol.root_lba();
     let entry = vol.lookup(root, name).expect("lookup").expect("present");
     let chain = vol.file_chain(entry.lba).expect("chain");
-    let blocks = &chain.blocks;
+    let blocks = read_path_sequence(&chain, vol.block_size());
 
     let mut runs = 1usize;
     let mut travel = 0u64;
@@ -79,8 +109,10 @@ fn describe(disk: MemDisk, name: &[u8]) -> (MemDisk, String) {
         travel += (w[1] as i64 - w[0] as i64).unsigned_abs();
     }
     let desc = format!(
-        "{} blocks, {} run(s), first {}, last {}, total head travel {} blocks",
-        blocks.len(),
+        "{} data blocks + {} ext block(s), {} run(s) in fetch order, first {}, last {}, \
+         total head travel {} blocks",
+        chain.blocks.len(),
+        chain.extensions.len(),
         runs,
         blocks.first().copied().unwrap_or(0),
         blocks.last().copied().unwrap_or(0),
@@ -90,16 +122,29 @@ fn describe(disk: MemDisk, name: &[u8]) -> (MemDisk, String) {
     (vol.into_inner(), desc)
 }
 
+/// The volume this experiment cares about, built the way an image
+/// actually gets built: [`Populator`], not [`Mutator`]. Wave 1 of the
+/// block layout policy (`docs/layout-survey.md` §6a and its wave-1
+/// addendum, `src/populate.rs`'s "Block layout policy" section) puts
+/// `Populator`'s file-data cursor to work here: the header lands near the
+/// root with the rest of its directory's metadata, and every data block
+/// *and* `T_LIST` extension block of the file is one contiguous physical
+/// run, extension blocks interleaved at their natural position in the
+/// stream rather than pulled away to the root cluster -- measured both
+/// ways through a real ROM, and interleaved won. `Mutator`'s own
+/// placement is unchanged by this wave (it is wave 2/3 territory --
+/// passive reorganisation on existing volumes), so building the
+/// *contiguous* baseline through it would still show the fragmented
+/// number the survey originally measured, not the policy this crate now
+/// states.
 fn build_contiguous() -> MemDisk {
-    let mut disk = blank();
+    let disk = blank();
     let opts = FormatOptions::new(Variant::FfsIntl, BLOCKS, b"Contig");
-    amiga_ffs::format(&mut disk, &opts).expect("format");
-    let vol = Volume::open(disk, None).expect("open");
-    let root = vol.root_lba();
-    let mut m = Mutator::open(vol).expect("mutator");
-    m.create_file(root, b"Payload", &Metadata::new(), &payload())
+    let mut pop = Populator::new(disk, &opts).expect("populate");
+    let root = pop.root_lba();
+    pop.create_file(root, b"Payload", &Metadata::new(), &payload())
         .expect("create");
-    m.into_volume().into_inner()
+    pop.finish().expect("finish")
 }
 
 fn build_fragmented() -> MemDisk {

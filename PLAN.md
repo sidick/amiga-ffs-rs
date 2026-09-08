@@ -947,6 +947,42 @@ observe.
   into a host file costing nothing. Layout is therefore a durable
   property of every image shipped, not a tuning detail.
 
+  **Wave 1 landed**: `docs/layout-survey.md` (the survey this entry
+  itself asked for, done first, plus a wave-1 addendum to §4a — see
+  below) and policy-at-creation, item 1 below. `Allocator`
+  (`src/allocator.rs`) gained an explicit `Intent` vocabulary
+  (`DataFor`/`HeaderIn`/`MetadataNearRoot`/`Anywhere`), each reducing to a
+  hint over the existing first-fit scan, and `allocate_run` for
+  contiguous-extent reservation with a documented graceful-degradation
+  fallback — machinery, not yet wired into `Mutator`'s own day-to-day
+  writes. `Populator` (`src/populate.rs`) now allocates from two forward
+  cursors instead of one: a metadata cursor starting next to the root
+  (directory and file headers, dircache blocks, comment overflow — what
+  a directory walk touches once, at open or during the walk) and a data
+  cursor over the volume's other half (file content, *and* `T_LIST`
+  extension blocks interleaved at their natural position in the write
+  order). The extension-block placement was not a first guess: an
+  earlier version of this wave put them with the header, on the
+  (wrong) theory that an index structure is metadata; a real-ROM
+  measurement (`examples/frag-bench.rs`, same rig as §4a) showed that
+  cost 21 s against 19 s for interleaved, because an extension block is
+  fetched mid-stream by a reader already reading the file, not once at
+  open the way a header is — pulling it to the root cluster inserts two
+  long seeks per extension boundary instead of zero. Interleaved is what
+  shipped. The net effect: a large file's data-and-extension sequence is
+  one contiguous physical run instead of several — measured on
+  `examples/frag-bench.rs`'s 391-block file, both through the run-count
+  metric (six runs before, one after, counted over the full fetch-order
+  sequence rather than data pointers alone) and through the real-ROM
+  timing already on record in §4a. `format()`'s own output is untouched
+  (the differential test against xdftool still agrees block for block);
+  the policy only changes what `Populator` adds on top of it. Items 2
+  and 3 below — compaction, and passive reorganisation through
+  `Mutator` — are still open; so is `Mutator` ever adopting `Intent` for
+  its own placement, which is a deliberate wave-1 non-goal, not an
+  oversight (frag-bench's *fragmented* image is still built through
+  `Mutator`, unchanged, on purpose).
+
   The format itself is the evidence. The root sits at the *midpoint* of
   the volume — the whole reason `canonical_root_lba` exists and the
   reason a resize has to move it — so that a seek to the root is on

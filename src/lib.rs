@@ -120,7 +120,7 @@ pub use read::{
     DateStamp, DostypeSource, Entry, EntryKind, Error, RootBlock, Volume, DEFAULT_RESERVED,
 };
 
-pub use allocator::{AllocError, Allocation, Allocator};
+pub use allocator::{AllocError, Allocation, Allocator, Intent};
 pub use bitmap::Bitmap;
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;

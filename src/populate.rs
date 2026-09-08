@@ -83,6 +83,89 @@
 //! and `CAFÉ` are the same name on the intl ones — is refused. AmigaDOS
 //! would happily create the second one and then be unable to open either
 //! reliably; this refuses instead.
+//!
+//! # Block layout policy: two cursors, not one
+//!
+//! See `docs/layout-survey.md` §6a and [`crate::allocator`]'s own "Block
+//! layout policy" section for the evidence; this is that policy's
+//! implementation for a populator specifically, and it differs from
+//! [`Allocator`](crate::Allocator)'s [`Intent`](crate::Intent)-driven one
+//! because a populator has no bitmap to scan a hint against — only a
+//! known-free extent and a cursor that never revisits a block. So instead
+//! of resolving a hint per allocation, this module keeps **two** cursors
+//! open for the whole session:
+//!
+//! - **The metadata cursor** starts at `format_span.1` — the block
+//!   immediately after everything [`format`](crate::format()) wrote, which
+//!   begins *at* the root — and serves every directory header, file
+//!   header, dircache block and LNFS comment-overflow block. Every one of
+//!   those is something a directory walk touches (survey §2's
+//!   hold-cache argument), so starting right next to the root and never
+//!   moving elsewhere keeps the whole set within a bounded distance of it
+//!   by construction, not by measurement after the fact.
+//! - **The data cursor** starts at `reserved`, the volume's very first
+//!   allocatable block, and serves file content. On a freshly formatted
+//!   volume the root sits at the midpoint (`canonical_root_lba`), so this
+//!   is the *other* half of the volume from the metadata cursor — the two
+//!   cannot collide while each stays inside its own half, which mirrors
+//!   ReOrg's own "directory area and file area... stored consecutively"
+//!   free-space mode (survey §1) rather than inventing a new one. If the
+//!   data cursor's half fills first (a data-heavy volume), it falls in
+//!   behind the metadata cursor and the two share one frontier from then
+//!   on — graceful degradation, not a hard limit at the halfway mark.
+//!
+//! **Where `T_LIST` extension blocks go — measured, not just reasoned.**
+//! A first pass at this policy put extension blocks with the header, on
+//! the theory that an extension block is an index structure rather than
+//! file content. That theory is wrong about what a reader actually does
+//! with one: `T_LIST` is **streaming** structure, not directory
+//! structure. A header is read once, at open, before any data read is in
+//! flight; a directory's dircache is read during a walk with no file
+//! read in flight either. An extension block is different in kind — it
+//! is fetched *mid-stream*, between the last data block of the table it
+//! closes and the first data block of the table it opens, by a reader
+//! that is actively reading the file's bytes and immediately needs the
+//! next pointer to keep going. Pulling it away to the root cluster does
+//! not remove it from the read path the way a header's one-time fetch
+//! can be amortized; it inserts two long seeks — root to stream position
+//! and back — into the middle of every extension-block boundary. This
+//! was measured, not just reasoned about: the same real-Kickstart-3.1
+//! rig `docs/layout-survey.md` §4a uses timed both placements, root
+//! cluster against interleaved, on the identical 391-block file, and
+//! interleaved won (19 s versus 21 s — see the addendum in §4a). So
+//! extension blocks are allocated from the **data cursor**, at their
+//! natural position in the write order — between the two data blocks
+//! either side of them, exactly where `TL_EXTENSION` already chains them
+//! — which keeps them physically adjacent to the stream instead of
+//! detached from it.
+//!
+//! One consequence worth being honest about: a data-block run that
+//! crosses an extension block is not a single *ascending* LBA run in the
+//! narrowest sense ([`FileChain::blocks`](crate::FileChain::blocks) alone
+//! has a one-block gap at each extension boundary) — but it is one
+//! physically contiguous run on the medium, which is the property that
+//! actually costs seeks, and the one a correct run-count has to measure:
+//! the full sequence a reader's head travels, extension blocks spliced
+//! in at the point the read path fetches them, not the data pointers
+//! alone. (OFS's own per-block header and checksum do not change any of
+//! this: a data block is still one LBA in the chain either way, raw
+//! payload on FFS or six longwords shorter on OFS.)
+//!
+//! **Headers are still different, and still near the root.** A file's
+//! header is not part of the stream the way an extension block is — it
+//! is consulted once, to find `byte_size` and the first data pointer,
+//! before streaming starts, the same one-time cost a directory walk pays
+//! for every header it touches. So it keeps the metadata-cursor
+//! placement the survey's top recommendation asks for (§6a-2): near the
+//! root, with the rest of its directory's metadata, not next to its own
+//! data. The trade this gives up — a header immediately adjacent to its
+//! file's first data block, true by accident of the single forward
+//! cursor before this policy existed (survey §6a-3) — is deliberate and
+//! stays deliberate: metadata locality is the effect ReOrg's own author
+//! called dominant (survey §1) and the one that transfers to every
+//! medium including flash (survey §3), while a header pays its distance
+//! from the root exactly once per open, not once per extension-block
+//! boundary the way a misplaced `T_LIST` block would.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -412,8 +495,25 @@ pub struct Populator<S: BlockMedium> {
     /// contiguously — and it does, by construction and by test.
     format_span: (u64, u64),
     bitmap_pages: Vec<u64>,
-    /// The next block to hand out. Never inside `format_span`.
-    next_free: u64,
+    /// The metadata cursor: headers, dircache blocks, comment-overflow
+    /// blocks and `T_LIST` extension blocks. Starts at `format_span.1`,
+    /// next to the root. See the module documentation's "Block layout
+    /// policy" section.
+    next_meta: u64,
+    /// The data cursor: file content only. Starts at `reserved`. Once it
+    /// reaches `format_span.0` its own half is full and it falls in
+    /// behind `next_meta`, at which point `merged` is set and the two
+    /// cursors share one frontier for the rest of the session.
+    next_data: u64,
+    /// Set the first time the data cursor's half fills and it starts
+    /// sharing `next_meta`'s frontier instead of its own.
+    merged: bool,
+    /// Blocks the data cursor has handed out, counted directly rather
+    /// than derived from cursor positions — which stop meaning "blocks
+    /// used" on their own once `merged` makes them share a frontier.
+    data_used: u64,
+    /// Blocks the metadata cursor has handed out, counted the same way.
+    meta_used: u64,
     buf: Vec<u8>,
 }
 
@@ -463,11 +563,19 @@ impl<S: BlockMedium> Populator<S> {
             root_lba: layout.root_lba,
             format_span: span,
             bitmap_pages: layout.bitmap_pages.clone(),
-            next_free: opts.reserved,
+            next_meta: span.1,
+            next_data: opts.reserved,
+            merged: false,
+            data_used: 0,
+            meta_used: 0,
             buf: vec![0u8; block_size],
         };
-        if me.next_free >= span.0 {
-            me.next_free = span.1;
+        if me.next_data >= span.0 {
+            // No room below the root at all (a volume small enough that
+            // `reserved` already reaches it): the data cursor has no half
+            // of its own to start in, so begin merged rather than
+            // pretending there is a boundary to reach.
+            me.merged = true;
         }
         // Say out loud that the bitmap is mid-update, before anything is
         // allocated against it. An interrupted populate then leaves a
@@ -494,15 +602,10 @@ impl<S: BlockMedium> Populator<S> {
     }
 
     /// Blocks allocated so far: the format's own, plus everything this
-    /// populator has handed out.
+    /// populator has handed out from either cursor.
     pub fn blocks_used(&self) -> u64 {
-        let mine = self.next_free.saturating_sub(self.reserved);
-        let formatted = if self.format_span.0 >= self.next_free {
-            self.format_span.1 - self.format_span.0
-        } else {
-            0
-        };
-        mine + formatted
+        let formatted = self.format_span.1 - self.format_span.0;
+        formatted + self.data_used + self.meta_used
     }
 
     /// Blocks still free.
@@ -534,9 +637,19 @@ impl<S: BlockMedium> Populator<S> {
     /// session started in.
     pub fn finish(mut self) -> Result<S, PopulateError<Transport<S>>> {
         let bs = self.block_size;
+        // The data cursor's own half only ever ran up to `format_span.0`
+        // before falling in behind the metadata cursor -- see `merged`'s
+        // documentation -- so once merged, everything it claimed after
+        // that point is already inside `format_span.1..next_meta`.
+        let data_hi = if self.merged {
+            self.format_span.0.min(self.next_data)
+        } else {
+            self.next_data
+        };
         let ranges = [
-            self.reserved..self.next_free,
+            self.reserved..data_hi,
             self.format_span.0..self.format_span.1,
+            self.format_span.1..self.next_meta,
         ];
         let words = pack_ranges(self.reserved, self.block_count, &ranges, bs);
         let words_per_page = (bs - OFF_BITMAP_BITS) / 4;
@@ -612,7 +725,7 @@ impl<S: BlockMedium> Populator<S> {
         // pointing at a block that was never written is the one shape the
         // write order exists to rule out.
         if self.variant.has_dircache() {
-            let dc = self.alloc()?;
+            let dc = self.alloc_meta()?;
             self.write_dircache_block(dc, prep.lba, &[])?;
             wr32(&mut hdr, tail(bs, TL_EXTENSION), dc as u32);
         }
@@ -697,11 +810,21 @@ impl<S: BlockMedium> Populator<S> {
                 return Err(PopulateError::FileTooLarge { len: total });
             }
 
-            // A full table means a new extension block, allocated before
-            // the data block it will point at so the file's blocks stay
-            // in ascending order on the medium.
+            // A full table means a new extension block. Unlike a header
+            // or a dircache block -- read once, at open or during a
+            // directory walk, with no data read in flight -- a `T_LIST`
+            // block is *streaming* structure: a reader fetches it
+            // mid-stream, between the last data block of the table it
+            // closes and the first of the table it opens, and never
+            // touches it again. So it comes from the **data cursor**,
+            // allocated at its natural position in the stream, which
+            // keeps it physically adjacent to the data either side of it
+            // -- see the module documentation's "Block layout policy"
+            // section, and `docs/layout-survey.md` §4a's addendum: this
+            // was measured both ways through a real ROM, and interleaved
+            // won.
             if in_table == slots {
-                let ext_lba = self.alloc()?;
+                let ext_lba = self.alloc_data()?;
                 match ext.take() {
                     None => wr32(&mut hdr, tail(bs, TL_EXTENSION), ext_lba as u32),
                     Some((prev, mut prev_buf)) => {
@@ -718,7 +841,7 @@ impl<S: BlockMedium> Populator<S> {
                 in_table = 0;
             }
 
-            let lba = self.alloc()?;
+            let lba = self.alloc_data()?;
             seq += 1;
             if seq == 1 {
                 wr32(&mut hdr, OFF_FIRST_DATA, lba as u32);
@@ -811,12 +934,16 @@ impl<S: BlockMedium> Populator<S> {
             next = chain;
         }
 
-        let lba = self.alloc()?;
+        // The header itself: a directory walk touching this entry reads
+        // this block, so it is metadata, allocated near the root along
+        // with everything else a walk touches. See the module
+        // documentation's "Block layout policy" section.
+        let lba = self.alloc_meta()?;
         // The comment goes in its own block only when the name left no
         // room beside it — which can only happen on LNFS, where the two
         // share one 112-byte field.
         let comment_block = if needs_comment_block(self.variant, name.len(), meta.comment.len()) {
-            let cb = self.alloc()?;
+            let cb = self.alloc_meta()?;
             let mut buf = vec![0u8; self.block_size];
             build_comment_block(&mut buf, cb, lba, meta.comment);
             self.write(cb, &buf)?;
@@ -934,7 +1061,7 @@ impl<S: BlockMedium> Populator<S> {
             return self.put_checked(block);
         }
 
-        let fresh = self.alloc()?;
+        let fresh = self.alloc_meta()?;
         self.write_dircache_block(fresh, dir, &record)?;
         self.read_checked(block)?;
         wr32(&mut self.buf, OFF_DIRCACHE_NEXT, fresh as u32);
@@ -986,26 +1113,47 @@ impl<S: BlockMedium> Populator<S> {
 
     // -- allocation and block I/O ------------------------------------------
 
-    /// The next free block, upward from the first one the volume has.
-    ///
-    /// Starting at `reserved` rather than after the root uses the whole
-    /// volume — half of it lives *below* the root, which sits at the
-    /// midpoint — and the only run to step over is the format's own,
-    /// which is contiguous.
-    fn alloc(&mut self) -> Result<u64, PopulateError<Transport<S>>> {
-        if self.next_free >= self.format_span.0 && self.next_free < self.format_span.1 {
-            self.next_free = self.format_span.1;
+    /// The next block for file content: the data cursor's own half of the
+    /// volume, below the root, until that fills — see the module
+    /// documentation's "Block layout policy" section.
+    fn alloc_data(&mut self) -> Result<u64, PopulateError<Transport<S>>> {
+        if !self.merged {
+            if self.next_data < self.format_span.0 {
+                let lba = self.next_data;
+                self.next_data += 1;
+                self.data_used += 1;
+                return Ok(lba);
+            }
+            // The data cursor's half is full: fall in behind the metadata
+            // cursor and share its frontier from here on.
+            self.merged = true;
         }
-        if self.next_free >= self.block_count {
+        let lba = self.take_meta_frontier()?;
+        self.data_used += 1;
+        Ok(lba)
+    }
+
+    /// The next block for a header, dircache block, comment-overflow
+    /// block or `T_LIST` extension block: the metadata cursor, which
+    /// starts next to the root and only ever moves up from there.
+    fn alloc_meta(&mut self) -> Result<u64, PopulateError<Transport<S>>> {
+        let lba = self.take_meta_frontier()?;
+        self.meta_used += 1;
+        Ok(lba)
+    }
+
+    /// Hand out `next_meta` and advance it, whichever cursor is asking.
+    /// The metadata cursor never needs to step over `format_span` itself
+    /// — it starts at `format_span.1` and only climbs — so the only
+    /// refusal here is running off the end of the volume.
+    fn take_meta_frontier(&mut self) -> Result<u64, PopulateError<Transport<S>>> {
+        if self.next_meta >= self.block_count {
             return Err(PopulateError::VolumeFull {
                 block_count: self.block_count,
             });
         }
-        let lba = self.next_free;
-        self.next_free += 1;
-        if self.next_free >= self.format_span.0 && self.next_free < self.format_span.1 {
-            self.next_free = self.format_span.1;
-        }
+        let lba = self.next_meta;
+        self.next_meta += 1;
         Ok(lba)
     }
 

@@ -102,6 +102,85 @@
 //! [`repair`](crate::repair)'s job, and it is the one caller here that
 //! constructs an allocator from a set it computed itself
 //! ([`Allocator::rebuilt`]) rather than from the disk.
+//!
+//! # Block layout policy
+//!
+//! `docs/layout-survey.md` (in the repository, not published with the
+//! crate) is the evidence base for everything below; citations here are to
+//! its section numbers. The policy is stated here, once, because
+//! [`Intent`] is where a caller states *what kind* of block it is placing,
+//! and the reasoning for why that vocabulary exists belongs next to it.
+//!
+//! **What goes where, and why.** ReOrg's own author judged directory- and
+//! file-header *scatter*, not file-data fragmentation, the dominant
+//! real-world cost on FFS/OFS (survey §1) — a conclusion this crate's own
+//! measurement corroborates independently: laying one file's data as six
+//! runs instead of one cost a real Kickstart 3.1 ROM 47% more wall-clock
+//! time reading it off a floppy (survey §4a, `examples/frag-bench.rs`).
+//! Two, not one, conclusions follow:
+//!
+//! - **Data contiguity is real and measured** — [`Intent::DataFor`] and
+//!   [`Allocator::allocate_run`] exist so a caller can ask for (up to) a
+//!   whole file's extent as one ascending run, rather than one block at a
+//!   time from a hint that a colliding allocation could break.
+//! - **Metadata locality is the *larger*, and evidence-independent-of-
+//!   floppies, effect.** [`Intent::HeaderIn`] and [`Intent::MetadataNearRoot`]
+//!   place headers, dircache blocks and comment overflow near a directory
+//!   or the root because AROS's `getCacheBlock` — a hold-cache with no
+//!   read-ahead, not a prefetch buffer (survey §2) — only pays off when the
+//!   working set a directory walk touches is small and close together.
+//!   That is a cache-*hit-rate* argument, not a seek argument, so unlike
+//!   data contiguity it transfers unconditionally to CF/SD, where there is
+//!   no seek cost to save at all (survey §3, the one row of the ranking
+//!   table with a "full" mark in every column).
+//!
+//! Metadata locality does not, however, cover *every* block a file's
+//! header reaches. `T_LIST` extension blocks were measured both ways
+//! through the same real-ROM rig — clustered near the root with the
+//! header, and interleaved into the data run at their natural stream
+//! position — and interleaved won (19 s versus 21 s on the identical
+//! 391-block file; see the addendum to survey §4a). An extension block
+//! is fetched mid-stream, by a reader already reading the file, not once
+//! at open the way a header is, so it is [`Intent::DataFor`]'s to place,
+//! not [`Intent::HeaderIn`]'s — see [`Populator`](crate::Populator)'s own
+//! documentation for the full reasoning.
+//!
+//! **What this deliberately does not do**, and why doing it would be
+//! cargo-cult rather than policy (survey §3, §6a-4):
+//!
+//! - **No cylinder or track alignment derived from RDB geometry.** The
+//!   RDB's `rdb_Cylinders`/`rdb_Heads`/`rdb_Sectors` fields are software-
+//!   chosen to multiply out to the reported size on essentially every
+//!   medium this crate targets, not tied to physical platters — AmigaOS's
+//!   own RDB documentation says so. A real floppy's geometry (11
+//!   sectors/track, 22 blocks/cylinder on DD) is a format constant that
+//!   never needs reading from anywhere, and floppies do not carry an RDB
+//!   to read it from regardless — but nothing here computes cylinder
+//!   boundaries for a hard disk or CF/SD image, because there is nothing
+//!   physical on the other end of that arithmetic.
+//! - **No segregated allocation zones.** [`Intent`] reduces to a
+//!   *hint and a preference*, resolved by the same first-fit scan
+//!   [`Allocator::allocate_near`] already does — not a partition of the
+//!   bitmap into a metadata region and a data region with their own
+//!   accounting. A caller with an anchor (a directory's LBA, a file
+//!   header's LBA) gets locality by scanning from that anchor; nothing
+//!   here reserves address ranges in advance for a class of block, which
+//!   would be exactly the fixed-geometry reasoning the previous point
+//!   rejects, aimed at content instead of cylinders.
+//! - **No free-space policy knob.** ReOrg exposed where a *compaction*
+//!   pass leaves reclaimed free space as a user choice (survey §1); this
+//!   module allocates blocks, and creation-time free space is simply
+//!   "the rest of the bitmap" — a knob for where a compactor leaves its
+//!   leftovers belongs to that later piece of work, not to allocation.
+//!
+//! [`Populator`](crate::Populator) implements the metadata/data split
+//! `Intent` makes possible directly, with two independent forward cursors
+//! rather than by calling into this module — see its own documentation for
+//! why (it has no bitmap to scan a hint against mid-session, only a known
+//! free extent and a monotonic frontier). [`Mutator`](crate::Mutator)'s own
+//! adoption of `Intent` for its day-to-day writes, and a compaction pass
+//! that applies the same policy retroactively, are later work; this module
+//! only has to make the vocabulary and the primitives honest today.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -254,6 +333,75 @@ impl Allocation {
     /// Which bitmap page carries this block's bit.
     pub fn page_index(self) -> usize {
         self.page
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Placement intent
+// ---------------------------------------------------------------------------
+
+/// Where a block being allocated *wants* to sit, relative to something
+/// already on the volume.
+///
+/// See this module's "Block layout policy" section for the reasoning.
+/// Every variant reduces to a starting hint (or none, for the rotating
+/// cursor) fed to the same first-fit-and-wrap scan
+/// [`Allocator::allocate_near`] already does — this is a vocabulary over
+/// that one mechanism, not a second allocation strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// File content, following its own header — a data block, or a
+    /// `T_LIST` extension block at its natural position in the stream.
+    /// [`Populator`](crate::Populator)'s own documentation has the
+    /// measurement: an extension block is fetched *mid-stream* by a
+    /// reader already reading the file, not once at open the way a
+    /// header is, so it belongs with the data run it splices into, not
+    /// with the header.
+    ///
+    /// Hints at `header_lba`: scanning forward from a file's own header
+    /// finds the block immediately after it when nothing else has claimed
+    /// that space yet, which is what keeps a freshly written file's data
+    /// in one run.
+    DataFor {
+        /// The file's header block.
+        header_lba: u64,
+    },
+    /// A file or directory header, placed near the directory it will be
+    /// filed in.
+    ///
+    /// Hints at `dir_lba`: an `Examine` or a path lookup touches every
+    /// header in a directory in one pass, so keeping them close together
+    /// raises the hit rate of a bounded hold-cache (survey §2) — this is
+    /// the primitive [`Populator`](crate::Populator)'s per-directory
+    /// header placement is built from.
+    HeaderIn {
+        /// The parent directory's header block.
+        dir_lba: u64,
+    },
+    /// Anything a directory walk touches that is not itself a header:
+    /// dircache blocks, comment-overflow blocks. Clustered toward the
+    /// root because that is the one anchor every walk starts from.
+    ///
+    /// Hints at `root_lba`.
+    MetadataNearRoot {
+        /// The volume's root block.
+        root_lba: u64,
+    },
+    /// No opinion: the rotating cursor, [`Allocator::allocate`]'s own
+    /// behaviour. For a caller with nothing to anchor to.
+    Anywhere,
+}
+
+impl Intent {
+    /// The LBA this intent hints at, or `None` for [`Intent::Anywhere`],
+    /// which has no anchor and uses the rotating cursor instead.
+    fn hint(self) -> Option<u64> {
+        match self {
+            Intent::DataFor { header_lba } => Some(header_lba),
+            Intent::HeaderIn { dir_lba } => Some(dir_lba),
+            Intent::MetadataNearRoot { root_lba } => Some(root_lba),
+            Intent::Anywhere => None,
+        }
     }
 }
 
@@ -482,6 +630,141 @@ impl<E> Allocator<E> {
     pub fn allocate_near(&mut self, hint: u64) -> Result<Allocation, AllocError<E>> {
         let from = hint.saturating_sub(self.reserved).min(self.covered());
         self.allocate_from_bit(from)
+    }
+
+    /// Allocate one block per [`Intent`]: [`Allocator::allocate_near`] the
+    /// intent's hint, or [`Allocator::allocate`] for [`Intent::Anywhere`].
+    ///
+    /// The policy vocabulary's single entry point — everything in this
+    /// module's "Block layout policy" section reduces to this one call.
+    pub fn allocate_for(&mut self, intent: Intent) -> Result<Allocation, AllocError<E>> {
+        match intent.hint() {
+            Some(hint) => self.allocate_near(hint),
+            None => self.allocate(),
+        }
+    }
+
+    /// Reserve up to `n` *contiguous* free blocks near `intent`'s hint (or
+    /// from the rotating cursor for [`Intent::Anywhere`]), so a file
+    /// writer can grab its whole extent — or as much of one as the volume
+    /// has room for in one place — before writing a byte.
+    ///
+    /// **Fallback semantics, precisely:** this scans for a run of exactly
+    /// `n` free blocks the same way [`Allocator::allocate_near`] scans for
+    /// one (forward from the hint, wrapping once). If a run that long
+    /// exists, all `n` blocks are marked allocated and returned. If none
+    /// does, the *longest* free run anywhere on the volume is marked and
+    /// returned instead — fewer than `n` blocks, but still one contiguous
+    /// run, never a scatter of leftovers from several holes. The only
+    /// error is [`AllocError::VolumeFull`], and only when there is no free
+    /// block at all; `n == 0` returns an empty run without touching the
+    /// bitmap. A caller that gets back fewer blocks than it asked for is
+    /// expected to call again for the remainder — exactly the same
+    /// contract [`Allocator::allocate`] already has one block at a time,
+    /// generalized to a run.
+    ///
+    /// The returned [`Allocation`]s are in ascending LBA order and are
+    /// otherwise ordinary: each one still needs
+    /// [`Allocator::flush`]-then-[`Allocator::reference`] before anything
+    /// may point at it, the same as a block from [`Allocator::allocate`].
+    pub fn allocate_run(
+        &mut self,
+        n: u64,
+        intent: Intent,
+    ) -> Result<Vec<Allocation>, AllocError<E>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let covered = self.covered();
+        let from = match intent.hint() {
+            Some(hint) => hint.saturating_sub(self.reserved).min(covered),
+            None => self.cursor.min(covered),
+        };
+
+        let exact = self
+            .find_run(from, covered, n)
+            .or_else(|| self.find_run(0, from, n));
+
+        let (start, len) = match exact {
+            // A run of at least `n` exists: take exactly `n` blocks of
+            // it, not the whole (possibly longer) run it was found in.
+            Some((start, _)) => (start, n),
+            // None does: the longest run in either half, checking both
+            // rather than stopping at the first that has anything, so
+            // "longest" is not just "first found while wrapping."
+            None => {
+                let after = self.longest_run(from, covered, 1);
+                let before = self.longest_run(0, from, 1);
+                match (after, before) {
+                    (Some(a), Some(b)) if b.1 > a.1 => b,
+                    (Some(a), _) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => {
+                        return Err(AllocError::VolumeFull {
+                            block_count: self.block_count,
+                        })
+                    }
+                }
+            }
+        };
+
+        let mut out = Vec::with_capacity(len as usize);
+        for bit in start..start + len {
+            self.words[(bit / 32) as usize] &= !(1u32 << (bit % 32));
+            self.free -= 1;
+            let page = self.page_of(bit);
+            self.dirty[page] = true;
+            out.push(Allocation {
+                lba: self.reserved + bit,
+                page,
+            });
+        }
+        self.cursor = start + len;
+        Ok(out)
+    }
+
+    /// The first run of at least `want` consecutive free bits in
+    /// `from..to`, or `None` if no run that long exists there.
+    fn find_run(&self, from: u64, to: u64, want: u64) -> Option<(u64, u64)> {
+        self.runs(from, to).find(|&(_, len)| len >= want)
+    }
+
+    /// The single longest run of free bits in `from..to`, at least
+    /// `want` long, or `None` if the range has no free bit at all (or
+    /// none as long as `want`).
+    fn longest_run(&self, from: u64, to: u64, want: u64) -> Option<(u64, u64)> {
+        self.runs(from, to)
+            .filter(|&(_, len)| len >= want)
+            .max_by_key(|&(_, len)| len)
+    }
+
+    /// Every maximal run of free bits in `from..to`, as `(start, len)`,
+    /// left to right. Bit-by-bit: run-finding is not [`Allocator::scan`]'s
+    /// hot path (a single free bit, skipping whole allocated longwords at
+    /// a time) — it has to look *past* the first free bit to measure how
+    /// far the run goes, so there is nothing for the longword shortcut to
+    /// buy here.
+    fn runs(&self, from: u64, to: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let mut bit = from;
+        core::iter::from_fn(move || {
+            while bit < to && !self.free_bit(bit) {
+                bit += 1;
+            }
+            if bit >= to {
+                return None;
+            }
+            let start = bit;
+            while bit < to && self.free_bit(bit) {
+                bit += 1;
+            }
+            Some((start, bit - start))
+        })
+    }
+
+    /// Is bit `bit` free? Panics on a bit outside `words`' coverage —
+    /// every caller here already bounds `bit < covered()`.
+    fn free_bit(&self, bit: u64) -> bool {
+        self.words[(bit / 32) as usize] >> (bit % 32) & 1 != 0
     }
 
     fn allocate_from_bit(&mut self, from: u64) -> Result<Allocation, AllocError<E>> {

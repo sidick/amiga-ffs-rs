@@ -4032,7 +4032,13 @@ fn allocation_never_disagrees_with_a_model_of_the_same_bitmap() {
     // allocator has never handed out a block the model already holds.
     // The disk is compared at the end too, because an allocator that is
     // right in memory and writes the bits inverted is the exact failure
-    // the bitmap module's four conventions are about.
+    // the bitmap module's four conventions are about. The allocation
+    // branch itself picks from every entry point this module offers --
+    // the plain cursor, a bare hint, every [`Intent`], and
+    // [`Allocator::allocate_run`] -- because the invariants (never twice,
+    // never outside range, bitmap agrees with memory) have to hold for
+    // the whole policy vocabulary, not just the two calls that predate
+    // it.
     let nblocks = 20_000;
     let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
     let mut model: std::collections::HashSet<u64> = allocated_set(&mut vol);
@@ -4043,20 +4049,57 @@ fn allocation_never_disagrees_with_a_model_of_the_same_bitmap() {
     for step in 0..4000 {
         match rng.below(10) {
             0..=5 => {
-                let a = if rng.below(2) == 0 {
-                    alloc.allocate().unwrap()
-                } else {
-                    alloc
-                        .allocate_near(2 + rng.below(nblocks as usize) as u64)
-                        .unwrap()
+                // A volume this randomized run of bursts (up to eight
+                // blocks a step) can genuinely fill; `VolumeFull` is a
+                // real outcome to tolerate here, not a bug to unwrap
+                // past -- the invariant under test is "never twice, never
+                // out of range, bitmap agrees with memory," not "never
+                // runs out."
+                let hint = 2 + rng.below(nblocks as usize) as u64;
+                let got: Result<Vec<u64>, AllocError<MemError>> = match rng.below(6) {
+                    0 => alloc.allocate().map(|a| vec![a.block()]),
+                    1 => alloc.allocate_near(hint).map(|a| vec![a.block()]),
+                    2 => alloc
+                        .allocate_for(Intent::DataFor { header_lba: hint })
+                        .map(|a| vec![a.block()]),
+                    3 => alloc
+                        .allocate_for(Intent::HeaderIn { dir_lba: hint })
+                        .map(|a| vec![a.block()]),
+                    4 => alloc
+                        .allocate_for(Intent::MetadataNearRoot { root_lba: hint })
+                        .map(|a| vec![a.block()]),
+                    _ => {
+                        let n = 1 + rng.below(8) as u64;
+                        let intent = if rng.below(2) == 0 {
+                            Intent::Anywhere
+                        } else {
+                            Intent::DataFor { header_lba: hint }
+                        };
+                        alloc.allocate_run(n, intent).map(|run| {
+                            for w in run.windows(2) {
+                                assert_eq!(
+                                    w[1].block(),
+                                    w[0].block() + 1,
+                                    "step {step}: allocate_run returned a non-contiguous run"
+                                );
+                            }
+                            run.iter().map(|a| a.block()).collect()
+                        })
+                    }
                 };
-                let lba = a.block();
-                assert!(
-                    model.insert(lba),
-                    "step {step}: block {lba} handed out while already allocated"
-                );
-                assert!((2..nblocks).contains(&lba), "step {step}: block {lba}");
-                mine.push(lba);
+                let got = match got {
+                    Ok(got) => got,
+                    Err(AllocError::VolumeFull { .. }) => continue,
+                    Err(e) => panic!("step {step}: {e}"),
+                };
+                for lba in got {
+                    assert!(
+                        model.insert(lba),
+                        "step {step}: block {lba} handed out while already allocated"
+                    );
+                    assert!((2..nblocks).contains(&lba), "step {step}: block {lba}");
+                    mine.push(lba);
+                }
             }
             6..=8 => {
                 if mine.is_empty() {
@@ -4077,6 +4120,143 @@ fn allocation_never_disagrees_with_a_model_of_the_same_bitmap() {
     alloc.flush(vol.source_mut()).unwrap();
     let on_disk = allocated_set(&mut vol);
     assert_eq!(on_disk, model, "the bits that were written are the model");
+}
+
+#[test]
+fn allocate_for_resolves_every_intent_to_its_documented_hint() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let before = allocated_set(&mut vol);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+
+    // Every intent but `Anywhere` reduces to `allocate_near` at the LBA
+    // its own documentation names -- checked against the same "first
+    // free at or above the hint" arithmetic
+    // `allocation_scans_forward_from_the_hint_and_wraps_once` already
+    // pins for `allocate_near` itself.
+    for (label, intent, hint) in [
+        ("DataFor", Intent::DataFor { header_lba: 500 }, 500u64),
+        ("HeaderIn", Intent::HeaderIn { dir_lba: 900 }, 900u64),
+        (
+            "MetadataNearRoot",
+            Intent::MetadataNearRoot { root_lba: 880 },
+            880u64,
+        ),
+    ] {
+        let want = (hint..1760).find(|b| !before.contains(b)).unwrap();
+        let a = alloc.allocate_for(intent).unwrap();
+        assert_eq!(a.block(), want, "{label}");
+        alloc.free(a.block()).unwrap();
+    }
+
+    // `Anywhere` is the rotating cursor: consecutive calls climb, same as
+    // a bare `allocate()`.
+    let mut last = alloc.allocate_for(Intent::Anywhere).unwrap().block();
+    for _ in 0..10 {
+        let n = alloc.allocate_for(Intent::Anywhere).unwrap().block();
+        assert!(n > last, "{n} follows {last}");
+        last = n;
+    }
+}
+
+#[test]
+fn allocate_run_reserves_one_contiguous_extent() {
+    let mut vol = allocatable(Variant::FfsIntl, 512, 2_000);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+
+    // `n == 0` never touches the bitmap.
+    assert!(alloc.allocate_run(0, Intent::Anywhere).unwrap().is_empty());
+    assert_eq!(alloc.dirty_pages(), 0);
+
+    // A run comfortably smaller than the volume's largest free extent:
+    // exactly that many blocks, strictly ascending and contiguous, no
+    // fewer.
+    let run = alloc.allocate_run(50, Intent::Anywhere).unwrap();
+    assert_eq!(run.len(), 50);
+    for w in run.windows(2) {
+        assert_eq!(w[1].block(), w[0].block() + 1);
+    }
+    let lbas: std::collections::HashSet<u64> = run.iter().map(|a| a.block()).collect();
+    assert_eq!(lbas.len(), 50, "no block in the run handed out twice");
+
+    // A run near a specific hint behaves like `allocate_near` scaled up:
+    // it starts at (or after) the hint.
+    let hinted = alloc
+        .allocate_run(10, Intent::DataFor { header_lba: 1000 })
+        .unwrap();
+    assert_eq!(hinted.len(), 10);
+    assert!(hinted[0].block() >= 1000);
+    for w in hinted.windows(2) {
+        assert_eq!(w[1].block(), w[0].block() + 1);
+    }
+}
+
+#[test]
+fn allocate_run_degrades_gracefully_when_no_run_is_that_long() {
+    // A volume punched into small, evenly spaced holes: no contiguous
+    // run anywhere near as long as a caller is about to ask for, which
+    // is exactly the "existing volume, not a fresh one" case this
+    // primitive has to behave sanely on.
+    let nblocks = 2_000u64;
+    let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+
+    // Allocate almost everything, then free back every fourth block --
+    // holes of at most three free blocks each, scattered across the
+    // whole covered range.
+    let mut all = Vec::new();
+    loop {
+        match alloc.allocate() {
+            Ok(a) => all.push(a.block()),
+            Err(AllocError::VolumeFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    for (i, &lba) in all.iter().enumerate() {
+        if i % 4 == 0 {
+            alloc.free(lba).unwrap();
+        }
+    }
+    let free = alloc.blocks_free();
+    assert!(free > 0, "test setup: there must be holes to find");
+
+    // Ask for a run far bigger than any hole: fewer blocks come back,
+    // but still exactly one contiguous run, and never an error while any
+    // free block remains.
+    let got = alloc.allocate_run(free * 10, Intent::Anywhere).unwrap();
+    assert!(!got.is_empty());
+    assert!(
+        (got.len() as u64) < free * 10,
+        "a punched volume has no run that long to give back"
+    );
+    assert!(
+        (got.len() as u64) <= 3,
+        "no hole in this layout is longer than three blocks, got {}",
+        got.len()
+    );
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].block(),
+            w[0].block() + 1,
+            "the fallback is still one run, not a scatter of leftovers"
+        );
+    }
+
+    // Free every remaining block, and only then does the volume truly
+    // have nothing left to offer.
+    for a in &got {
+        alloc.free(a.block()).unwrap();
+    }
+    loop {
+        match alloc.allocate() {
+            Ok(_) => {}
+            Err(AllocError::VolumeFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(matches!(
+        alloc.allocate_run(1, Intent::Anywhere),
+        Err(AllocError::VolumeFull { .. })
+    ));
 }
 
 /// One allocation session, as a caller with the discipline would write
@@ -4149,6 +4329,189 @@ fn an_interrupted_allocation_session_leaks_and_never_double_allocates() {
         assert_eq!(vol.read_file(payload.lba).unwrap(), pattern(9000));
     }
     assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+// ---------------------------------------------------------------------------
+// Block layout policy (wave 1: `Populator`)
+// ---------------------------------------------------------------------------
+
+/// How many ascending runs a sequence of blocks takes -- the same "does
+/// the next block follow the last one" walk `examples/frag-bench.rs`
+/// computes, kept in one place so a test can assert on it without
+/// reimplementing the walk. Zero blocks is zero runs; anything else is
+/// at least one.
+fn count_runs(blocks: &[u32]) -> usize {
+    if blocks.is_empty() {
+        return 0;
+    }
+    let mut runs = 1;
+    for w in blocks.windows(2) {
+        if w[1] != w[0] + 1 {
+            runs += 1;
+        }
+    }
+    runs
+}
+
+/// The full sequence of blocks a streaming read actually touches, in
+/// fetch order: data blocks, with each `T_LIST` extension block spliced
+/// in exactly where a reader fetches it -- between the last data block
+/// of the table it closes and the first data block of the table it
+/// opens. Mirrors `examples/frag-bench.rs`'s `read_path_sequence`.
+///
+/// Counting runs over `FileChain::blocks` alone is a metric that can
+/// lie in *both* directions: an extension block sitting between two
+/// data blocks in LBA order reads as a broken run even when nothing is
+/// out of place on disk, and an extension block moved away from the
+/// stream (measured, and rejected -- see `docs/layout-survey.md` §4a's
+/// wave-1 addendum) would not show up as a cost at all if only the data
+/// pointers were counted. This is what "1 run" has to mean: the full
+/// physical sequence a read walks, table boundaries included.
+fn read_path_sequence(chain: &FileChain, block_size: usize) -> Vec<u32> {
+    let slots = hash_table_size(block_size) as usize;
+    let mut out = Vec::with_capacity(chain.blocks.len() + chain.extensions.len());
+    for (i, &b) in chain.blocks.iter().enumerate() {
+        out.push(b);
+        if (i + 1) % slots == 0 {
+            let ext_index = (i + 1) / slots - 1;
+            if let Some(&ext) = chain.extensions.get(ext_index) {
+                out.push(ext);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_large_files_read_path_is_one_ascending_run_straight_out_of_populate() {
+    // The cost `docs/layout-survey.md` §4a measured directly against a
+    // real ROM: a 391-block file split into six runs by `T_LIST`
+    // extension blocks landing inside the data cursor's own sequence,
+    // 47% slower to read than the same bytes as one run. Wave 1's fix
+    // keeps extension blocks *in* the data cursor's stream, at their
+    // natural fetch position (measured against pulling them to the root
+    // cluster instead, which cost a further 10% -- the addendum to
+    // §4a), so the full read-path sequence -- data blocks and extension
+    // blocks together, in fetch order -- is one contiguous run, even
+    // though `FileChain::blocks` alone has a gap at each extension
+    // boundary.
+    let payload = pattern(200_000); // several extension blocks' worth
+    let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Payload", &amiga_ffs::Metadata::new(), &payload)
+            .unwrap();
+    });
+    let root = vol.root_lba();
+    let entry = vol.lookup(root, b"Payload").unwrap().expect("Payload");
+    let chain = vol.file_chain(entry.lba).unwrap();
+    assert!(
+        chain.extensions.len() >= 3,
+        "test setup: the file must actually cross several extension blocks, got {}",
+        chain.extensions.len()
+    );
+    let sequence = read_path_sequence(&chain, vol.block_size());
+    assert_eq!(
+        count_runs(&sequence),
+        1,
+        "data and extension blocks together should be one physical run: {sequence:?}"
+    );
+    // And a metric that only looked at data pointers would have missed
+    // that interleaving is what makes this true: on their own, the data
+    // blocks have a gap at every extension-block boundary.
+    assert!(
+        count_runs(&chain.blocks) > 1,
+        "test is meaningless if the data-pointers-only view was already contiguous"
+    );
+    assert!(vol.validate().is_clean());
+}
+
+/// Every header, dircache and comment-overflow block a directory walk
+/// would touch, collected recursively -- the set
+/// [`Intent::MetadataNearRoot`]/[`Intent::HeaderIn`] and `Populator`'s
+/// metadata cursor exist to cluster.
+fn collect_metadata_lbas(vol: &mut Volume<MemDisk>, dir: u64, out: &mut Vec<u64>) {
+    out.push(dir);
+    if let Ok(dc) = vol.read_dircache(dir) {
+        out.extend(dc.blocks.iter().copied());
+    }
+    for entry in vol.read_dir(dir).unwrap() {
+        out.push(entry.lba);
+        if entry.comment_block != 0 {
+            out.push(entry.comment_block as u64);
+        }
+        if entry.kind.is_directory() {
+            collect_metadata_lbas(vol, entry.lba, out);
+        }
+    }
+}
+
+#[test]
+fn a_populated_trees_metadata_stays_within_a_bounded_distance_of_the_root() {
+    // A multi-directory tree, several files per directory: enough
+    // metadata that a policy which scattered it would show a wide
+    // spread, and enough that a bound has to be about the *shape* of the
+    // policy (one contiguous region starting at the root) rather than a
+    // hand-tuned constant.
+    let nblocks = 1760u64;
+    let mut vol = populated(Variant::FfsIntlDircache, 512, nblocks, |pop| {
+        let root = pop.root_lba();
+        for d in 0..6 {
+            let dir = pop
+                .create_dir(
+                    root,
+                    format!("Dir{d}").as_bytes(),
+                    &amiga_ffs::Metadata::new(),
+                )
+                .unwrap();
+            for f in 0..5 {
+                pop.create_file(
+                    dir,
+                    format!("f{f}").as_bytes(),
+                    &amiga_ffs::Metadata::new(),
+                    &pattern(300),
+                )
+                .unwrap();
+            }
+        }
+    });
+    assert!(vol.validate().is_clean());
+
+    let root = vol.root_lba();
+    let mut metadata = Vec::new();
+    collect_metadata_lbas(&mut vol, root, &mut metadata);
+    // 6 directories + 30 files = 36 headers, plus a dircache block per
+    // directory (root's included): comfortably under a hundred blocks
+    // even before considering the bound is meant to be generous, not
+    // tight.
+    assert!(
+        metadata.len() >= 36,
+        "test setup: expected at least 36 headers, got {}",
+        metadata.len()
+    );
+
+    let farthest = metadata
+        .iter()
+        .map(|&lba| lba.abs_diff(root))
+        .max()
+        .unwrap();
+    assert!(
+        farthest <= 200,
+        "a metadata block sat {farthest} blocks from the root ({root}); \
+         the policy clusters every header, dircache and comment block in \
+         one contiguous region starting there -- see \
+         `src/populate.rs`'s \"Block layout policy\" section"
+    );
+
+    // And, for contrast, the file data itself is *not* required to be
+    // anywhere near the root -- the whole point of splitting the cursor
+    // is that data fills the other half of the volume instead.
+    let dir0 = vol.lookup(root, b"Dir0").unwrap().unwrap().lba;
+    let payload = vol.lookup(dir0, b"f0").unwrap().unwrap();
+    let chain = vol.file_chain(payload.lba).unwrap();
+    assert!(
+        chain.blocks[0] as u64 <= root,
+        "file data should sit below the root, in the data cursor's own half"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6763,8 +7126,33 @@ fn resize_shrink_crash_sweep_never_leaves_a_block_double_allocated() {
                         // the old dircache/bitmap-page blocks (~881+)
                         // end up past the new end and must relocate.
 
+    // A freshly formatted volume, no tree on it -- deliberately, post
+    // wave 1. This sweep is about relocating the *root's own* structures
+    // (its bitmap pages, its dircache chain) past a shrinking cut, which
+    // is resize's job; that only exercises the path this test wants when
+    // `new_n` falls below where those structures sit, and the block
+    // layout policy now clusters ordinary headers right next to them
+    // (`docs/layout-survey.md` §6a, `src/populate.rs`'s and
+    // `src/allocator.rs`'s "Block layout policy" sections) -- both
+    // `Populator` (this policy) and `Mutator` (already hinting a
+    // top-level header near the root, unrelated to and unchanged by this
+    // wave) would strand any such tree's own headers past the same cut,
+    // which is `ResizeError::UserDataPastCut` firing *correctly*: exactly
+    // the refusal PLAN.md documents as resize's known gap, and exactly
+    // what a compaction pass (not yet built) is for, not something this
+    // sweep is testing. Tree-survival-across-resize is exercised with a
+    // populated volume elsewhere (`resize_random_grow_shrink_sequence_
+    // keeps_the_tree_intact`); this sweep stays about the root furniture
+    // alone.
+    let fixture = |old_n: u64| -> Volume<MemDisk> {
+        let mut disk = MemDisk::filled(bs, old_n, 0xA5);
+        let opts = FormatOptions::new(Variant::FfsIntlDircache, old_n, b"Target");
+        amiga_ffs::format(&mut disk, &opts).unwrap();
+        Volume::open_with(disk, None, old_n, 2).unwrap()
+    };
+
     let total = {
-        let mut vol = allocatable(Variant::FfsIntlDircache, bs, old_n);
+        let mut vol = fixture(old_n);
         vol.source_mut().clear_log();
         vol.resize(new_n).unwrap();
         vol.source_mut().write_log().len()
@@ -6773,7 +7161,7 @@ fn resize_shrink_crash_sweep_never_leaves_a_block_double_allocated() {
 
     let mut crashed = 0;
     for n in 0..total {
-        let mut vol = allocatable(Variant::FfsIntlDircache, bs, old_n);
+        let mut vol = fixture(old_n);
         vol.source_mut().fail_after(n);
         if vol.resize(new_n).is_err() {
             crashed += 1;
@@ -6837,7 +7225,6 @@ fn resize_shrink_crash_sweep_never_leaves_a_block_double_allocated() {
                     "crash after {n} writes: repair alone left an unexpected finding: {finding}"
                 );
             }
-            assert_tree_intact(&mut vol_a);
         }
 
         // Path B: a same-target `resize` retry, from the same crashed
@@ -6872,7 +7259,6 @@ fn resize_shrink_crash_sweep_never_leaves_a_block_double_allocated() {
             orphans <= 1,
             "crash after {n} writes: {orphans} leaks after retry, expected at most one"
         );
-        assert_tree_intact(&mut vol);
         let root = vol.root_lba();
         for e in vol.read_dir(root).unwrap() {
             assert_eq!(

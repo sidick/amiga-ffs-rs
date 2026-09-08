@@ -511,6 +511,24 @@ Reproduce with `cargo run --example frag-bench -- outdir`, then boot
 each image under Copperline with a real Kickstart and the script shape
 above.
 
+**Addendum, wave 1 implementation (2026-09-08).** The same rig was used
+again, mid-implementation, to settle a placement question this section
+does not answer on its own: where should a `T_LIST` extension block go
+once directory metadata is clustered near the root? Two builds of the
+identical 391-block file were compared, both otherwise using the
+policy's own metadata/data cursor split — one with extension blocks
+allocated near the root alongside the file's header, one with them left
+at their natural position in the data stream (between the last data
+block of the table they close and the first of the table they open).
+Root-clustered: 21 s. Interleaved: 19 s, matching the original
+contiguous number in the table above. The regression makes sense in
+hindsight: unlike a header (read once, at open) or a dircache block
+(read during a walk with no file read in flight), an extension block is
+fetched *mid-stream* by a reader already reading the file, so pulling it
+to the root inserts two long seeks into every extension-block boundary
+instead of zero. Extension blocks stay interleaved with file data;
+headers, dircache and comment-overflow blocks stay near the root.
+
 ## 5. What could not be established
 
 - Whether the real Commodore ROM FFS batches contiguous block reads
