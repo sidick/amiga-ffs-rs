@@ -103,10 +103,10 @@ jobs:
       # generator still runs.
       - run: cargo run --example seed-corpus -- fuzz/corpus/fuzz_read
 
-  # The differential suite skips itself when xdftool is absent, so this
-  # job exists to make sure it is *not* absent somewhere. It is the only
-  # leg that can catch a mistake this crate and its own test builder
-  # would make together.
+  # The differential suite skips itself when an oracle is absent, so this
+  # job exists to make sure neither is absent somewhere. These are the
+  # only legs that can catch a mistake this crate and its own test
+  # builder would make together.
   differential:
     runs-on: ubuntu-latest
     steps:
@@ -119,7 +119,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: differential
-      # Fail rather than skip: on this job the oracle being missing is
+      # The second oracle. `--locked` so it builds against its own
+      # lockfile and a red build here is this crate's fault rather than
+      # one of fstool's dependencies'. Deliberately *not* version-pinned:
+      # the tests that record its limits (no DOS\6/DOS\7, no dircache
+      # writing) are written to fail loudly if a release grows the
+      # support, with a panic message saying which constant to update.
+      # Finding that out is the point of tracking a live oracle.
+      - run: cargo install fstool --locked
+      # Fail rather than skip: on this job an oracle being missing is
       # itself the bug.
       - run: xdftool --help > /dev/null
+      - run: fstool --version > /dev/null
       - run: cargo test --test differential

@@ -2,24 +2,42 @@
 //! read back through this crate — and, since milestone 2, volumes built
 //! by this crate and handed to that implementation.
 //!
-//! The oracle is `xdftool` from amitools — GPL-2, so it is **run, never
-//! copied**. Nothing in this file transcribes a line of it; it is invoked
-//! as a subprocess, it lays down the bytes, and this crate has to agree
-//! with what a completely separate codebase decided those bytes mean.
-//! That is the only kind of test that can catch a mistake this crate and
-//! its own synthetic builder in `volumes.rs` would make together — and
-//! the failure this crate exists to not have (every name empty on a
-//! `DOS\7` volume) is exactly that kind of mistake: self-consistent,
-//! and wrong.
+//! There are two oracles.
+//!
+//! **`xdftool`** from amitools is GPL-2, so it is **run, never copied**.
+//! Nothing in this file transcribes a line of it; it is invoked as a
+//! subprocess, it lays down the bytes, and this crate has to agree with
+//! what a completely separate codebase decided those bytes mean. That is
+//! the only kind of test that can catch a mistake this crate and its own
+//! synthetic builder in `volumes.rs` would make together — and the
+//! failure this crate exists to not have (every name empty on a `DOS\7`
+//! volume) is exactly that kind of mistake: self-consistent, and wrong.
+//!
+//! **`fstool`** (KarpelesLab, crates.io) is the second, and it is here
+//! for a different reason: it is **MIT**, so when it and this crate
+//! disagree the disagreement can be *settled by reading its source*
+//! rather than inferred from behaviour. It is still only ever run as a
+//! subprocess — no line of it is copied here either, and the citations in
+//! the tests below are file-and-function references, not transcriptions.
+//! Having a readable second implementation paid for itself immediately:
+//! see [`fstool_corrupts_a_dircache_volume_it_was_never_able_to_create`],
+//! which names two bugs in it and cites the functions they live in.
+//!
+//! The two oracles overlap deliberately. Where they agree, the claim is
+//! about this crate; where they disagree, three implementations are
+//! enough to say which one is odd.
 //!
 //! # Skipping, not failing
 //!
-//! `xdftool` is not a build dependency. When it is absent every test here
-//! prints why and returns green: a contributor without amitools installed
-//! must not see red for a tool they were never asked to have. Set
-//! `AMIGA_FFS_XDFTOOL` to point at a specific one, or leave it and the
-//! suite looks for `xdftool` on `PATH` and then for
-//! `python3 -m amitools.tools.xdftool`.
+//! Neither tool is a build dependency. When one is absent every test
+//! using it prints why and returns green: a contributor without amitools
+//! or fstool installed must not see red for a tool they were never asked
+//! to have. Set `AMIGA_FFS_XDFTOOL` to point at a specific xdftool, or
+//! leave it and the suite looks for `xdftool` on `PATH` and then for
+//! `python3 -m amitools.tools.xdftool`; likewise `AMIGA_FFS_FSTOOL`, or
+//! `fstool` on `PATH`. CI installs both and asserts they are there, so
+//! "skipped" is a local convenience and never a way for the suite to go
+//! quiet on a push.
 //!
 //! Fixtures are generated into a temporary directory at test time and
 //! deleted afterwards. Nothing is checked in: a committed ADF is a
@@ -43,9 +61,20 @@
 //! layouts including the `T_COMMENT` overflow block.
 //!
 //! Also not covered: block sizes other than 512. `xdftool`'s ADF and HDF
-//! images are 512-byte-blocked, and the RDB-partitioned images where
-//! other block sizes live are `rdbtool`'s territory and this crate's
-//! sibling's problem.
+//! images are 512-byte-blocked, `fstool`'s AFFS backend has `BSIZE` as a
+//! compile-time constant, and the RDB-partitioned images where other
+//! block sizes live are `rdbtool`'s territory and this crate's sibling's
+//! problem.
+//!
+//! `fstool` covers less than `xdftool` and is asserted to: it reads
+//! `DOS\0`–`DOS\5` and writes only `DOS\0`–`DOS\3` (its `AffsFormatOpts`
+//! has exactly two knobs, `ffs` and `intl`). It has no long-name support
+//! at all — `DOS\6`/`DOS\7` open and produce wrong names rather than an
+//! error, which is asserted rather than assumed — and it must not be let
+//! near a `DOS\4`/`DOS\5` volume, which is asserted too. *Image geometry*
+//! is a documented don't-care for it: its default is a 1 MiB image, and
+//! the tests that care pass `--size 880KiB` to get the ADF shape the rest
+//! of this file uses.
 //!
 //! # The write side
 //!
@@ -1418,5 +1447,881 @@ fn the_same_file_content_through_both_implementations_agrees() {
             ],
         );
         assert_eq!(std::fs::read(&back).unwrap(), second, "{variant:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The third leg: fstool, the *readable* oracle
+// ---------------------------------------------------------------------------
+
+/// How to invoke `fstool`, if it can be invoked at all.
+///
+/// Same shape as [`xdftool`] above: an explicit override first, then
+/// `PATH`. `fstool` is a Rust crate rather than a Python package, so
+/// there is no module-invocation fallback to try.
+fn fstool() -> Option<String> {
+    let candidates = match std::env::var("AMIGA_FFS_FSTOOL") {
+        Ok(explicit) => vec![explicit],
+        Err(_) => vec!["fstool".to_string()],
+    };
+    candidates.into_iter().find(|bin| {
+        Command::new(bin)
+            .arg("--version")
+            .output()
+            .map_or(false, |o| o.status.success())
+    })
+}
+
+/// Print the reason and skip. Returns the tool when it is there.
+macro_rules! fstool_oracle {
+    () => {
+        match fstool() {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "SKIP: fstool not found. Install it (`cargo install fstool --locked`) or \
+                     set AMIGA_FFS_FSTOOL to run the fstool leg of the differential suite."
+                );
+                return;
+            }
+        }
+    };
+}
+
+/// Run fstool and hand back its raw stdout. `cat` prints file bytes, so
+/// this cannot be a `String`. Unlike xdftool, fstool exits non-zero on a
+/// filesystem error, so the status is the whole check.
+fn fs_run(bin: &str, args: &[&str]) -> Vec<u8> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .expect("fstool was found a moment ago");
+    assert!(
+        out.status.success(),
+        "fstool {args:?} failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// The same, for the subcommands whose output is text.
+fn fs_text(bin: &str, args: &[&str]) -> String {
+    String::from_utf8(fs_run(bin, args)).expect("fstool prints UTF-8")
+}
+
+/// Drive `fstool shell` over stdin. `mkdir` and `put` live only there —
+/// `add` is the non-interactive half and there is no non-interactive
+/// `mkdir` — so the in-place mutation leg needs it.
+fn fs_shell(bin: &str, image: &str, script: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(bin)
+        .args(["shell", image])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fstool shell");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(script.as_bytes())
+        .expect("write shell script");
+    let out = child.wait_with_output().expect("fstool shell");
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "fstool shell failed:\n{text}");
+    text
+}
+
+/// The variant string `fstool info` prints, spelled the way *it* spells
+/// it rather than the way this crate would.
+///
+/// The difference is deliberate and is the first disagreement this leg
+/// records: fstool decodes the dostype byte as three independent bits
+/// (`ffs | intl<<1 | dircache<<2`), so it calls `DOS\4` "OFS+DC" where
+/// this crate calls it international — AmigaDOS's directory-cache mode
+/// implies international case folding, and [`Variant::is_intl`] says so.
+/// It also has no long-name bit at all, so `DOS\6`/`DOS\7` come out
+/// labelled "+DC". Nothing downstream of the label depends on it for the
+/// variants tested here; see the long-name test for where it does.
+fn fstool_variant_label(variant: Variant) -> String {
+    let byte = variant.dostype() & 0xFF;
+    format!(
+        "DOS\\{byte} ({}{}{})",
+        if byte & 1 != 0 { "FFS" } else { "OFS" },
+        if byte & 2 != 0 { "+INTL" } else { "" },
+        if byte & 4 != 0 { "+DC" } else { "" },
+    )
+}
+
+/// Latin-1 bytes as fstool spells them back: one byte, one code point.
+///
+/// [`walk`] above uses `from_utf8`, which is honest for the xdftool
+/// fixture because it is ASCII. The fstool fixture deliberately is not.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// One file in the fstool fixture.
+///
+/// Two spellings of the name, because there are two: the bytes on the
+/// volume (Latin-1) and the UTF-8 string a host filename and an fstool
+/// command line are written in.
+struct FixtureFile {
+    /// Directory it lives in, `""` for the root.
+    dir: String,
+    /// Its name as stored on the volume.
+    name: Vec<u8>,
+    /// The same name, as fstool and the host spell it.
+    display: String,
+    bytes: Vec<u8>,
+}
+
+impl FixtureFile {
+    /// The whole path, in fstool's spelling, without a leading slash.
+    fn path(&self) -> String {
+        if self.dir.is_empty() {
+            self.display.clone()
+        } else {
+            format!("{}/{}", self.dir, self.display)
+        }
+    }
+
+    /// The whole path as it is spelled *on the volume* — Latin-1, so one
+    /// byte for `é` where [`FixtureFile::path`] has two. The two are not
+    /// interchangeable, which is the entire reason the fixture carries
+    /// both: a lookup asked in UTF-8 hashes to a different slot and
+    /// misses.
+    fn amiga_path(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.dir.is_empty() {
+            out.extend_from_slice(self.dir.as_bytes());
+            out.push(b'/');
+        }
+        out.extend_from_slice(&self.name);
+        out
+    }
+}
+
+/// The xdftool fixture tree plus one Latin-1 name.
+///
+/// `Café` is the name that separates a byte-transparent implementation
+/// from one that assumed ASCII: `é` is one byte (`0xE9`) on the volume
+/// and two in the UTF-8 the host filesystem and fstool's own output use.
+/// Long names are absent on purpose — see
+/// [`fstool_reads_a_long_name_as_a_truncated_one`].
+fn fstool_fixture() -> Vec<FixtureFile> {
+    let mut out: Vec<FixtureFile> = fixture_files(false)
+        .into_iter()
+        .map(|(path, bytes)| {
+            let (dir, leaf) = match path.rsplit_once('/') {
+                Some((d, l)) => (d.to_string(), l.to_string()),
+                None => (String::new(), path),
+            };
+            FixtureFile {
+                dir,
+                name: leaf.clone().into_bytes(),
+                display: leaf,
+                bytes,
+            }
+        })
+        .collect();
+    out.push(FixtureFile {
+        dir: String::new(),
+        name: b"Caf\xe9".to_vec(),
+        display: "Caf\u{e9}".to_string(),
+        bytes: pattern(64),
+    });
+    out
+}
+
+/// The whole tree as `(path, kind)`, recursively, read through
+/// `fstool ls` — which prints TAB-separated `block<TAB>Kind<TAB>name`.
+///
+/// The block column is deliberately dropped: fstool allocates from the
+/// bottom of the volume and this crate scans forward from a hint, so
+/// *which* block an entry landed on is a documented don't-care. What
+/// must agree is which entries exist, where, and of what kind.
+fn fstool_tree(
+    bin: &str,
+    image: &str,
+    dir: &str,
+    prefix: &str,
+    out: &mut Vec<(String, EntryKind)>,
+) {
+    let listing = fs_text(bin, &["ls", image, dir]);
+    for line in listing.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let _block = fields.next().expect("block column");
+        let kind = match fields.next().expect("kind column") {
+            "Dir" => EntryKind::Directory,
+            "Regular" => EntryKind::File,
+            other => panic!("fstool ls printed kind {other:?} in:\n{listing}"),
+        };
+        let name = fields.next().expect("name column");
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if kind.is_directory() {
+            let sub = if dir == "/" {
+                format!("/{name}")
+            } else {
+                format!("{dir}/{name}")
+            };
+            fstool_tree(bin, image, &sub, &path, out);
+        }
+        out.push((path, kind));
+    }
+}
+
+/// [`walk`], for a fixture whose names are not all ASCII.
+fn walk_latin1(vol: &mut Volume<ImageDisk>, dir: u64, prefix: &str) -> Vec<(String, EntryKind)> {
+    let mut out = Vec::new();
+    for entry in vol.read_dir(dir).expect("read_dir") {
+        let name = latin1(&entry.name);
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.kind.is_directory() {
+            out.extend(walk_latin1(vol, entry.lba, &path));
+        }
+        out.push((path, entry.kind));
+    }
+    out.sort();
+    out
+}
+
+/// The fixture tree as `(path, kind)`, sorted — what both directions
+/// compare against.
+fn fstool_fixture_tree() -> Vec<(String, EntryKind)> {
+    let mut want: Vec<(String, EntryKind)> = FIXTURE_DIRS
+        .iter()
+        .map(|d| (d.to_string(), EntryKind::Directory))
+        .collect();
+    for file in fstool_fixture() {
+        want.push((file.path(), EntryKind::File));
+    }
+    want.sort();
+    want
+}
+
+/// Build the fixture tree with this crate's writer, Latin-1 name and all.
+fn populate_fstool_adf(scratch: &Scratch, variant: Variant, label: &str, name: &str) -> PathBuf {
+    let disk = ImageDisk::blank(ADF_BLOCKS);
+    let opts = FormatOptions::new(variant, ADF_BLOCKS, label.as_bytes());
+    let mut pop = Populator::new(disk, &opts).expect("populate");
+    let root = pop.root_lba();
+    let meta = Metadata::new();
+
+    let mut dirs: Vec<(String, u64)> = vec![(String::new(), root)];
+    for dir in FIXTURE_DIRS {
+        let (parent, leaf) = match dir.rsplit_once('/') {
+            Some((p, l)) => (p.to_string(), l),
+            None => (String::new(), dir),
+        };
+        let parent_lba = dirs.iter().find(|(p, _)| *p == parent).expect("parent").1;
+        let lba = pop
+            .create_dir(parent_lba, leaf.as_bytes(), &meta)
+            .expect("create_dir");
+        dirs.push((dir.to_string(), lba));
+    }
+    for file in fstool_fixture() {
+        let parent_lba = dirs.iter().find(|(p, _)| *p == file.dir).expect("parent").1;
+        pop.create_file(parent_lba, &file.name, &meta, &file.bytes)
+            .expect("create_file");
+    }
+
+    let disk = pop.finish().expect("finish");
+    let out = scratch.path(name);
+    disk.save(&out);
+    out
+}
+
+/// The same tree on the host, for `fstool create` to read.
+fn host_fixture_tree(scratch: &Scratch) -> PathBuf {
+    let root = scratch.path("hosttree");
+    std::fs::create_dir_all(&root).expect("host tree");
+    for dir in FIXTURE_DIRS {
+        std::fs::create_dir_all(root.join(dir)).expect("host subdir");
+    }
+    for file in fstool_fixture() {
+        std::fs::write(root.join(file.path()), &file.bytes).expect("host file");
+    }
+    root
+}
+
+/// The variants fstool's AFFS backend can be asked to *create*.
+///
+/// `AffsFormatOpts` has exactly two knobs, `ffs` and `intl`, so the
+/// creatable set is `DOS\0`–`DOS\3` and nothing else: there is no
+/// `dircache` option (`-O dircache=true` is rejected by name) and no
+/// long-name one. `DOS\4`/`DOS\5` are *readable* — see the read leg —
+/// but only this crate and xdftool can write them.
+const FSTOOL_CREATABLE: [(Variant, &str, &str); 4] = [
+    (Variant::Ofs, "ofs", "false"),
+    (Variant::Ffs, "ffs", "false"),
+    (Variant::OfsIntl, "ofs", "true"),
+    (Variant::FfsIntl, "ffs", "true"),
+];
+
+// ---------------------------------------------------------------------------
+// fstool reads what this crate wrote
+// ---------------------------------------------------------------------------
+
+/// Every variant fstool can read, written by this crate and read back
+/// through it: the variant string, the whole tree, and every byte.
+///
+/// `DOS\0`–`DOS\5`, which is more than fstool can *write*. Its reader
+/// walks all 72 hash buckets and every same-hash chain rather than
+/// hashing a name to find it, so the fold table it would have used never
+/// comes into play and a directory-cache volume reads back correctly
+/// even though fstool knows nothing about dircache blocks. `DOS\6` and
+/// `DOS\7` are the two it cannot read; that is its own test.
+#[test]
+fn fstool_reads_every_variant_it_can_read_that_this_crate_wrote() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-read");
+
+    for byte in 0u32..=5 {
+        let variant = Variant::from_dostype(DOSTYPE_MAGIC | byte).unwrap();
+        let label = format!("FsVol{byte}");
+        let image = populate_fstool_adf(&scratch, variant, &label, &format!("ours{byte}.adf"));
+        let path = image.to_str().unwrap();
+
+        // It knows what it is looking at, down to the variant byte.
+        let info = fs_text(&bin, &["info", path]);
+        assert!(
+            info.contains("fs kind:           affs"),
+            "{variant:?}: fstool did not recognise our image as AFFS:\n{info}"
+        );
+        assert!(
+            info.contains(&format!("volume name:       {label:?}")),
+            "{variant:?}: fstool read a different volume name:\n{info}"
+        );
+        assert!(
+            info.contains(&format!(
+                "variant:           {}",
+                fstool_variant_label(variant)
+            )),
+            "{variant:?}: fstool read a different variant:\n{info}"
+        );
+
+        // The whole tree, entry for entry, through a reader that shares
+        // no code with the writer -- and no code with xdftool either,
+        // which is the point of having a third leg at all.
+        let mut found = Vec::new();
+        fstool_tree(&bin, path, "/", "", &mut found);
+        found.sort();
+        assert_eq!(found, fstool_fixture_tree(), "{variant:?}: fstool's tree");
+        for (path, _) in &found {
+            assert!(!path.is_empty() && !path.ends_with('/'), "{variant:?}");
+        }
+
+        // Every byte of every file, including the 40 000-byte one that
+        // has to cross an extension block on OFS and FFS alike, the
+        // empty one, and the Latin-1 name.
+        for file in fstool_fixture() {
+            let amiga = format!("/{}", file.path());
+            assert_eq!(
+                fs_run(&bin, &["cat", path, &amiga]),
+                file.bytes,
+                "{variant:?}: fstool read {amiga} differently"
+            );
+        }
+    }
+}
+
+/// What fstool does with a `DOS\6`/`DOS\7` volume, asserted so the
+/// limitation is a fact this suite records rather than one it assumes.
+///
+/// It is not a refusal. `Affs::open` accepts any boot flag byte 0..=7
+/// and decodes bit 2 as "dircache", so a long-name volume opens and is
+/// mislabelled `+DC`; `read_name` then reads the BCPL name at the
+/// classic offset `0x1b0` and clamps its length to 30. On `DOS\6`/`DOS\7`
+/// the name does not live there, so what comes back is not the name.
+///
+/// This is exactly the failure mode this crate exists to not have, seen
+/// from the outside — which makes it the sharpest available statement of
+/// why long-name support is not something a reader gets for free. The
+/// assertion is deliberately weak (fstool does not see the real name)
+/// rather than an exact transcription of the garbage, because the garbage
+/// is not a contract.
+#[test]
+fn fstool_reads_a_long_name_as_a_truncated_one() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-long");
+    let long = "a-file-name-of-fifty-characters-for-the-lnfs-tests";
+
+    for variant in [Variant::OfsIntlLongname, Variant::FfsIntlLongname] {
+        let byte = variant.dostype() & 0xFF;
+        let image = populate_adf(&scratch, variant, "LongNames", &format!("long{byte}.adf"));
+        let path = image.to_str().unwrap();
+
+        // This crate reads it, which is what makes the next assertion a
+        // statement about fstool and not about the image.
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let root = vol.root_lba();
+        assert!(vol.lookup(root, long.as_bytes()).unwrap().is_some());
+        assert!(vol.validate().is_clean());
+
+        // fstool opens it -- and calls it a dircache volume, because it
+        // has no long-name bit to decode.
+        let info = fs_text(&bin, &["info", path]);
+        assert!(
+            info.contains(&format!(
+                "variant:           {}",
+                fstool_variant_label(variant)
+            )),
+            "{variant:?}:\n{info}"
+        );
+
+        // ...and cannot see the name.
+        let listing = fs_text(&bin, &["ls", path, "/"]);
+        assert!(
+            !listing.contains(long),
+            "fstool 0.4.26 grew long-name support; this test is now the \
+             wrong shape:\n{listing}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// This crate reads what fstool wrote
+// ---------------------------------------------------------------------------
+
+/// A volume `fstool create -t affs` produced, opened here.
+///
+/// The other direction of the read leg, and the one that catches a
+/// *reader* assumption rather than a writer one: nothing in this image
+/// came from this crate, its allocator ran bottom-up where ours runs
+/// from a hint, and its root block leaves the header key and the boot
+/// block's root pointer zero.
+#[test]
+fn this_crate_reads_a_volume_fstool_created() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-made");
+    let src = host_fixture_tree(&scratch);
+    let src = src.to_str().unwrap();
+
+    for (variant, fstype, intl) in FSTOOL_CREATABLE {
+        let byte = variant.dostype() & 0xFF;
+        let image = scratch.path(&format!("theirs{byte}.adf"));
+        fs_run(
+            &bin,
+            &[
+                "create",
+                "-t",
+                "affs",
+                src,
+                "-o",
+                image.to_str().unwrap(),
+                // The ADF geometry the rest of this suite uses. fstool's
+                // default is a 1 MiB image, which is fine too -- see
+                // below -- but pinning it here keeps the root block at
+                // 880 where every other test in this file expects it.
+                "--size",
+                "880KiB",
+                "-O",
+                &format!("fstype={fstype},intl={intl},volume_label=FsMade"),
+            ],
+        );
+
+        let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open fstool's image");
+        assert_eq!(vol.variant(), variant, "the dostype fstool wrote");
+        assert_eq!(vol.root().name, b"FsMade");
+        assert_eq!(vol.block_size(), 512);
+        assert_eq!(vol.root_lba(), 880, "fstool puts the root at total/2");
+
+        let root = vol.root_lba();
+        assert_eq!(
+            walk_latin1(&mut vol, root, ""),
+            fstool_fixture_tree(),
+            "{variant:?}: the tree fstool wrote"
+        );
+        for file in fstool_fixture() {
+            let entry = vol
+                .lookup_path(root, &file.amiga_path())
+                .unwrap()
+                .unwrap_or_else(|| panic!("{variant:?}: {} not found", file.path()));
+            assert_eq!(entry.byte_size as usize, file.bytes.len(), "{variant:?}");
+            assert_eq!(
+                vol.read_file(entry.lba).unwrap(),
+                file.bytes,
+                "{variant:?}: contents of {}",
+                file.path()
+            );
+        }
+        // The Latin-1 name is found by its bytes, under this volume's
+        // own fold table -- the intl one on DOS\2/DOS\3, where `é` folds
+        // to `É`, and the classic one on DOS\0/DOS\1, where it does not.
+        assert!(vol.lookup(root, b"Caf\xe9").unwrap().is_some());
+
+        // Zero findings: checksums, hash slots, parent pointers, own
+        // keys and the bitmap in both directions, on bytes this crate
+        // never touched.
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?}: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.summary.directories, 1 + FIXTURE_DIRS.len() as u64);
+        assert_eq!(report.summary.files, fstool_fixture().len() as u64);
+        assert_eq!(report.summary.orphans, 0);
+        assert_eq!(report.summary.reachable_but_free, 0);
+        assert!(report.summary.extension_blocks >= 1);
+        assert_eq!(report.summary.dircache_blocks, 0, "fstool writes no cache");
+    }
+
+    // Geometry is a documented don't-care. fstool's own default is a
+    // 1 MiB image -- 2048 blocks, root at 1024 -- and that opens and
+    // validates here too, which is the statement that the root-block
+    // formula agrees at more than one size.
+    let image = scratch.path("default.adf");
+    fs_run(
+        &bin,
+        &["create", "-t", "affs", src, "-o", image.to_str().unwrap()],
+    );
+    let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+    assert_eq!(vol.variant(), Variant::FfsIntl, "fstool's default variant");
+    assert_eq!(vol.root_lba(), 1024, "1 MiB / 512 / 2");
+    let root = vol.root_lba();
+    assert_eq!(walk_latin1(&mut vol, root, ""), fstool_fixture_tree());
+    assert!(vol.validate().is_clean());
+}
+
+// ---------------------------------------------------------------------------
+// Mutation agreement: two independent writers taking turns
+// ---------------------------------------------------------------------------
+
+/// fstool mutates a volume this crate created, in place.
+///
+/// The leg that matters most. `fstool add` / `rm` and the shell's
+/// `mkdir` / `put` are its *incremental* path -- `AffsEditor`, which
+/// touches only the bitmap, the parent's hash chain and the blocks it
+/// allocates or frees, leaving the rest of the image byte-for-byte
+/// alone. So it is allocating out of a bitmap this crate laid down,
+/// splicing into hash chains this crate built, and freeing an extension
+/// chain this crate wrote -- and then this crate has to still find every
+/// block accounted for.
+#[test]
+fn this_crate_reads_a_volume_fstool_mutated_in_place() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-mutates");
+    let added = pattern(9000);
+    let host = scratch.path("payload");
+    std::fs::write(&host, &added).unwrap();
+
+    for (variant, _, _) in FSTOOL_CREATABLE {
+        let byte = variant.dostype() & 0xFF;
+        let image = populate_fstool_adf(&scratch, variant, "Turns", &format!("turns{byte}.adf"));
+        let path = image.to_str().unwrap();
+
+        let before = Volume::open(ImageDisk::open(&image), None)
+            .unwrap()
+            .read_bitmap()
+            .unwrap()
+            .allocated_count();
+
+        // Its non-interactive half: one file in, two out. `big.dat`
+        // spans an extension block, so freeing it is the case where a
+        // writer that forgot the `T_LIST` chain leaks 80 blocks.
+        fs_run(&bin, &["add", path, host.to_str().unwrap(), "/Devs/Added"]);
+        fs_run(&bin, &["rm", path, "/empty"]);
+        fs_run(&bin, &["rm", path, "/big.dat"]);
+
+        // ...and its interactive half, which is where `mkdir` lives.
+        fs_shell(
+            &bin,
+            path,
+            &format!(
+                "mkdir /NewDir\nput {} /NewDir/inner\nquit\n",
+                host.to_str().unwrap()
+            ),
+        );
+
+        let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+        let root = vol.root_lba();
+
+        // The tree we asked for, seen from here.
+        let mut want = fstool_fixture_tree();
+        want.retain(|(p, _)| p != "empty" && p != "big.dat");
+        want.push(("Devs/Added".to_string(), EntryKind::File));
+        want.push(("NewDir".to_string(), EntryKind::Directory));
+        want.push(("NewDir/inner".to_string(), EntryKind::File));
+        want.sort();
+        assert_eq!(walk_latin1(&mut vol, root, ""), want, "{variant:?}");
+
+        // Every byte of what it wrote, and of what was already there.
+        for (amiga, bytes) in [
+            ("Devs/Added", added.clone()),
+            ("NewDir/inner", added.clone()),
+            ("Devs/system-configuration", pattern(232)),
+            ("S/Startup-Sequence", b"Echo \"Hello\"\n".to_vec()),
+        ] {
+            let entry = vol.lookup_path(root, amiga.as_bytes()).unwrap().unwrap();
+            assert_eq!(
+                vol.read_file(entry.lba).unwrap(),
+                bytes,
+                "{variant:?}: {amiga}"
+            );
+        }
+        assert_eq!(
+            read_named(&mut vol, root, b"Caf\xe9"),
+            pattern(64),
+            "{variant:?}"
+        );
+
+        // Zero findings -- and in particular no orphan, which is what a
+        // `rm` that freed a header but not its data or extension blocks
+        // would leave behind, and no reachable-but-free block, which is
+        // what an `add` that allocated without marking would.
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after fstool mutated it: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.summary.orphans, 0, "{variant:?}");
+        assert_eq!(report.summary.reachable_but_free, 0, "{variant:?}");
+
+        // And the accounting moved the way the operations say it should:
+        // a 40 000-byte file and an empty one gone, two 9 000-byte files
+        // and a directory added. Both writers agree on the bit polarity
+        // and the bit order, or this number would be nonsense.
+        let after = vol.read_bitmap().unwrap().allocated_count();
+        assert_eq!(after, report.summary.allocated, "{variant:?}");
+        assert!(after < before, "{variant:?}: {after} vs {before}");
+    }
+}
+
+/// Look a path up and hand back its header block -- the borrow dance
+/// [`read_named`] does, for a path rather than a name.
+fn vol_lba(vol: &mut Volume<ImageDisk>, dir: u64, name: &[u8]) -> u64 {
+    vol.lookup(dir, name)
+        .expect("lookup")
+        .unwrap_or_else(|| panic!("{} is not there", latin1(name)))
+        .lba
+}
+
+/// ...and the reverse: this crate's [`Mutator`] edits a volume fstool
+/// created, and fstool reads the result.
+///
+/// The same image, mutated by two implementations in turn, checked by
+/// the one that did not write last. Every operation the mutator has:
+/// a directory and a file created, an entry renamed *across*
+/// directories (which is a splice out of one hash chain and into
+/// another), one deleted, and metadata set.
+#[test]
+fn fstool_reads_a_volume_this_crate_mutated() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-turns");
+    let src = host_fixture_tree(&scratch);
+    let created = pattern(9000);
+
+    for (variant, fstype, intl) in FSTOOL_CREATABLE {
+        let byte = variant.dostype() & 0xFF;
+        let image = scratch.path(&format!("theirs{byte}.adf"));
+        fs_run(
+            &bin,
+            &[
+                "create",
+                "-t",
+                "affs",
+                src.to_str().unwrap(),
+                "-o",
+                image.to_str().unwrap(),
+                "--size",
+                "880KiB",
+                "-O",
+                &format!("fstype={fstype},intl={intl},volume_label=Turns"),
+            ],
+        );
+
+        let vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+        let root = vol.root_lba();
+        let mut m = Mutator::open(vol).expect("mutator");
+        let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+        let keymaps = m.volume().lookup(devs, b"Keymaps").unwrap().unwrap().lba;
+        m.create_file(keymaps, b"usa1", &Metadata::new(), &created)
+            .expect("create_file");
+        m.create_dir(root, b"Libs", &Metadata::new())
+            .expect("create_dir");
+        // Across directories, and with a Latin-1 name on both ends.
+        m.rename(root, b"Caf\xe9", devs, b"Th\xe9").expect("rename");
+        m.delete(root, b"empty").expect("delete");
+        let usa1 = m.volume().lookup(keymaps, b"usa1").unwrap().unwrap().lba;
+        m.set_metadata(
+            usa1,
+            &MetaUpdate::new().protection(meta::FIBF_WRITE | meta::FIBF_DELETE),
+        )
+        .expect("set_metadata");
+        let mut vol = m.into_volume();
+        assert!(vol.validate().is_clean(), "{variant:?}: our own validator");
+        vol.into_inner().save(&image);
+        let path = image.to_str().unwrap();
+
+        // fstool's turn: the tree it sees is the one we asked for.
+        let mut found = Vec::new();
+        fstool_tree(&bin, path, "/", "", &mut found);
+        found.sort();
+        let mut want = fstool_fixture_tree();
+        want.retain(|(p, _)| p != "empty" && p != "Caf\u{e9}");
+        want.push(("Devs/Keymaps/usa1".to_string(), EntryKind::File));
+        want.push(("Devs/Th\u{e9}".to_string(), EntryKind::File));
+        want.push(("Libs".to_string(), EntryKind::Directory));
+        want.sort();
+        assert_eq!(found, want, "{variant:?}: fstool's view of our mutations");
+
+        // ...and every byte of what we created, of what we moved, and of
+        // what neither of us touched.
+        for (amiga, bytes) in [
+            ("/Devs/Keymaps/usa1".to_string(), created.clone()),
+            ("/Devs/Th\u{e9}".to_string(), pattern(64)),
+            ("/big.dat".to_string(), pattern(40_000)),
+        ] {
+            assert_eq!(
+                fs_run(&bin, &["cat", path, &amiga]),
+                bytes,
+                "{variant:?}: fstool read {amiga} differently"
+            );
+        }
+
+        // Now it writes into the volume we mutated -- allocating from a
+        // bitmap we edited in place -- and this crate still validates
+        // what it left behind. Two writers, three turns, one image.
+        let host = scratch.path("theirs-payload");
+        std::fs::write(&host, pattern(2000)).unwrap();
+        fs_run(&bin, &["add", path, host.to_str().unwrap(), "/Libs/Theirs"]);
+        let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+        let report = vol.validate();
+        assert!(
+            report.is_clean(),
+            "{variant:?} after fstool wrote into our mutated volume: {:#?}",
+            report
+                .findings
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        );
+        let root = vol.root_lba();
+        let libs = vol_lba(&mut vol, root, b"Libs");
+        assert_eq!(read_named(&mut vol, libs, b"Theirs"), pattern(2000));
+    }
+}
+
+/// The disagreement this leg found, asserted so it stays a fact.
+///
+/// `fstool` cannot *create* `DOS\4`/`DOS\5`, but it opens one and
+/// mutates it without a word of complaint — and gets two things wrong,
+/// both of which this crate's validator names. Neither is a judgement
+/// call: AmigaDOS is the specification and both implementations are
+/// trying to be it.
+///
+/// **One: the wrong fold table.** `Variant::from_flag` in
+/// `fs/affs/mod.rs` decodes the boot flag byte as three independent bits
+/// and sets `intl = flag & 2 != 0`, so `DOS\4` (flag 4) and `DOS\5`
+/// (flag 5) come out `intl: false`. Directory-cache mode *implies*
+/// international case folding — which is why [`Variant::is_intl`] here
+/// is `!matches!(self, Ofs | Ffs)` rather than a bit test — so
+/// `hash_name(name, self.variant.intl)` in `fs/affs/writer.rs` hashes an
+/// accented name down the classic table. The header lands in a slot no
+/// AmigaDOS lookup will ever walk: enumeration finds the file, `Lock()`
+/// does not. This is invisible on `DOS\0`–`DOS\3`, where the bit test
+/// and the rule agree, which is exactly why it survived.
+///
+/// **Two: the cache is not maintained.** `AffsEditor` has no notion of a
+/// dircache, so the block stays as this crate left it. On `DOS\4`/`DOS\5`
+/// AmigaDOS serves `List` *from the cache*, so the added file is not
+/// merely hard to open — it is not there at all.
+///
+/// The conclusion is not "fix the test": it is that fstool's supported
+/// set for writing is `DOS\0`–`DOS\3`, which is what
+/// [`FSTOOL_CREATABLE`] says and what every other fstool test here
+/// stays inside. This test exists so that if fstool grows dircache
+/// support, the suite says so out loud instead of quietly gaining
+/// coverage nobody noticed.
+#[test]
+fn fstool_corrupts_a_dircache_volume_it_was_never_able_to_create() {
+    let bin = fstool_oracle!();
+    let scratch = Scratch::new("fstool-dc");
+    let host = scratch.path("payload");
+    std::fs::write(&host, b"x").unwrap();
+
+    for variant in [Variant::OfsIntlDircache, Variant::FfsIntlDircache] {
+        assert!(variant.is_intl(), "dircache mode implies international");
+        let byte = variant.dostype() & 0xFF;
+        let image = populate_fstool_adf(&scratch, variant, "Cached", &format!("dc{byte}.adf"));
+        let path = image.to_str().unwrap();
+
+        // `\u{e9}clair`: an accented first byte, so the two fold tables
+        // disagree about it. It goes in without an error.
+        fs_run(&bin, &["add", path, host.to_str().unwrap(), "/\u{e9}clair"]);
+
+        let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+        let root = vol.root_lba();
+        let report = vol.validate();
+
+        // The file is in the directory -- enumeration finds it...
+        assert!(
+            walk_latin1(&mut vol, root, "")
+                .iter()
+                .any(|(p, _)| p == "\u{e9}clair"),
+            "{variant:?}: fstool did not add the file at all"
+        );
+        // ...and lookup by name, which is what an AmigaDOS `Lock()` does,
+        // never will.
+        assert!(
+            vol.lookup(root, b"\xe9clair").unwrap().is_none(),
+            "{variant:?}: fstool 0.4.26 learned that DOS\\4 is international; \
+             update FSTOOL_CREATABLE and this test"
+        );
+
+        let wrong_slot = report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::WrongChainSlot { dir, .. } if *dir == root));
+        let stale_cache = report.findings.iter().any(|f| {
+            matches!(
+                f,
+                Finding::DircacheStale {
+                    dir,
+                    detail: validate::DircacheDiscrepancy::Missing { .. },
+                    ..
+                } if *dir == root
+            )
+        });
+        assert!(wrong_slot, "{variant:?}: {:#?}", report.findings);
+        assert!(stale_cache, "{variant:?}: {:#?}", report.findings);
+        // Nothing *else* is wrong: the bitmap, the checksums, the parent
+        // pointers and the extension chains are all still right, which is
+        // what makes this two specific bugs rather than a broken writer.
+        assert_eq!(
+            report.findings.len(),
+            2,
+            "{variant:?}: {:#?}",
+            report.findings
+        );
+        assert_eq!(report.summary.orphans, 0, "{variant:?}");
+        assert_eq!(report.summary.reachable_but_free, 0, "{variant:?}");
     }
 }

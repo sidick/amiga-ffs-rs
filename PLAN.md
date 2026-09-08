@@ -23,9 +23,10 @@ plan, which owns everything outside the partition.
 
 **Landed** (commits `db33576`, `76989f3`, `a837b68`): the read side is
 complete — every variant, every block size, 82 tests green on stable
-and MSRV across both feature sets, and the xdftool differential leg
-passing on all eight variants. One box below stays open for the parts
-of the differential suite that need more than `cargo test` can reach.
+and MSRV across both feature sets, and both differential legs passing —
+xdftool on all eight variants, fstool on the six it can read. One box
+below stays open for the parts of the differential suite that need more
+than `cargo test` can reach.
 
 - [x] **Root block**: locate (from geometry / reserved blocks), parse
       name, dates, hash table, bitmap pointers. Detect the variant from
@@ -84,7 +85,7 @@ of the differential suite that need more than `cargo test` can reach.
       *different* findings, because the mutation ordering in milestone 3
       exists precisely to fail in the first direction and not the second.
 - [ ] **Differential suite**: same tree read through this crate,
-      xdftool (GPL oracle — run, never copy), affs-read (MIT —
+      xdftool (GPL oracle — run, never copy), fstool (MIT —
       readable when outputs disagree), and AROS's `afs.handler`
       (readable for understanding, licence-incompatible for copying —
       but it runs *inside a guest* against the same images, which
@@ -105,43 +106,90 @@ of the differential suite that need more than `cargo test` can reach.
       eight. It skips with a printed reason when xdftool is absent, so
       it is never a build dependency.
 
-      What remains, and why it is not done rather than merely not done
-      yet:
+      **The `fstool` leg has since landed too**, in the same file and the
+      same shape (`AMIGA_FFS_FSTOOL`, then `PATH`, skip with a printed
+      reason). Six tests, and CI `cargo install fstool --locked`s it and
+      asserts presence rather than skipping:
 
-      - **`fstool` as the readable oracle** (KarpelesLab, **MIT**,
-        crates.io) — found after the suite was built, and the piece
-        `affs-read` was supposed to be. Its AFFS backend reads *and*
-        writes `.adf`, mutates images incrementally in place, and is
-        licence-compatible: unlike xdftool it can be **read** when
-        outputs disagree, which is the whole reason the plan wanted a
-        permissive second implementation. Verified by hand at 0.4.26:
-        it reads a volume this crate built and a guest ROM then
-        mutated (`DOS\3 (FFS+INTL)`, correct tree, correct bytes), and
-        this crate reads a volume `fstool create -t affs` produced —
-        `validate()` clean, 40 000-byte extension-block crosser
-        intact. Worth wiring into `tests/differential.rs` as a third
-        leg alongside xdftool: same skip-if-absent shape, and a
-        disagreement there comes with source to read rather than
-        behaviour to infer. Note its table claims no `DOS\6`/`DOS\7`
-        long-name support, so that variant stays this crate's own
-        (and the long-name regression stays the thing only we assert).
-      - **affs-read and AROS `afs.handler` as oracles.** xdftool is the
-        leg that catches the mistakes this crate and its own synthetic
-        builder would make *together*; the other two matter for
-        understanding a disagreement once there is one. `afs.handler`
-        additionally needs a guest to run in, which is Copperline's seam
-        and not something `cargo test` can reach.
+      - **fstool reads what we write**, `DOS\0`–`DOS\5`: the variant
+        string from `info`, the whole tree entry-for-entry through `ls`,
+        and every byte of every file through `cat` — the 40 000-byte
+        extension-block crosser, the empty file, and a Latin-1 `Café`
+        whose `é` is one byte on the volume and two in fstool's output.
+        `DOS\4`/`DOS\5` read correctly through it even though it knows
+        nothing about dircache blocks, because its reader walks all 72
+        buckets rather than hashing a name to find one.
+      - **We read what it writes**, `DOS\0`–`DOS\3`: tree, bytes,
+        `validate()` clean with zero findings, at the ADF geometry and at
+        its own default 1 MiB (geometry is a documented don't-care; the
+        root-block formula agrees at both sizes, and its boot block leaves
+        the root pointer zero, which is fine because `canonical_root_lba`
+        derives it).
+      - **Mutation, both directions.** `fstool add`/`rm` and the shell's
+        `mkdir`/`put` mutate a volume this crate populated — allocating
+        from our bitmap, splicing into our hash chains, freeing an
+        extension chain we wrote — and we read it back clean, no orphans,
+        no reachable-but-free. And the reverse: `Mutator` creates,
+        renames across directories (Latin-1 on both ends), deletes and
+        sets metadata on a volume `fstool create` produced, fstool reads
+        every byte back, then writes into it again. Two independent
+        writers taking turns on one image, three turns deep.
+
+      What it cannot do, established by reading its source rather than
+      guessing, and asserted so the limits stay facts:
+
+      - **No `DOS\6`/`DOS\7`.** Confirmed, and worse than a refusal:
+        `Affs::open` accepts any boot flag 0..=7 and decodes bit 2 as
+        "dircache", so a long-name volume opens, is mislabelled `+DC`,
+        and `read_name` reads the BCPL name at the classic offset `0x1b0`
+        clamped to 30 bytes — which is not where the name is. Long names
+        stay this crate's own, and the long-name regression stays the
+        thing only we assert.
+      - **No `DOS\4`/`DOS\5` writing** — and it does not refuse, which is
+        the finding this leg paid for. Two real bugs in fstool 0.4.26,
+        both cited in the test that asserts them:
+        `Variant::from_flag` sets `intl = flag & 2 != 0`, but
+        directory-cache mode *implies* international folding, so
+        `hash_name` puts an accented name in the classic-fold slot —
+        enumeration finds the file, `Lock()` never will; and `AffsEditor`
+        has no notion of a dircache, so the cache AmigaDOS actually
+        serves `List` from is left stale. This crate's validator names
+        both. Nothing else about the resulting volume is wrong, which is
+        what makes them two specific bugs rather than a broken writer.
+      - **No comments, no dircache, no block size but 512** (`BSIZE` is a
+        compile-time constant), and no protection/owner/date knobs on
+        `create`. `-O` takes exactly `fstype`, `intl` and `volume_label`.
+      What still remains, and why it is not done rather than merely not
+      done yet:
+
+      - **AROS `afs.handler` as an oracle.** The two subprocess legs now
+        catch the mistakes this crate and its own synthetic builder would
+        make together, and `fstool` supplies the readable second
+        implementation the plan wanted `affs-read` for — so `affs-read`
+        itself is no longer wanted and is dropped from this box.
+        `afs.handler` is still worth having and is still the only oracle
+        that is also a *real consumer*, running inside a guest against the
+        same images. It needs that guest, which is Copperline's seam and
+        not something `cargo test` can reach.
       - **Block sizes other than 512.** xdftool's ADF and HDF images are
-        512-blocked; larger block sizes live behind an RDB, which is
-        `rdbtool`'s and amiga-rdb's territory. Covered synthetically at
-        512/1024/4096 in `tests/volumes.rs` meanwhile.
+        512-blocked and fstool's AFFS `BSIZE` is a constant; larger block
+        sizes live behind an RDB, which is `rdbtool`'s and amiga-rdb's
+        territory. Covered synthetically at 512/1024/4096 in
+        `tests/volumes.rs` meanwhile.
       - **Comments.** xdftool's `comment` command raises a `TypeError`
-        before writing anything (amitools 0.7.x), so no oracle-written
-        volume can carry one. Covered synthetically in both layouts,
-        `T_COMMENT` overflow block included.
+        before writing anything (amitools 0.7.x), and fstool has no
+        comment surface at all, so no oracle-written volume can carry
+        one. Covered synthetically in both layouts, `T_COMMENT` overflow
+        block included.
       - **The amibake AROS `DOS\7` fixture** — a real-world image rather
         than a generated one. Wanted; needs a fixture pipeline, not just
         a test.
+
+      Two of the four oracles this box names are now landed and wired
+      into CI, which is the substance of it; the box stays unticked
+      because the remaining two are the two that cannot be reached from
+      `cargo test` — `afs.handler` needs a guest, and the amibake fixture
+      needs a pipeline. Neither is blocked on anything here.
 
 ## Milestone 2 — create
 
