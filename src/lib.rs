@@ -45,7 +45,11 @@
 //! mark-then-use ordering in the types), [`repair`] (rebuilding a
 //! bitmap from the same walk [`validate`] performs) and [`mutate`]
 //! (creating, deleting, renaming and re-describing entries in a volume
-//! that already exists).
+//! that already exists), [`resize`] (growing or shrinking a volume in
+//! place — the root must move, because FFS recomputes its position from
+//! geometry on every mount) and [`compact`] (relocating file data and
+//! header blocks toward the layout the crate's own policy states, with
+//! the safety ReOrg's manual admits it lacks).
 //!
 //! The primitives come first because they are where a subtle mistake —
 //! the wrong `toupper` table, a hash off by the length byte, a name read
@@ -63,8 +67,9 @@
 //! `populate::populate_from_tree` turning a host directory into an image
 //! in one call under the `std` feature.
 //!
-//! Milestone 3 (mutate) is complete but for one leg of its differential
-//! suite. [`Allocator`] hands out blocks
+//! Milestone 3 (mutate) is complete, its differential suite closed in
+//! both directions — the ROM's own FFS and this crate taking turns
+//! mutating the same images. [`Allocator`] hands out blocks
 //! from an existing volume's own bitmap — refusing one that is
 //! mid-update, tracking dirty pages, and making the crash ordering
 //! visible in the types ([`Allocation::block`] to write a block,
@@ -82,7 +87,26 @@
 //! with the file header block as the single commit — before that one
 //! write the file is entirely the old one, after it entirely the new —
 //! and [`Volume::read_range`] reads a slice of a file back, walking only
-//! the blocks the range covers.
+//! the blocks the range covers. Deletion is two halves —
+//! [`Mutator::unlink`] removes the entry, [`Mutator::release`] frees the
+//! chain — so a consumer with open-handle semantics (a FUSE adapter's
+//! create-then-unlink) can hold the gap open; `delete` is the composed
+//! pair.
+//!
+//! Beyond the milestones: [`Volume::resize`] grows and shrinks a volume
+//! in place (idempotent on retry, with `resize_evacuating` moving what
+//! blocks the way); [`Mutator::compact`], `defragment_file`,
+//! `relocate_header` and `make_room` reorganise existing volumes; and
+//! the allocator's [`Intent`] vocabulary carries a measured layout
+//! policy — metadata clustered at the root where directory walks pay,
+//! file data as single ascending runs where streaming pays, extension
+//! blocks in the stream because a real Kickstart read both placements
+//! and the interleaved one won (`docs/layout-survey.md` has the
+//! numbers: a fragmented file cost 47% through a real ROM, and
+//! defragmenting recovered all of it). Ordinary [`Mutator`] writes
+//! place blocks by the same policy, so a full-content rewrite lands as
+//! one run — the copy-out-and-back defragmentation gesture that never
+//! worked on stock FFS works through this crate.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

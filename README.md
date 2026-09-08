@@ -23,13 +23,17 @@ cargo add amiga-ffs
 
 ## Status
 
-**Complete: read, create, and mutate** — the plan's three milestones
-are landed and released, each closed by an oracle that is not this
-crate: xdftool driving the same images for structure, and a real
-Kickstart 3.1 under deterministic emulation for behaviour — mounting
-volumes this crate built, reading every byte through the ROM's own FFS
-handler, mutating a volume in place, and agreeing entry-for-entry with
-the same operations replayed through this crate.
+**Complete: read, create, mutate, resize, and reorganise** — five
+milestones landed, each closed by an oracle that is not this crate:
+xdftool (GPL, run as an oracle) and fstool (MIT, readable when outputs
+disagree — reading it found two of its bugs, reported upstream) driving
+the same images for structure, and a real Kickstart 3.1 under
+deterministic emulation for behaviour — mounting volumes this crate
+built, reading every byte through the ROM's own FFS handler, mutating a
+volume in place, and agreeing entry-for-entry with the same operations
+replayed through this crate. The layout work is *measured*, not argued:
+a fragmented file cost 47% more to read through a real ROM, and this
+crate's defragmenter recovered all of it.
 
 **Reading** (milestone 1): root blocks, directory traversal
 under both fold tables, the `DOS\6`/`DOS\7` long-name layout, file data
@@ -74,9 +78,28 @@ block with two owners. `write_file`, `append` and `truncate` change a
 file's contents in place, committing every size change in the single
 header-block write that carries the length, the block count and the
 pointer table together; `Volume::read_range` is the read half, touching
-only the blocks a range covers. `PLAN.md` is the full map, including
-what is in scope but not yet scheduled (in-place resize, the muFS
-dostype survey, notes for a FUSE adapter).
+only the blocks a range covers. Deletion splits into `unlink` (remove
+the entry, keep the blocks) and `release` (free them) so a consumer
+with open handles — a FUSE adapter's create-then-unlink — can hold the
+gap open; `delete` is the composed pair.
+
+**Resizing and reorganising** (milestones 4–5): `Volume::resize` grows
+and shrinks a volume in place — the root must *move*, because FFS
+recomputes its position from geometry on every mount, and every
+top-level entry is re-parented to follow it; interrupted resizes are
+finished by calling again. `Mutator::compact`, `defragment_file`,
+`relocate_header` and `make_room` reorganise existing volumes with a
+safety property the best-known prior art lacks (ReOrg's manual admits a
+"must not be interrupted" phase; this crate's worst crash outcome at
+any write is a leaked block). Allocation follows a measured layout
+policy — metadata clustered at the root where directory walks pay, file
+data as single ascending runs where streaming pays — and ordinary
+writes place blocks by the same policy, so rewriting a file's content
+defragments it as a side effect: the copy-out-and-back gesture that
+never worked on stock FFS works here. `docs/layout-survey.md` holds the
+prior art and the real-ROM measurements behind each choice. `PLAN.md`
+is the full map, including what remains (the muFS dostype survey, the
+API-surface pass toward 1.0, notes for a FUSE adapter).
 
 ```rust
 let mut m = Mutator::open(Volume::open(disk, None)?)?;
@@ -97,11 +120,13 @@ crate is MIT OR Apache-2.0 so that emulators, image-building tools and
 hobby OS projects can all use it, whatever their own licence.
 
 Written against the layouts documented in the AmigaOS NDK and the
-FFS/AFFS format literature, tested differentially against independent
-implementations (xdftool on every variant, and a real Amiga ROM's FFS
-mounting, reading and mutating the same images under deterministic
-emulation), fuzzed, and CI-checked across stable and MSRV on both
-feature sets.
+FFS/AFFS format literature, tested differentially against three
+independent implementations (xdftool and fstool on every variant each
+supports, and a real Amiga ROM's FFS mounting, reading and mutating
+the same images under deterministic emulation), fuzzed, and CI-checked
+across stable and MSRV on both feature sets. Where behaviour was worth
+a number — what fragmentation costs, where an extension block belongs —
+it was measured through a real Kickstart rather than argued.
 
 ## License
 
