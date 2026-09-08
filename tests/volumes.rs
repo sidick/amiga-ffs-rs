@@ -5172,6 +5172,565 @@ fn delete_refuses_a_hard_links_target_and_frees_the_links_themselves() {
     assert!(vol.read_dir(root).unwrap().is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// unlink/release: the create-then-unlink split delete() is composed from
+// ---------------------------------------------------------------------------
+
+/// `unlink` then `release` must land the volume in exactly the same place
+/// `delete` does: same bitmap, byte for byte, and the same block count
+/// handed back.
+#[test]
+fn unlink_then_release_equals_delete() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+
+            // The `delete` reference: create the same two entries on two
+            // otherwise-identical volumes, delete one straight, split the
+            // other into unlink+release, and the two must finish in the
+            // same set of allocated blocks.
+            let comment = &b"a comment long enough to be worth carrying about"[..];
+            let long: Vec<u8> = if variant.has_long_names() {
+                vec![b'L'; 100]
+            } else {
+                b"Ordinary".to_vec()
+            };
+            let big = pattern(
+                hash_table_size(bs) as usize * data_payload_size(bs, variant.is_ffs()) + 100,
+            );
+
+            let via_delete = {
+                let vol = mutable(variant, bs, nblocks);
+                let root = vol.root_lba();
+                let vol = mutating(vol, |m| {
+                    let meta = Metadata::new().comment(comment);
+                    m.create_dir(root, b"Doomed", &meta).unwrap();
+                    m.create_file(root, &long, &meta, &big).unwrap();
+                });
+                let mut vol = mutating(vol, |m| {
+                    m.delete(root, b"Doomed").unwrap();
+                    m.delete(root, &long).unwrap();
+                });
+                assert_clean(&mut vol, &format!("{variant:?} @{bs} via delete"));
+                allocated_set(&mut vol)
+            };
+
+            let via_unlink_release = {
+                let vol = mutable(variant, bs, nblocks);
+                let root = vol.root_lba();
+                let vol = mutating(vol, |m| {
+                    let meta = Metadata::new().comment(comment);
+                    m.create_dir(root, b"Doomed", &meta).unwrap();
+                    m.create_file(root, &long, &meta, &big).unwrap();
+                });
+                let mut vol = mutating(vol, |m| {
+                    let h1 = m.unlink(root, b"Doomed").unwrap();
+                    let h2 = m.unlink(root, &long).unwrap();
+                    // Order shouldn't matter -- release the second one
+                    // first.
+                    m.release(h2).unwrap();
+                    m.release(h1).unwrap();
+                });
+                assert_clean(&mut vol, &format!("{variant:?} @{bs} via unlink+release"));
+                allocated_set(&mut vol)
+            };
+
+            assert_eq!(
+                via_delete, via_unlink_release,
+                "{variant:?} @{bs}: unlink+release did not land on delete's block set"
+            );
+        }
+    }
+}
+
+/// Between `unlink` and `release`, the entry's whole chain stays allocated
+/// and unreachable: `validate()` reports exactly one `OrphanBlock` per
+/// block it owns, nothing else, and the rest of the volume is untouched --
+/// including the unlinked file's own content, still readable by the LBA
+/// `unlink` handed back. That readability is the entire point: a FUSE
+/// adapter's still-open handle keeps working across the unlink.
+#[test]
+fn unlink_leaves_an_orphaned_chain_that_still_reads() {
+    let nblocks = 1760;
+    let vol = mutable(Variant::FfsIntl, 512, nblocks);
+    let root = vol.root_lba();
+
+    let mut owned_blocks = Vec::new();
+    let mut header = 0u64;
+    let mut vol = mutating(vol, |m| {
+        let payload = m.volume().lookup(root, b"Payload").unwrap().unwrap();
+        let chain = m.volume().file_chain(payload.lba).unwrap();
+        owned_blocks.push(payload.lba);
+        owned_blocks.extend(chain.extensions.iter().map(|&e| e as u64));
+        owned_blocks.extend(chain.blocks.iter().map(|&b| b as u64));
+
+        header = m.unlink(root, b"Payload").unwrap();
+        assert_eq!(header, payload.lba);
+    });
+
+    // Gone from the directory.
+    assert!(vol.lookup(root, b"Payload").unwrap().is_none());
+    assert_eq!(vol.read_dir(root).unwrap().len(), 2);
+
+    // Still there, still whole, by the LBA the caller was handed --
+    // exactly what a still-open FUSE handle needs.
+    let entry = vol.entry_at(header).unwrap();
+    assert_eq!(entry.name, b"Payload");
+    assert_eq!(vol.read_file(header).unwrap(), pattern(9000));
+
+    // Everything else on the volume is exactly as it was.
+    let small = vol.lookup(root, b"Small").unwrap().expect("Small");
+    assert_eq!(vol.read_file(small.lba).unwrap(), b"hello");
+    let devs = vol.lookup(root, b"Devs").unwrap().expect("Devs").lba;
+    let cfg = vol
+        .lookup(devs, b"system-configuration")
+        .unwrap()
+        .expect("system-configuration");
+    assert_eq!(vol.read_file(cfg.lba).unwrap(), pattern(232));
+
+    // The report is exactly the orphaned chain and nothing else.
+    let report = vol.validate();
+    let mut found: Vec<u64> = report
+        .findings
+        .iter()
+        .map(|f| match f {
+            Finding::OrphanBlock { lba } => *lba,
+            other => panic!("unexpected finding after unlink: {other}"),
+        })
+        .collect();
+    found.sort_unstable();
+    owned_blocks.sort_unstable();
+    owned_blocks.dedup();
+    assert_eq!(found, owned_blocks);
+    assert_eq!(report.summary.orphans, owned_blocks.len() as u64);
+    assert_eq!(report.summary.reachable_but_free, 0);
+
+    // And releasing it clears every one of those findings, and only
+    // those.
+    let mut m = Mutator::open(vol).unwrap();
+    let freed = m.release(header).unwrap();
+    assert_eq!(freed, owned_blocks.len() as u64);
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, "after releasing the unlinked file");
+}
+
+/// `release` refuses a header its recorded parent's hash chain still
+/// names -- a live file nobody unlinked.
+#[test]
+fn release_refuses_a_still_linked_header() {
+    let nblocks = 1760;
+    let mut vol = mutable(Variant::FfsIntl, 512, nblocks);
+    let root = vol.root_lba();
+    let payload = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+
+    let mut m = Mutator::open(vol).unwrap();
+    assert!(matches!(
+        m.release(payload),
+        Err(MutateError::StillLinked { lba, parent }) if lba == payload && parent == root
+    ));
+
+    // Refused cleanly: the file is still exactly there afterwards.
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, "after a refused release of a live file");
+    assert_eq!(
+        vol.read_file(payload).unwrap(),
+        pattern(9000),
+        "a refused release must not have touched the file"
+    );
+}
+
+/// `release` refuses a block that does not parse as a file or directory
+/// header at all -- an OFS data block here, which has its own type field
+/// and checksum and is definitely not one.
+#[test]
+fn release_refuses_a_block_that_is_not_a_header() {
+    let nblocks = 1760;
+    let vol = mutable(Variant::Ofs, 512, nblocks);
+    let root = vol.root_lba();
+    let mut vol = vol;
+    let payload = vol.lookup(root, b"Payload").unwrap().unwrap();
+    let chain = vol.file_chain(payload.lba).unwrap();
+    let data_block = chain.blocks[0] as u64;
+
+    let mut m = Mutator::open(vol).unwrap();
+    assert!(matches!(m.release(data_block), Err(MutateError::Read(_))));
+}
+
+/// Releasing the same header twice refuses the second time: the first
+/// call's frees already cleared every bit, so the second is a double free
+/// exactly as a retried `delete` would be, and the allocator's own
+/// [`AllocError::DoubleFree`] is the refusal -- there is no separate
+/// "already released" error, because by the time the reachability check
+/// has passed, "is this block already free" is the allocator's question
+/// to answer, not a second implementation of it in `Mutator`.
+#[test]
+fn releasing_twice_refuses_as_a_double_free() {
+    let nblocks = 1760;
+    let vol = mutable(Variant::FfsIntl, 512, nblocks);
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let header = m.unlink(root, b"Small").unwrap();
+    m.release(header).unwrap();
+    assert!(matches!(
+        m.release(header),
+        Err(MutateError::Alloc(AllocError::DoubleFree { .. }))
+    ));
+}
+
+/// The crash-shape claim for `unlink` alone: stop the medium after every
+/// prefix of a session that only unlinks (and creates, to give the sweep
+/// something to walk past), and the damage must always be leak-shaped --
+/// `unlink` never clears a bitmap bit at all, so the only way it can go
+/// wrong is leaving an entry half-spliced, which the walk would refuse to
+/// read.
+#[test]
+fn an_interrupted_unlink_leaks_and_never_double_allocates() {
+    for variant in [
+        Variant::Ffs,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        let nblocks = 1760;
+        let session = |vol: Volume<MemDisk>| -> (Volume<MemDisk>, bool) {
+            let mut m = match Mutator::open(vol) {
+                Ok(m) => m,
+                Err(_) => unreachable!("the bitmap is valid at the start of every prefix"),
+            };
+            let root = m.volume().root_lba();
+            let ok = m.create_dir(root, b"Fresh", &Metadata::new()).is_ok()
+                & m.unlink(root, b"Payload").is_ok()
+                & m.unlink(root, b"Small").is_ok();
+            (m.into_volume(), ok)
+        };
+
+        let total = {
+            let mut vol = mutable(variant, 512, nblocks);
+            vol.source_mut().clear_log();
+            let (vol, ok) = session(vol);
+            assert!(ok, "{variant:?}: the uninterrupted session must succeed");
+            vol.into_inner().write_log().len()
+        };
+        assert!(total >= 3, "{variant:?}: the session writes {total} blocks");
+
+        let mut crashed = 0;
+        for n in 0..=total {
+            let mut vol = mutable(variant, 512, nblocks);
+            vol.source_mut().clear_log();
+            vol.source_mut().fail_after(n);
+            let (vol, ok) = session(vol);
+            if !ok {
+                crashed += 1;
+            }
+            let disk = vol.into_inner();
+
+            let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+            let report = vol.validate();
+            for finding in &report.findings {
+                let excusable = matches!(finding, Finding::OrphanBlock { .. })
+                    || (variant.has_dircache() && matches!(finding, Finding::DircacheStale { .. }));
+                assert!(
+                    excusable,
+                    "{variant:?}: crash after {n} writes left {finding}"
+                );
+            }
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "{variant:?}: crash after {n} writes"
+            );
+        }
+        assert!(crashed > 0, "{variant:?}: no prefix actually failed");
+    }
+}
+
+/// The crash-shape claim for `release` alone: a volume that already has
+/// entries unlinked but not yet released (the on-disk state this module's
+/// documentation says is ordinary and persistent), releasing them must
+/// stay leak-shaped at every prefix of its own writes too.
+#[test]
+fn an_interrupted_release_leaks_and_never_double_allocates() {
+    for variant in [
+        Variant::Ffs,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ] {
+        let nblocks = 1760;
+
+        // Build once, uncrashed: a volume with "Payload" and "Small"
+        // already unlinked -- the starting point every trial below
+        // replays release from. `MemDisk` clones (`Volume` does not), so
+        // what is kept between trials is the disk image and the header
+        // LBAs, not the `Volume` wrapping either.
+        let (base_disk, headers): (MemDisk, Vec<u64>) = {
+            let vol = mutable(variant, 512, nblocks);
+            let root = vol.root_lba();
+            let mut headers = Vec::new();
+            let vol = mutating(vol, |m| {
+                headers.push(m.unlink(root, b"Payload").unwrap());
+                headers.push(m.unlink(root, b"Small").unwrap());
+            });
+            (vol.into_inner(), headers)
+        };
+
+        let session = |disk: MemDisk, headers: &[u64]| -> (MemDisk, bool) {
+            let vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+            let mut m = match Mutator::open(vol) {
+                Ok(m) => m,
+                Err(_) => unreachable!("the bitmap is valid at the start of every prefix"),
+            };
+            let ok = headers.iter().all(|&h| m.release(h).is_ok());
+            (m.into_volume().into_inner(), ok)
+        };
+
+        let total = {
+            let mut disk = base_disk.clone();
+            disk.clear_log();
+            let (disk, ok) = session(disk, &headers);
+            assert!(ok, "{variant:?}: the uninterrupted session must succeed");
+            disk.write_log().len()
+        };
+        assert!(total >= 1, "{variant:?}: the session writes {total} blocks");
+
+        let mut crashed = 0;
+        for n in 0..=total {
+            let mut disk = base_disk.clone();
+            disk.clear_log();
+            disk.fail_after(n);
+            let (disk, ok) = session(disk, &headers);
+            if !ok {
+                crashed += 1;
+            }
+
+            let mut vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+            let report = vol.validate();
+            for finding in &report.findings {
+                let excusable = matches!(finding, Finding::OrphanBlock { .. })
+                    || (variant.has_dircache() && matches!(finding, Finding::DircacheStale { .. }));
+                assert!(
+                    excusable,
+                    "{variant:?}: crash after {n} writes left {finding}"
+                );
+            }
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "{variant:?}: crash after {n} writes"
+            );
+        }
+        assert!(crashed > 0, "{variant:?}: no prefix actually failed");
+    }
+}
+
+/// The property-test extension: a random interleave that sometimes
+/// defers a delete into an `unlink` now and a `release` a batch later,
+/// with the model tracking both "in the tree" and "unlinked, pending
+/// release" states. After every batch the tree matches the model exactly
+/// (an unlinked entry is *not* in it) and every pending-release entry
+/// still reads back its content by LBA; the volume validates clean except
+/// for exactly one `OrphanBlock` per block a still-pending entry owns.
+#[test]
+fn a_random_interleave_mixes_unlink_and_deferred_release_with_a_model() {
+    for (v, variant) in [
+        Variant::Ofs,
+        Variant::Ffs,
+        Variant::FfsIntlDircache,
+        Variant::FfsIntlLongname,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (b, bs) in [512usize, 4096].into_iter().enumerate() {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut rng = Rng::new(0x0BEA_5E00 + (v * 16 + b) as u64);
+            let fold = variant.fold();
+            let max_name = if variant.has_long_names() {
+                MAX_NAME_LONG
+            } else {
+                MAX_NAME_CLASSIC
+            };
+
+            let vol = populated(variant, bs, nblocks, |_| {});
+            let root = vol.root_lba();
+            let mut model = Model::new(root);
+            let mut m = Mutator::open(vol).expect("mutator");
+
+            // Header LBA -> the entry as the model last knew it, for
+            // everything unlinked and not yet released.
+            let mut pending: std::collections::BTreeMap<u64, MEntry> =
+                std::collections::BTreeMap::new();
+            let mut unlinked_count = 0usize;
+            let mut released_count = 0usize;
+
+            for batch in 0..4 {
+                for _ in 0..15 {
+                    let dirs = model.dir_list();
+                    let dir = dirs[rng.below(dirs.len())];
+                    match rng.below(8) {
+                        0..=2 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let data = pattern(rng.below(3000));
+                            let meta = Metadata::new();
+                            let lba = m
+                                .create_file(dir, &name, &meta, &data)
+                                .expect("create_file");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::File,
+                                    data,
+                                    comment: Vec::new(),
+                                    protection: 0,
+                                },
+                            );
+                        }
+                        3 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let lba = m
+                                .create_dir(dir, &name, &Metadata::new())
+                                .expect("create_dir");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::Directory,
+                                    data: Vec::new(),
+                                    comment: Vec::new(),
+                                    protection: 0,
+                                },
+                            );
+                            model.dirs.insert(lba, Default::default());
+                            model.parent.insert(lba, dir);
+                        }
+                        // Remove something: either a plain delete, or an
+                        // unlink whose release the model defers.
+                        4..=6 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let e = model.dirs[&dir][&key].clone();
+                            if e.kind == EntryKind::Directory && !model.dirs[&e.lba].is_empty() {
+                                continue;
+                            }
+                            if rng.below(2) == 0 {
+                                m.delete(dir, &e.name).expect("delete");
+                            } else {
+                                let header = m.unlink(dir, &e.name).expect("unlink");
+                                assert_eq!(header, e.lba);
+                                pending.insert(header, e.clone());
+                                unlinked_count += 1;
+                            }
+                            model.dirs.get_mut(&dir).unwrap().remove(&key);
+                            if e.kind == EntryKind::Directory {
+                                model.dirs.remove(&e.lba);
+                                model.parent.remove(&e.lba);
+                            }
+                        }
+                        // Release some of what is pending -- "a batch
+                        // later," never in the same iteration it was
+                        // unlinked in.
+                        _ => {
+                            if pending.is_empty() {
+                                continue;
+                            }
+                            let keys: Vec<u64> = pending.keys().copied().collect();
+                            let header = keys[rng.below(keys.len())];
+                            m.release(header).expect("release");
+                            pending.remove(&header);
+                            released_count += 1;
+                        }
+                    }
+                }
+
+                let what = format!("{variant:?} @{bs} batch {batch}");
+                verify_model(m.volume(), &model, &what);
+
+                // Every pending entry is unreachable from the tree but
+                // still reads its content by the LBA it was handed.
+                for (&header, e) in &pending {
+                    if e.kind == EntryKind::File {
+                        assert_eq!(
+                            m.volume().read_file(header).unwrap(),
+                            e.data,
+                            "{what}: pending release {:?} changed content",
+                            Latin1(&e.name)
+                        );
+                    } else {
+                        m.volume()
+                            .entry_at(header)
+                            .expect("pending dir still parses");
+                    }
+                }
+
+                let report = m.volume().validate();
+                for finding in &report.findings {
+                    let excusable = matches!(finding, Finding::OrphanBlock { .. })
+                        || (variant.has_dircache()
+                            && matches!(finding, Finding::DircacheStale { .. }));
+                    assert!(excusable, "{what}: {finding}");
+                }
+                assert_eq!(report.summary.reachable_but_free, 0, "{what}");
+            }
+
+            assert!(
+                unlinked_count > 0,
+                "{variant:?} @{bs}: never deferred a release"
+            );
+            assert!(
+                released_count > 0,
+                "{variant:?} @{bs}: never released a deferred entry"
+            );
+
+            // Release everything still pending, then delete the rest of
+            // the tree, and the volume must land back on the blocks a
+            // fresh format had -- unlink+release leaks nothing that
+            // survives being fully drained, same as plain delete.
+            for header in pending.keys().copied().collect::<Vec<_>>() {
+                m.release(header).expect("final release");
+            }
+            loop {
+                let all = model.entry_list();
+                let mut removed = false;
+                for (dir, key) in all {
+                    let e = model.dirs[&dir][&key].clone();
+                    if e.kind == EntryKind::Directory && !model.dirs[&e.lba].is_empty() {
+                        continue;
+                    }
+                    m.delete(dir, &e.name).expect("delete");
+                    model.dirs.get_mut(&dir).unwrap().remove(&key);
+                    if e.kind == EntryKind::Directory {
+                        model.dirs.remove(&e.lba);
+                        model.parent.remove(&e.lba);
+                    }
+                    removed = true;
+                }
+                if !removed {
+                    break;
+                }
+            }
+            let mut vol = m.into_volume();
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} fully drained"));
+            let fresh = populated(variant, bs, nblocks, |_| {});
+            let mut fresh = fresh;
+            assert_eq!(
+                allocated_set(&mut vol),
+                allocated_set(&mut fresh),
+                "{variant:?} @{bs}: draining unlink+release did not return to a fresh format"
+            );
+        }
+    }
+}
+
 #[test]
 fn rename_moves_an_entry_within_and_between_directories() {
     for variant in ALL_VARIANTS {

@@ -674,6 +674,17 @@ observe.
       would clear them — turns "the driver refused" into "the driver
       protected the image". Which is the whole point of `Report` being
       typed findings rather than a boolean.
+
+      The deletion surface such an adapter should call is
+      `Mutator::unlink`/`Mutator::release` (below, "the create-then-unlink
+      split"), not `Mutator::delete`: FUSE's `unlink`/`rmdir` callback maps
+      onto `unlink` alone, and the actual block freeing happens later, on
+      the `forget`/last-`release` callback for whichever handle(s) were
+      still open — the adapter's own open-handle refcount is what decides
+      *when* to call `Mutator::release` on the LBA `unlink` returned, this
+      crate only guarantees that doing so late is safe and that not doing
+      it yet leaks nothing worse than an `OrphanBlock` a later `repair` or
+      `release` clears.
 - [x] **Crash-shape discipline**: data blocks before metadata, chain
       pointers flipped last, bitmap updated in an order that at worst
       *leaks* blocks (validator-recoverable) rather than double-uses
@@ -814,6 +825,131 @@ observe.
       this crate repaired. A prerequisite for resize, which must rebuild
       the bitmap rather than hand FFS an invalid flag the way AmiPart
       does.
+- [x] **`unlink`/`release`: the create-then-unlink split** (2026-09-08,
+      after M3 itself was landed — a FUSE-adapter requirement surfaced
+      while designing that consumer, not something the original wave
+      anticipated). `Mutator::delete` frees a block the instant its
+      directory entry disappears, which is wrong for a FUSE mount: POSIX
+      programs unlink a file while still holding it open — a temporary
+      file that cleans itself up if the program dies, a rename-over-open
+      editor save — and keep reading and writing through the handle they
+      already have. The kernel doesn't tell a filesystem "the last handle
+      closed" at the moment of `unlink()`; it tells it later, in a
+      separate call, however much later that is. A crate whose only
+      deletion primitive frees blocks synchronously with the directory
+      change gives a FUSE adapter no seam to hold that gap open at.
+
+      `Mutator::unlink(parent, name) -> Result<u64, _>` is
+      `delete`'s exact metadata half — hash-chain and link-chain splice,
+      dircache regeneration, date stamp, every refusal `delete` already
+      had (`DirectoryNotEmpty`, `LinkedTo`, an unreadable file chain) —
+      stopping short of clearing a single bitmap bit, and returning the
+      header block's LBA as the handle a caller holds until every reader
+      is done with it. `Mutator::release(header_lba) -> Result<u64, _>`
+      is the other half: free the header, its extension blocks, its data
+      blocks and its comment block. `delete` is now defined as `unlink`
+      immediately followed by `release` on the LBA it returns — one
+      implementation of each half, not three. This was a **factoring, not
+      new discipline**: the module's write-order rule 3 ("bitmap last
+      when freeing") already put the unlink before the free in `delete`'s
+      own body; splitting the function at that exact seam was the whole
+      change.
+
+      `release` does not trust that a caller only ever offers it a header
+      `unlink` actually produced. Before freeing anything it verifies
+      reachability itself — hashes the header's own recorded name and
+      walks *that one chain* in the header's own recorded parent, refusing
+      with a new typed `MutateError::StillLinked` if the header is still
+      named by it. That is the cheap end of "prove it is unreachable"
+      (one chain) rather than the thorough end (a whole `validate()` walk)
+      — deliberately: it catches exactly the mistake `release`'s contract
+      has to guard against (a header offered that was never unlinked),
+      for the cost of a lookup rather than a tree walk. `release` also
+      refuses the root (`IsRoot`) and anything that does not parse as a
+      file or directory header at all — a data block, a `T_LIST`
+      extension block, a comment block — via the same typed refusal
+      `Volume::entry_at` already gives every other caller. A second
+      `release` of an already-released header is not given its own error:
+      it surfaces as the allocator's existing `AllocError::DoubleFree`,
+      the same shape a retried `delete` already takes — by the time the
+      reachability check has passed, "is this block already free" is the
+      allocator's question to answer, not a second implementation of it
+      in `Mutator`.
+
+      **The state in between `unlink` and `release` is not a transient
+      phase this module hides — it is ordinary, persistent on-disk data**,
+      exactly as legal as the leak an interrupted `delete` already
+      produces, because it *is* that leak, held open on purpose instead of
+      by accident. Three things about it worth stating precisely, since a
+      FUSE adapter has to reason about all three:
+
+      - It survives a restart. Nothing marks it "in progress" anywhere
+        that isn't already on the disk; a `Mutator` opened fresh in a
+        later process sees the same allocated-but-unreachable chain and
+        can `release` it just the same.
+      - `validate()` classifies it as exactly `Finding::OrphanBlock`, one
+        per block owned, and nothing else — the identical finding an
+        interrupted `delete` produces, for the identical reason (the walk
+        from the root does not reach it). Pinned directly:
+        `unlink_leaves_an_orphaned_chain_that_still_reads` in
+        `tests/volumes.rs` asserts the finding set is *exactly* that set
+        and nothing more, that every other file on the volume is
+        untouched, and — the actual point — that the unlinked file's
+        content still reads correctly by the LBA `unlink` returned,
+        through `entry_at`/`read_file`, which is what a still-open FUSE
+        handle needs.
+      - `repair()` does **not** release it. `repair`'s bitmap rebuild is
+        the *union* of the reachability walk and the bitmap's existing
+        bits (its own module documentation): an orphan is already marked
+        allocated, the walk does not reach it to add anything, and the
+        union leaves it exactly as it was. That is the correct
+        conservative direction — a walk over a genuinely *damaged* volume
+        might miss a subtree that is not actually a leak, so `repair`
+        never frees anything the walk failed to reach — but the honest
+        consequence is that a crash (or a plain process exit) between
+        `unlink` and `release` leaves those blocks leaked until something
+        calls `release` on that header LBA specifically. `repair`'s job is
+        making the bitmap agree with the volume, not deciding which leaks
+        are safe to reclaim, and from inside this crate an
+        unlinked-but-still-open handle is indistinguishable from every
+        other leak it is conservative about.
+
+      **`delete()` keeps its exact existing semantics** — same refusals,
+      same write order, same return value — as the composed pair; every
+      pre-existing `delete` test passes unchanged, which is the
+      confirmation the refactor is a factoring and not a behaviour change.
+
+      Tested in `tests/volumes.rs`: `unlink_then_release_equals_delete`
+      (same final bitmap, byte for byte, as plain `delete`, on every
+      variant × {512, 4096}); `unlink_leaves_an_orphaned_chain_that_still_
+      reads` (the intermediate-state properties above, pinned directly);
+      `release_refuses_a_still_linked_header` and
+      `release_refuses_a_block_that_is_not_a_header` (the two typed
+      refusals); `releasing_twice_refuses_as_a_double_free` (the chosen,
+      documented shape for a double release); crash sweeps over `unlink`
+      alone and `release` alone
+      (`an_interrupted_unlink_leaks_and_never_double_allocates`,
+      `an_interrupted_release_leaks_and_never_double_allocates`), pinning
+      the two halves' own write-prefix safety now that they are reachable
+      independently rather than only as `delete`'s interior; and a
+      property-test extension
+      (`a_random_interleave_mixes_unlink_and_deferred_release_with_a_model`)
+      that replaces some of the seeded interleave's deletes with an
+      `unlink` now and a `release` a batch later, the model tracking both
+      "in the tree" and "unlinked, pending release" states, checking the
+      pending set's content stays readable and the volume's only findings
+      are the expected orphans at every batch boundary, and confirming a
+      full drain (release everything pending, delete everything else)
+      still lands back on a fresh format's exact block set.
+
+      The FUSE adapter this was built for is still future work (the
+      milestone-3 "Ranged reads" entry's mount-time notes are the design
+      surface it will extend), but the primitive it needs — hold a leak
+      open across an unknown gap, prove it safe to close later — did not
+      want to wait for that adapter to exist before landing, since
+      `delete`'s only alternative shape was baking synchronous freeing in
+      deep enough that adding this later would have meant relitigating
+      the write-order rules rather than factoring them.
 
 ## Milestone 4 — resize
 

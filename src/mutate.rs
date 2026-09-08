@@ -51,6 +51,91 @@
 //! sweep in `tests/volumes.rs` asserts exactly that, at every prefix of
 //! every operation's writes.
 //!
+//! # `unlink`/`release`: freeing an entry in two calls instead of one
+//!
+//! [`Mutator::delete`] is a single call because most callers have no
+//! reason to want otherwise — but a FUSE adapter does. POSIX's
+//! create-then-unlink is ordinary use, not a corner case: a program opens
+//! a file, unlinks it (a temporary file that cleans itself up even if the
+//! program is killed), and keeps reading and writing through the handle
+//! it already has. A filesystem that frees a file's blocks the moment its
+//! last directory entry disappears breaks that program the instant it
+//! touches the handle again, and a FUSE adapter has no seam to intercept
+//! it at unless the crate underneath offers one: directory-entry removal
+//! and block release have to be two operations, because *its* last handle
+//! closing may be seconds or hours after the unlink, in an entirely
+//! different call.
+//!
+//! [`Mutator::unlink`] and [`Mutator::release`] are that split.
+//! `unlink` is everything [`Mutator::delete`] does short of clearing a
+//! bitmap bit — the entry is gone from its directory, its dircache is
+//! regenerated, the parent's date is stamped, and it returns the header
+//! block's LBA, which is the handle a caller holds until every reader of
+//! it is done. `release` takes that LBA back and does the rest: verify
+//! the header is genuinely unreachable, then free its header, its
+//! extension blocks, its data blocks and its comment block. Splitting the
+//! call in two is a factoring rather than a new discipline, because
+//! `unlink` was already the first half of `delete`'s own write order (the
+//! module documentation above states it as rule 3, "bitmap last when
+//! freeing") — `delete` is now defined as `unlink` immediately followed
+//! by `release` on the LBA it returns, and there is exactly one
+//! implementation of each half.
+//!
+//! **The state in between is not a corner case either.** An entry that
+//! has been `unlink`ed but not yet `release`d is a volume with some
+//! blocks allocated and unreachable — precisely a leak, precisely what
+//! this module's write-order rules already produce for free under an
+//! interrupted `delete`, and precisely as legal. It is not a transient
+//! phase this module hides:
+//!
+//! - **It is ordinary, persistent, on-disk data.** Nothing marks it
+//!   "in progress"; there is no session-local flag anywhere for it,
+//!   because there does not need to be one. A `Mutator` that opens the
+//!   volume fresh in a later process, on a different day, sees exactly
+//!   the same allocated-but-unreachable chain an interrupted `delete`
+//!   would have left, and can `release` it just the same. The handle
+//!   [`Mutator::unlink`] hands back is simply an LBA — it survives a
+//!   restart the same way the rest of the volume does.
+//! - **[`validate`](crate::Volume::validate) classifies it as exactly
+//!   [`Finding::OrphanBlock`](crate::Finding::OrphanBlock), one per
+//!   block, and nothing else.** That is the same finding an interrupted
+//!   `delete` produces, for the same reason: the walk reaches the volume
+//!   from the root, and an unlinked header's whole chain is, by
+//!   definition, not reached from anywhere. `tests/volumes.rs` pins this
+//!   exactly — an unlinked file validates with one `OrphanBlock` per
+//!   block it owns and no other finding, the rest of the volume
+//!   unaffected.
+//! - **[`repair`](crate::repair) treats it exactly as it treats any other
+//!   leak: it stays allocated.** `repair`'s bitmap rebuild is defined as
+//!   the *union* of the reachability walk and the bitmap's own existing
+//!   bits (its own module documentation, "Repair only ever adds
+//!   allocation and only ever removes reachability") — an orphan is
+//!   already marked allocated, the walk does not reach it to add
+//!   anything, and the union keeps it exactly as it was. That is the
+//!   conservative direction on purpose: a walk over a *damaged* volume
+//!   might miss a subtree that is not actually a leak, so freeing
+//!   anything the walk failed to reach is unsafe in general, and `repair`
+//!   never does it. The consequence worth stating plainly: **calling
+//!   `repair` does not release an unlinked file's blocks.** A crash (or a
+//!   process exit) between `unlink` and `release` leaves those blocks
+//!   leaked until something calls `release` on that header LBA, or until
+//!   whatever higher-level bookkeeping tracks open handles decides the
+//!   file is orphaned and releases it during recovery — `repair`'s job is
+//!   restoring a *bitmap* that agrees with the volume, not deciding which
+//!   leaks are safe to reclaim, and an unlinked-but-still-referenced
+//!   handle looks, from inside this crate, exactly like every other leak
+//!   it is conservative about.
+//!
+//! `release` does not trust that the caller only ever offers it a header
+//! `unlink` actually produced: it re-verifies reachability itself before
+//! freeing anything (a name-hash lookup in the header's own recorded
+//! parent, not a whole-volume walk — see [`Mutator::release`]'s own
+//! documentation for why that is enough), and refuses with a typed error
+//! rather than silently doing nothing when it is not warranted. Freeing a
+//! block something still reaches is the one mistake this crate exists to
+//! never make, and `release` is the one entry point whose entire job is
+//! freeing blocks a caller has *asserted*, not derived, are unreachable.
+//!
 //! # File contents: the one place two blocks change together
 //!
 //! [`Mutator::write_file`], [`Mutator::append`] and [`Mutator::truncate`]
@@ -379,6 +464,19 @@ pub enum MutateError<E> {
         /// The root block.
         lba: u64,
     },
+    /// [`Mutator::release`] was offered a header still named by its
+    /// recorded parent's hash chain — a live file, or one somebody
+    /// re-linked after [`Mutator::unlink`] unlinked it. Freeing it would
+    /// produce exactly the corruption this crate exists to never write:
+    /// a block something reaches, marked free
+    /// ([`Finding::ReachableButFree`](crate::Finding::ReachableButFree)).
+    StillLinked {
+        /// The header block offered to `release`.
+        lba: u64,
+        /// The directory named in its own `parent` longword, whose hash
+        /// chain was walked to find it.
+        parent: u64,
+    },
     /// The entry is not in the hash chain its own name hashes to, so
     /// there is no pointer to splice it out of. The state
     /// [`Finding::WrongChainSlot`](crate::Finding::WrongChainSlot)
@@ -466,6 +564,11 @@ impl<E: fmt::Display> fmt::Display for MutateError<E> {
             Self::IsRoot { lba } => {
                 write!(f, "block {lba} is the volume root, not a directory entry")
             }
+            Self::StillLinked { lba, parent } => write!(
+                f,
+                "block {lba} is still named by directory {parent}'s own hash chain; unlink it \
+                 before releasing it"
+            ),
             Self::NotInChain { dir, lba } => write!(
                 f,
                 "block {lba} is not in the hash chain of directory {dir} its name hashes to"
@@ -1286,9 +1389,166 @@ impl<S: BlockMedium> Mutator<S> {
         Ok(new_size)
     }
 
-    // -- deleting ----------------------------------------------------------
+    // -- deleting ------------------------------------------------------------
+
+    /// Remove `name` from `parent`, without freeing anything it owns.
+    ///
+    /// This is the metadata half of [`Mutator::delete`] on its own — see
+    /// this module's "`unlink`/`release`" section for why a FUSE adapter
+    /// (or anything else honouring POSIX create-then-unlink) wants exactly
+    /// this half, separately callable. Returns the header block's LBA,
+    /// which is the handle a caller holds onto until it calls
+    /// [`Mutator::release`] — an open file descriptor, in the terms the
+    /// FUSE motivation states it in.
+    ///
+    /// Write order: out of the target's link chain first if the entry is
+    /// itself a hard link, then out of the parent's hash chain, then the
+    /// parent's dircache is regenerated and its date stamped. Exactly
+    /// [`Mutator::delete`]'s own write order up to the point it used to
+    /// start freeing blocks — this function simply stops there. Nothing
+    /// here clears a single bitmap bit, so every block the entry owns
+    /// stays allocated, unreachable, and — once this call returns —
+    /// reported by [`validate`](crate::Volume::validate) as
+    /// [`Finding::OrphanBlock`](crate::Finding::OrphanBlock), one finding
+    /// per block. That is not a defect to fix: it is the leak
+    /// [`Mutator::release`] is for, and it is exactly as recoverable as
+    /// the leak an interrupted `delete` already leaves —
+    /// [`repair`](crate::repair) keeps it allocated rather than guessing
+    /// it is safe to free (this
+    /// module's "`unlink`/`release`" section says why).
+    ///
+    /// # What it refuses
+    ///
+    /// Identical to [`Mutator::delete`]'s refusals, because this is
+    /// exactly the half of `delete` where they are checked: a
+    /// **directory with anything in it**
+    /// ([`MutateError::DirectoryNotEmpty`]), an entry that is the
+    /// **target of a hard link** ([`MutateError::LinkedTo`] — see
+    /// [`Mutator::delete`] for the four-implementation survey that
+    /// settled this), and a **file whose chain does not read**
+    /// ([`MutateError::Read`], from the same block-enumeration `delete`
+    /// uses to know what to free — checked here even though nothing is
+    /// freed yet, because `delete` must refuse it before unlinking and
+    /// `unlink` is `delete`'s first half).
+    pub fn unlink(&mut self, parent: u64, name: &[u8]) -> Result<u64, MutateError<Transport<S>>> {
+        let entry = self.expect_entry(parent, name)?;
+        // The same enumeration `delete` uses to know what to free, run
+        // here purely for its refusals (a non-empty directory, an
+        // unreadable file chain) and then discarded: `release` recomputes
+        // the set itself, from whatever the volume looks like when it is
+        // called, which may be a different session entirely.
+        self.blocks_of(&entry)?;
+
+        // A link is spliced out of its target's chain while it is still
+        // reachable from the directory: the other order would leave the
+        // target naming a block that is about to be freed.
+        if matches!(entry.kind, EntryKind::LinkFile | EntryKind::LinkDir) {
+            self.unlink_from_link_chain(&entry)?;
+        } else if entry.next_link != 0 {
+            return Err(MutateError::LinkedTo {
+                lba: entry.lba,
+                link: entry.next_link,
+            });
+        }
+
+        self.splice_from_hash_chain(parent, &entry)?;
+        self.refresh_dircache(parent)?;
+        self.touch(parent)?;
+        Ok(entry.lba)
+    }
+
+    /// Free the header, its chain and everything else it owns.
+    ///
+    /// The second half of [`Mutator::delete`], and the operation a FUSE
+    /// adapter calls once the last open handle on an already-unlinked file
+    /// closes. `header_lba` is whatever [`Mutator::unlink`] returned —
+    /// possibly in an earlier `Mutator` session, possibly on a volume this
+    /// one just opened, since the unlinked-but-not-released state is
+    /// ordinary on-disk data and survives exactly as well as anything else
+    /// does (this module's "`unlink`/`release`" section).
+    ///
+    /// Returns how many blocks came back, the same accounting
+    /// [`Mutator::delete`] returns.
+    ///
+    /// # The reachability check
+    ///
+    /// Before freeing anything, this verifies the header is genuinely
+    /// unreachable: it hashes the header's own recorded name and walks
+    /// *that one hash chain* in the header's own recorded parent — not a
+    /// walk of the volume, just the one chain a lookup of this name would
+    /// walk. If the header is still in it, this refuses with
+    /// [`MutateError::StillLinked`] rather than free a block something
+    /// reaches, which is precisely the
+    /// [`Finding::ReachableButFree`](crate::Finding::ReachableButFree)
+    /// corruption every other write order in this crate exists to avoid.
+    /// That is the cheap end of "verify it is unreachable" rather than the
+    /// thorough end (a full [`validate`](crate::Volume::validate) walk):
+    /// it catches exactly the mistake this function's contract has to
+    /// guard against — a caller that never called `unlink`, or one that
+    /// (impossibly, if nothing else on the volume relinked it) races
+    /// `release` against a second unlink — for the cost of one chain
+    /// instead of the whole tree.
+    ///
+    /// Also refuses [`MutateError::IsRoot`] for the root block, and
+    /// whatever typed [`MutateError::Read`] [`Volume::entry_at`] gives for
+    /// a block that does not parse as a file or directory header at all —
+    /// a data block, a `T_LIST` extension block, a comment block, or
+    /// anything else this crate does not lay a header down as.
+    ///
+    /// # Freeing twice
+    ///
+    /// Releasing an already-released header is not given its own error:
+    /// it surfaces as [`AllocError::DoubleFree`] (wrapped in
+    /// [`MutateError::Alloc`]) from [`Allocator::free`], the same as a
+    /// retried [`Mutator::delete`] does today. The reachability check
+    /// above does not catch it — a released header was never relinked, so
+    /// its parent's chain still does not name it — and there is no
+    /// cleaner refusal to give: by the time the check above has passed,
+    /// "is this block already free" is exactly the allocator's own
+    /// question to answer, not a second implementation of it here.
+    pub fn release(&mut self, header_lba: u64) -> Result<u64, MutateError<Transport<S>>> {
+        if header_lba == self.vol.root_lba() {
+            return Err(MutateError::IsRoot { lba: header_lba });
+        }
+        let entry = self.vol.entry_at(header_lba)?;
+
+        let slot = self.slot_of(&entry.name);
+        let block_count = self.vol.block_count();
+        let mut next = self.vol.hash_table(entry.parent as u64)?[slot];
+        let mut steps = 0u64;
+        while next != 0 {
+            if next as u64 == header_lba {
+                return Err(MutateError::StillLinked {
+                    lba: header_lba,
+                    parent: entry.parent as u64,
+                });
+            }
+            steps += 1;
+            if steps > block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
+                    lba: next as u64,
+                }));
+            }
+            next = self.vol.entry_at(next as u64)?.hash_chain;
+        }
+
+        let free = self.blocks_of(&entry)?;
+        for lba in &free {
+            self.alloc.free(*lba)?;
+        }
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(free.len() as u64)
+    }
 
     /// Delete `name` from `parent`, and return how many blocks came back.
+    ///
+    /// Exactly [`Mutator::unlink`] followed by [`Mutator::release`] on the
+    /// header it returns — there is one implementation of each half, and
+    /// this is their composition, not a third copy. Every refusal
+    /// documented on those two applies here in the same order: `unlink`'s
+    /// checks run before anything is freed, so a `delete` that refuses
+    /// changes nothing.
     ///
     /// Write order, and the reason for it: the entry is spliced out of the
     /// **metadata** first — out of its target's link chain if it is a hard
@@ -1352,34 +1612,11 @@ impl<S: BlockMedium> Mutator<S> {
     ///   available here, so a damaged file is repair's to sort out, not a
     ///   delete's to guess at.
     pub fn delete(&mut self, parent: u64, name: &[u8]) -> Result<u64, MutateError<Transport<S>>> {
-        let entry = self.expect_entry(parent, name)?;
-        let free = self.blocks_of(&entry)?;
-
-        // A link is spliced out of its target's chain while it is still
-        // reachable from the directory: the other order would leave the
-        // target naming a block that is about to be freed.
-        if matches!(entry.kind, EntryKind::LinkFile | EntryKind::LinkDir) {
-            self.unlink_from_link_chain(&entry)?;
-        } else if entry.next_link != 0 {
-            return Err(MutateError::LinkedTo {
-                lba: entry.lba,
-                link: entry.next_link,
-            });
-        }
-
-        self.unlink(parent, &entry)?;
-        self.refresh_dircache(parent)?;
-        self.touch(parent)?;
-
-        for lba in &free {
-            self.alloc.free(*lba)?;
-        }
-        self.flush()?;
-        self.stamp_blocks_used()?;
-        Ok(free.len() as u64)
+        let header_lba = self.unlink(parent, name)?;
+        self.release(header_lba)
     }
 
-    // -- renaming ----------------------------------------------------------
+    // -- renaming --------------------------------------------------------
 
     /// Move and/or rename an entry, within one directory or between two on
     /// the same volume.
@@ -1457,7 +1694,7 @@ impl<S: BlockMedium> Mutator<S> {
             comment_block = 0;
         }
 
-        self.unlink(parent, &entry)?;
+        self.splice_from_hash_chain(parent, &entry)?;
 
         // After the unlink, because for a rename within one slot the
         // unlink is exactly what changed this slot's head.
@@ -1793,7 +2030,12 @@ impl<S: BlockMedium> Mutator<S> {
     /// The successor is re-read from the entry's block rather than taken
     /// from the caller's [`Entry`], so an entry that has been re-chained
     /// since it was looked up cannot be spliced with a stale pointer.
-    pub(crate) fn unlink(
+    ///
+    /// Named for the block it edits rather than for [`Mutator::unlink`],
+    /// which is this plus the metadata half of a link splice plus the
+    /// dircache and date bookkeeping — this is the one primitive write
+    /// both [`Mutator::unlink`] and [`Mutator::rename`] share.
+    pub(crate) fn splice_from_hash_chain(
         &mut self,
         dir: u64,
         entry: &Entry,
