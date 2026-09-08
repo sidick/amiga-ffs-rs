@@ -24,6 +24,51 @@
 //!   *per volume*, on the same disk. A `[u8; 512]` in the trait
 //!   signature is a wall built exactly where the format is flexible.
 //!
+//! # The shape of the API
+//!
+//! Read once; it explains several things that look like duplication and
+//! are not.
+//!
+//! **Two writers, same verbs.** [`Populator`] and [`Mutator`] both have
+//! `create_dir`/`create_file`, deliberately under the same names: the
+//! *operation* is the same, the *session contract* differs. A
+//! `Populator` fills a volume this crate just formatted — the free
+//! space is known, not discovered, the bitmap is written once at
+//! `finish()`, and the volume is unmountable mid-session by design. A
+//! `Mutator` changes a volume anybody wrote — every block comes from
+//! the volume's own bitmap, every operation leaves the volume
+//! consistent, and the crash-shape rules hold at each step. Building a
+//! fresh image: `Populator`. Everything else: `Mutator`.
+//!
+//! **[`Metadata`] describes; [`MetaUpdate`] amends.** Creation takes a
+//! full description (absent means the default); `set_metadata` takes
+//! `Option` per field (absent means untouched) — because "unmentioned"
+//! must not mean "cleared" when there is existing state to clear.
+//!
+//! **One error type per operation family**, not one for the crate:
+//! [`Error`] (reading), [`FormatError`], [`PopulateError`],
+//! [`AllocError`], [`MutateError`], [`ResizeError`],
+//! [`CompactError`]. Each is generic over the
+//! block device's own error, which survives unflattened and is
+//! reachable through `source()` under `std`; each lists exactly what
+//! its operations can refuse, so a caller matches what can actually
+//! happen rather than a crate-wide catch-all. `validate()` is the
+//! deliberate exception: damage is not an error, so it returns typed
+//! [`Finding`]s in a [`Report`] and keeps walking.
+//!
+//! **[`Volume`] accretes capabilities by module** — reading and
+//! traversal from [`read`], file data from [`mod@file`], the bitmap
+//! from [`bitmap`], `validate()`/`repair()`/`resize()` from their
+//! modules — so its docs page is long; the module docs are where each
+//! capability's reasoning lives.
+//!
+//! **Constructor verbs say what happens**: `Volume::open` reads and
+//! verifies structures off a medium; `Populator::new` formats first
+//! (`adopt` wraps a volume already formatted this session);
+//! `Mutator::open` checks the volume is safe to mutate;
+//! `Allocator::load` reads the whole bitmap. None of them is a plain
+//! `new` because none of them is free.
+//!
 //! # Status
 //!
 //! Primitives — DOS-type/variant model, block checksums (standard and
@@ -109,6 +154,7 @@
 //! worked on stock FFS works through this crate.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
@@ -168,6 +214,9 @@ pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 /// the caller sizes to `block_size()`; implementations must reject a
 /// mismatched buffer via their error type rather than truncate.
 pub trait BlockSource {
+    /// How this source reports a failed read. No bound is imposed:
+    /// `no_std` backends bring whatever error type they have, and the
+    /// crate's own error types carry it through unflattened.
     type Error;
 
     /// This source's block size in bytes. Stable for the source's
