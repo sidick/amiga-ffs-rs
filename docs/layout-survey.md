@@ -457,6 +457,60 @@ than PLAN.md states it as, since even a modest fixed seek cost
 (4–11 ms track-to-track on mechanical media) compounds fast over
 thousands of metadata touches during a session.
 
+## 4a. Measured: what fragmentation actually costs a real ROM
+
+Everything above about runtime behaviour is inference from AROS as a
+proxy. This section is not: it is a measurement against a genuine
+Kickstart 3.1 (A1200) reading a floppy, run under Copperline, whose
+emulation is deterministic — so the numbers are exact and reproducible
+rather than a benchmark with error bars.
+
+`examples/frag-bench.rs` builds two `DOS\3` DD floppies that differ in
+**nothing but block placement**. Both hold the same 200 000-byte file
+(391 data blocks) with identical bytes. In one, `Populator`'s forward
+cursor lays the data down as 6 ascending runs; in the other the same
+file is threaded through holes left by creating 180 small files and
+deleting every second one — wear, not sabotage, and the shape a volume
+takes after months of use. Total in-order head travel: 395 blocks
+against 790.
+
+Then Workbench 3.1 boots from `df0`, and an AmigaShell script stamps
+`date`, copies the file off `df1` to `ram:`, and stamps `date` again
+(typed while the copy runs, so the console buffer makes the second
+stamp the copy's own end time):
+
+| layout | runs | start | end | elapsed |
+|---|---|---|---|---|
+| contiguous | 6 | 12:42:58 | 12:43:17 | **19 s** |
+| fragmented | 83 | 12:42:58 | 12:43:26 | **28 s** |
+
+**47% slower, for the identical file.** The start stamps agree to the
+second across two separate emulator runs, which is the determinism
+doing its job: the only variable was the layout.
+
+What this establishes and what it does not:
+
+- **Establishes** that layout has a large, measurable cost through the
+  real ROM's own FFS on the most seek-sensitive medium. A policy that
+  keeps files in a handful of runs is worth having; this is no longer
+  reasoned from first principles.
+- **Consistent with** §2's one-request-per-block conclusion — a
+  filesystem that batched contiguous runs would show a wider gap than
+  47%, since the contiguous case would also be saving requests.
+- **Does not** transfer the *ratio* to hard disks or CF. Floppy is the
+  extreme: a head step is milliseconds and the track buffer is only 11
+  blocks. Mechanical drives will show less, CF/SD less again, and
+  measuring those needs a different rig than an ADF in `df1`.
+- **Does not** isolate seek from rotational latency, nor tell us
+  anything about metadata scatter — which, per §1, ReOrg's author
+  considered the *dominant* cost. That experiment is the obvious next
+  one: two volumes differing only in how far directory and header
+  blocks sit from the root, same files, same data layout.
+
+Reproduce with `cargo run --example frag-bench -- outdir`, then boot
+each image under Copperline with a real Kickstart and the script shape
+above.
+
 ## 5. What could not be established
 
 - Whether the real Commodore ROM FFS batches contiguous block reads

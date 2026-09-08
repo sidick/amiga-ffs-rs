@@ -990,6 +990,24 @@ observe.
      current implementation will accept. Compaction is not merely a
      companion to shrink; it is what lets shrink reach its limit.
 
+  **Passive reorganisation** is the third strategy, and the one worth
+  building alongside the policy rather than after it. Aminet's
+  `PFS2DefragTry` (Martin Steigerwald, 1998 — crediting Simon for the
+  idea) defragments by copying each fragmented file out and back,
+  letting the filesystem lay it down afresh. That works on PFS2/AFS
+  because *their* allocators deliberately seek contiguous runs; it does
+  **not** transfer to FFS, whose allocator is a volume-wide next-fit
+  rover with no such intent, so a recopy just lands the file wherever
+  the rover happens to be. But this crate *is* the writer when it is
+  the one mutating, and it chooses placement rather than hoping — so it
+  can do passively what PFS does natively: when a file is being
+  rewritten anyway, place the new blocks as one run; when a mutation
+  passes through a directory, prefer allocations that pull its entries
+  toward it. No separate pass, no tool to run, just leaving a volume
+  better than it was found. The cost is that it makes writes place
+  blocks by policy rather than by cursor, which is the same machinery
+  item 1 needs — which is why the two belong in one piece of work.
+
   **Survey before designing the policy**, the way the allocator and the
   LNFS layout were surveyed: ReOrg and the other commercial Amiga
   defragmenters had opinions tuned against real drives and real FFS
