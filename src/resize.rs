@@ -226,6 +226,17 @@ pub enum ResizeError<E> {
     /// but a shrink that cannot place what it must move is refused rather
     /// than attempted.
     NoRoomBelowCut,
+    /// [`Volume::resize_evacuating`]'s own extra step — relocating
+    /// whatever occupied the new root's target block, via
+    /// [`crate::mutate::Mutator::make_room`] — failed. The volume is
+    /// returned unchanged (this is checked, read-only-equivalent, before
+    /// the ordinary shrink resumes), and the plain
+    /// [`ResizeError::RootTargetOccupied`] this wraps names the block that
+    /// could not be cleared.
+    EvacuationFailed {
+        /// The block make_room could not clear.
+        lba: u64,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for ResizeError<E> {
@@ -269,6 +280,10 @@ impl<E: fmt::Display> fmt::Display for ResizeError<E> {
             Self::NoRoomBelowCut => f.write_str(
                 "a shrink needed to relocate a metadata block below the new end and found no \
                  free block there",
+            ),
+            Self::EvacuationFailed { lba } => write!(
+                f,
+                "could not relocate whatever occupies block {lba}, where the new root would go"
             ),
         }
     }
@@ -371,13 +386,7 @@ impl<S: BlockSource> Volume<S> {
         let block_count = self.block_count();
         let bitmap = self.read_bitmap()?;
         let movable = movable_metadata(self, &bitmap)?;
-
-        let mut floor = reserved + 1;
-        for lba in bitmap.allocated() {
-            if lba + 1 > floor && !movable.contains(&lba) {
-                floor = lba + 1;
-            }
-        }
+        let floor = allocated_floor(reserved, &bitmap, &movable);
         if floor > block_count {
             return Ok(floor);
         }
@@ -404,6 +413,44 @@ impl<S: BlockSource> Volume<S> {
         let min = reserved + 1 + 2 * (root_target - reserved);
         Ok(min.max(floor))
     }
+
+    /// The theoretical floor PLAN.md's own compaction entry names:
+    /// `minimum_size`'s achievable-by-[`Volume::resize`]-alone answer,
+    /// without the extra headroom that method's own
+    /// [`ResizeError::RootTargetOccupied`] refusal forces it to reserve.
+    ///
+    /// This is exactly `allocated-blocks-plus-metadata-overhead` —
+    /// the highest allocated, non-movable block plus one — which is what
+    /// [`Volume::resize`] can reach once whatever occupies the new root's
+    /// target has been relocated first, the way
+    /// [`Volume::resize_evacuating`] (or a manual
+    /// [`crate::compact`]/[`crate::mutate::Mutator::make_room`] pass) does.
+    /// On a volume packed solid from `reserved` upward — this crate's own
+    /// allocator's ordinary output — this can be roughly half of what
+    /// [`Volume::minimum_size`] reports, which is precisely the gap
+    /// PLAN.md's "Block layout policy, and compaction" entry names:
+    /// relocation is what lets a shrink reach its limit, not merely
+    /// accompany it.
+    pub fn minimum_size_floor(&mut self) -> Result<u64, ReadError<S::Error>> {
+        let reserved = self.reserved();
+        let bitmap = self.read_bitmap()?;
+        let movable = movable_metadata(self, &bitmap)?;
+        Ok(allocated_floor(reserved, &bitmap, &movable))
+    }
+}
+
+/// The highest allocated, non-movable block plus one, or `reserved + 1`
+/// if nothing is. Shared by [`Volume::minimum_size`] (which then extends
+/// it to account for [`ResizeError::RootTargetOccupied`]'s extra
+/// headroom) and [`Volume::minimum_size_floor`] (which does not).
+fn allocated_floor(reserved: u64, bitmap: &Bitmap, movable: &[u64]) -> u64 {
+    let mut floor = reserved + 1;
+    for lba in bitmap.allocated() {
+        if lba + 1 > floor && !movable.contains(&lba) {
+            floor = lba + 1;
+        }
+    }
+    floor
 }
 
 impl<S: BlockMedium> Volume<S> {
@@ -730,6 +777,72 @@ impl<S: BlockMedium> Volume<S> {
             blocks_freed,
             repair,
         })
+    }
+}
+
+impl<S: BlockMedium> Volume<S> {
+    /// [`Volume::resize`], except a shrink refused with
+    /// [`ResizeError::RootTargetOccupied`] is retried once after
+    /// relocating whatever occupied the new root's target block, via
+    /// [`crate::mutate::Mutator::make_room`].
+    ///
+    /// **[`Volume::resize`]'s own refusal stays the default** — this is a
+    /// separate, explicitly-opted-into method, not a flag flipped on the
+    /// existing one, on purpose: `RootTargetOccupied` is cheap to check
+    /// and free of side effects, and a caller who only wanted to *try* a
+    /// shrink (PLAN.md's own `minimum_size`-then-`resize` pattern) should
+    /// not have a refusal silently turn into a bigger, invasive operation
+    /// it did not ask for. A caller that wants relocation gets it by
+    /// calling this method by name, the same way `Volume::minimum_size`
+    /// and `Volume::minimum_size_floor` are two methods rather than one
+    /// with a mode flag.
+    ///
+    /// Takes and returns `self` by value rather than `&mut self`: closing
+    /// the gap requires briefly handing the volume to a
+    /// [`crate::mutate::Mutator`] session (`make_room` is `Mutator`'s
+    /// territory, not `resize`'s own — see this module's documentation for
+    /// why relocating arbitrary user data was always out of scope for the
+    /// plain root-move this module implements), and `Mutator::open` takes
+    /// its volume by value. The volume comes back either way, whether the
+    /// evacuation attempt succeeded or not.
+    ///
+    /// Only ever touches the disk beyond what [`Volume::resize`] already
+    /// would when `RootTargetOccupied` is the *first* refusal
+    /// encountered: the ordinary refusal path here is unconditionally
+    /// safe (nothing is written before it fires), so evacuating is always
+    /// attempted against an otherwise-untouched volume, and
+    /// [`ResizeError::EvacuationFailed`] leaves the volume exactly as
+    /// `Volume::resize` alone would have.
+    pub fn resize_evacuating(
+        mut self,
+        new_block_count: u64,
+    ) -> (Self, Result<ResizeReport, ResizeError<Transport<S>>>) {
+        let lba = match self.resize(new_block_count) {
+            Ok(report) => return (self, Ok(report)),
+            Err(ResizeError::RootTargetOccupied { lba }) => lba,
+            Err(e) => return (self, Err(e)),
+        };
+
+        // `resize`'s own refusal above only fires once its bitmap is
+        // already known valid (it repairs first if not), so `Mutator::open`
+        // refusing here is not expected to happen. It is not treated as an
+        // ordinary error, because `Mutator::open` does not hand a refused
+        // volume back and this method's whole contract is that it always
+        // does: there is no `Self` left to return. A panic, clearly
+        // labelled, is more honest than inventing one.
+        let mut m = crate::mutate::Mutator::open(self).unwrap_or_else(|_| {
+            unreachable!(
+                "Mutator::open refused a volume Volume::resize just proved has a valid \
+                 bitmap (block {lba} occupied the new root's target)"
+            )
+        });
+        if m.make_room(lba..lba + 1).is_err() {
+            let vol = m.into_volume();
+            return (vol, Err(ResizeError::EvacuationFailed { lba }));
+        }
+        let mut vol = m.into_volume();
+        let result = vol.resize(new_block_count);
+        (vol, result)
     }
 }
 

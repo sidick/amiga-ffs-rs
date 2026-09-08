@@ -983,6 +983,114 @@ observe.
   oversight (frag-bench's *fragmented* image is still built through
   `Mutator`, unchanged, on purpose).
 
+  **Wave 2 landed**: item 2 (compaction) and, for the one refusal it
+  named, item 3 (closing `resize`'s gap). New module `src/compact.rs`,
+  as inherent methods on `Mutator` (the mutation façade already owns
+  every other write-path operation; a separate `Compactor` type would
+  have been a second one). Two tiers, matching the survey's own §6b
+  ordering:
+
+  - **Tier 1**, `Mutator::defragment_file`: relocates one file's data
+    blocks and `T_LIST` extension blocks (fetch order, per wave 1's own
+    interleaving finding — not the data pointers alone) into one
+    ascending run, without moving the header. Atomicity is exactly
+    `edit_file`'s own shape, generalized from length to position:
+    allocate the whole destination first, write every block at its new
+    home, then **one** header write swaps the table over — before it the
+    file is entirely the old one, after it entirely the new one.
+    `bitmap_flag` never leaves −1; this is ordinary `Mutator` discipline,
+    not a new safety story.
+  - **Tier 2**, `Mutator::relocate_header`: moves a directory or file
+    header to a new LBA. This is where the survey said the bugs would
+    live, and the reason is concrete: `T_LIST` parent pointers, OFS data
+    blocks' `header_key`, and `T_DIRCACHE` blocks' owning-directory field
+    are all *hard*-checked on an ordinary read (typed errors, not
+    `validate()` findings) — so patching one in place, on either side of
+    the pointer that names the header, leaves a crash window in which the
+    file or directory is unreadable through whichever number is
+    currently authoritative. The fix: every hard-checked dependent gets a
+    **fresh copy**, built already naming the header's new number, before
+    anything points at any of it; a single write then retargets whichever
+    pointer currently names the header (the parent's hash slot, or the
+    previous entry's hash-chain longword). This tier does **not** keep
+    `bitmap_flag` at −1 throughout — it is not a single commit the way
+    tier 1 is, so it is honestly flagged mid-update for its duration,
+    the same choice `resize`'s own root move and `Populator` already
+    make, closed by a same-relocation retry exactly `resize`'s own
+    "Retrying" contract, generalized from "the root" to "any header."
+    The honest cost, stated rather than buried: on FFS a header move
+    touches only its extension blocks; **on OFS it touches every data
+    block**, because `header_key` is real and enforced. Full re-pointing
+    list: parent's hash slot/predecessor's chain longword (the commit);
+    every extension block's `TL_PARENT`; every OFS data block's
+    `header_key`; a moved directory's own dircache chain (fresh copies)
+    and its direct children's `parent` longwords (soft, patched after the
+    commit, matching `resize`'s own reparenting); an LNFS overflow
+    comment block's `HeaderKey` (fresh copy); hard-link `real_entry` in
+    every link naming a moved target, and the one predecessor pointer in
+    a moved link's own chain.
+  - `Mutator::make_room(range)`: evacuates every movable allocated block
+    (headers via tier 2; a file's data/extension blocks via a
+    range-scoped tier 1 that moves only what is actually in the range,
+    not the whole file — an unqualified whole-file move turned out not
+    to fit for a large file straddling a small target range, caught by
+    this wave's own resize-integration test) out of an LBA range. The
+    root, bitmap pages and bitmap extension blocks are deliberately
+    excluded — that is `resize`'s own `movable_metadata`, not
+    duplicated here.
+  - `Volume::resize_evacuating` closes the one refusal item 3 named:
+    `ResizeError::RootTargetOccupied` retried once after an internal
+    `make_room` of the target block. **Not** the default — `resize()`
+    itself is unchanged and keeps refusing, on purpose (a caller that
+    only wanted to *try* a shrink should not have a cheap, side-effect-
+    free refusal silently turn into an invasive relocation it did not
+    ask for) — a separate, explicitly opt-in method instead.
+    `Volume::minimum_size_floor` reports the true floor (allocated blocks
+    plus metadata overhead) alongside the existing, more conservative
+    `Volume::minimum_size`.
+  - `Mutator::compact`/`compact_with`: the policy pass, tier 1 across
+    every file by default (`CompactOptions`, dry-run and progress
+    callback included), tier 2 opt-in
+    (`CompactOptions::relocate_headers`, default off — full metadata
+    clustering by default was judged a bigger blast radius than a
+    defragmentation pass should have without being asked). Measured on
+    `examples/frag-bench.rs`'s own fragmented image: 80 runs in fetch
+    order before, 1 after (`cargo run --example frag-bench`, which now
+    also builds and reports a `defragmented.adf` third image, for
+    replaying the real-ROM timing script against the compacted result by
+    hand).
+
+  Tested: relocate-then-verify for FFS and OFS (tier 1 and tier 2, files
+  and directories), the frag-bench run-count claim above, `make_room`
+  evacuating an occupied range, dry-run report accuracy, the
+  `resize_evacuating` integration, both differential oracles reading a
+  compacted image (`tests/differential.rs`), and three dedicated crash
+  sweeps (tier 1, tier 2, `make_room`) each replaying every write prefix
+  and checking both `repair()` alone (never `ReachableButFree`, never
+  anything but `OrphanBlock` left over) and `repair()`-then-retry
+  (byte-identical, and — for tier 1 — fully clean; tier 2/`make_room`
+  can leave one superseded destination's blocks as a harmless leak,
+  which a retry does not recover, on the same accepted terms `resize`'s
+  own crash sweep already documents). **Narrower than the milestone's
+  full ask, honestly**: the variant/block-size sweep is FFS/OFS at 512
+  bytes with a handful of variants (not the full 512/4096 ×
+  every-variant-incl.-LNFS matrix); the seeded property test
+  (`a_random_interleave_of_mutations_agrees_with_a_model`) was not
+  extended with compaction interleaved among its mutations. Both are
+  gaps worth closing before this lands as anything more than "landed and
+  working," not oversights papered over.
+
+  **Wave 3, passive reorganisation, stays open** — item after item 3 in
+  this entry's own original ordering, and not attempted this wave: making
+  `Mutator`'s own day-to-day writes place blocks by `Intent` instead of
+  by whatever hint they use today, so a volume gets a little better every
+  time it is written to rather than only when a compaction is run by
+  hand. Wave 2's tier 1/tier 2 primitives are exactly the machinery a
+  passive pass would call into (the same `defragment_file`/
+  `relocate_header` shapes, triggered opportunistically rather than
+  swept end to end), so this is now unblocked, not merely still-a-good-
+  idea.
+
   The format itself is the evidence. The root sits at the *midpoint* of
   the volume — the whole reason `canonical_root_lba` exists and the
   reason a resize has to move it — so that a seek to the root is on
@@ -993,7 +1101,9 @@ observe.
   step per block. A design that put its root in the middle was designed
   around seek.
 
-  So, in the order they should be built:
+  So, in the order they should be built (1 and 2/3 below are the wave 1
+  and wave 2 landed above; this numbered list is kept as the original
+  planning record rather than rewritten):
 
   1. **Policy at creation.** `format` and `Populator` already produce
      contiguous files, but by accident of a forward-cursor allocator

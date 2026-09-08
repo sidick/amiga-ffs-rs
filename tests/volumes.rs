@@ -7314,3 +7314,574 @@ fn resize_refuses_a_root_target_occupied_by_real_data() {
     assert_eq!(allocated_set(&mut vol), before);
     assert_clean(&mut vol, "after a refused grow");
 }
+
+// ---------------------------------------------------------------------------
+// Block layout policy (wave 2: compaction)
+// ---------------------------------------------------------------------------
+
+/// The fetch-order run count of one file, using the crate's own reading
+/// (not a hand-rolled reimplementation): `FileChain::blocks`, with a
+/// `T_LIST` extension block spliced in at its natural fetch position —
+/// the same metric `a_large_files_read_path_is_one_ascending_run_
+/// straight_out_of_populate` already established as the honest one.
+fn file_run_count(vol: &mut Volume<MemDisk>, header_lba: u64) -> usize {
+    let chain = vol.file_chain(header_lba).unwrap();
+    let seq = read_path_sequence(&chain, vol.block_size());
+    count_runs(&seq)
+}
+
+/// A volume with one large file threaded through holes left by deleting
+/// every other file of a filler set -- the same rig
+/// `examples/frag-bench.rs`'s `build_fragmented` uses, and the shape a
+/// volume takes after months of use, not sabotage.
+fn fragmented_volume(variant: Variant, bs: usize, nblocks: u64) -> (Volume<MemDisk>, u64) {
+    let mut disk = MemDisk::filled(bs, nblocks, 0xA5);
+    let opts = FormatOptions::new(variant, nblocks, b"Frag");
+    amiga_ffs::format(&mut disk, &opts).unwrap();
+    let vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let filler = pattern(bs * 2);
+    let mut names = Vec::new();
+    for i in 0..120u32 {
+        let name = format!("F{i:03}");
+        m.create_file(root, name.as_bytes(), &amiga_ffs::Metadata::new(), &filler)
+            .unwrap();
+        names.push(name);
+    }
+    for (i, name) in names.iter().enumerate() {
+        if i % 2 == 0 {
+            m.delete(root, name.as_bytes()).unwrap();
+        }
+    }
+    let payload = pattern(200_000);
+    let header = m
+        .create_file(root, b"Payload", &amiga_ffs::Metadata::new(), &payload)
+        .unwrap();
+    (m.into_volume(), header)
+}
+
+#[test]
+fn tier1_defragments_a_scattered_file_into_one_run_ffs() {
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    let before_bytes = vol.read_file(header).unwrap();
+    let before_runs = file_run_count(&mut vol, header);
+    assert!(before_runs > 1, "test setup: file must start fragmented");
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.defragment_file(header).unwrap();
+    assert_eq!(report.runs_before, before_runs);
+    assert_eq!(report.runs_after, 1);
+    let mut vol = m.into_volume();
+
+    assert_eq!(file_run_count(&mut vol, header), 1);
+    assert_eq!(vol.read_file(header).unwrap(), before_bytes);
+    let root = vol.root_lba();
+    assert_eq!(
+        vol.lookup(root, b"Payload").unwrap().unwrap().lba,
+        header,
+        "the header itself must not have moved -- tier 1's whole point"
+    );
+    assert_clean(&mut vol, "after tier 1 defragmentation");
+}
+
+#[test]
+fn tier1_defragments_a_scattered_file_into_one_run_ofs() {
+    let (mut vol, header) = fragmented_volume(Variant::OfsIntl, 512, 4000);
+    let before_bytes = vol.read_file(header).unwrap();
+    assert!(file_run_count(&mut vol, header) > 1);
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.defragment_file(header).unwrap();
+    assert_eq!(report.runs_after, 1);
+    let mut vol = m.into_volume();
+
+    assert_eq!(vol.read_file(header).unwrap(), before_bytes);
+    assert_clean(&mut vol, "after tier 1 defragmentation (OFS)");
+}
+
+#[test]
+fn tier1_is_a_no_op_on_an_already_contiguous_file() {
+    let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Payload",
+            &amiga_ffs::Metadata::new(),
+            &pattern(50_000),
+        )
+        .unwrap();
+    });
+    let root = vol.root_lba();
+    let header = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+    assert_eq!(
+        file_run_count(&mut vol, header),
+        1,
+        "populate lays it down as one run"
+    );
+
+    vol.source_mut().clear_log();
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.defragment_file(header).unwrap();
+    assert_eq!(report.blocks_relocated, 0);
+    let mut vol = m.into_volume();
+    assert_eq!(
+        vol.source_mut().write_log().len(),
+        0,
+        "a no-op must write nothing"
+    );
+}
+
+#[test]
+fn full_compact_drops_the_frag_bench_images_run_count_toward_one() {
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    let before_runs = file_run_count(&mut vol, header);
+    assert!(
+        before_runs >= 20,
+        "test setup: expected heavy fragmentation, got {before_runs} runs"
+    );
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.compact(&CompactOptions::new()).unwrap();
+    assert!(report.files_relocated >= 1);
+    let mut vol = m.into_volume();
+
+    assert_eq!(
+        file_run_count(&mut vol, header),
+        1,
+        "a full compact must bring the payload down to one run, from {before_runs}"
+    );
+    assert_clean(&mut vol, "after a full compact");
+}
+
+#[test]
+fn compact_dry_run_writes_nothing_and_reports_the_work() {
+    let (mut vol, _header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    vol.source_mut().clear_log();
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.compact(&CompactOptions::new().dry_run(true)).unwrap();
+    assert!(report.dry_run);
+    assert!(report.files_relocated >= 1);
+    assert!(report.runs_before_total > report.runs_after_total);
+
+    let mut vol = m.into_volume();
+    assert_eq!(
+        vol.source_mut().write_log().len(),
+        0,
+        "a dry run must never write"
+    );
+}
+
+#[test]
+fn tier2_relocates_a_file_header_and_everything_still_reads_ffs() {
+    let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Payload",
+            &amiga_ffs::Metadata::new(),
+            &pattern(50_000),
+        )
+        .unwrap();
+    });
+    let root = vol.root_lba();
+    let old_lba = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+    let before_bytes = vol.read_file(old_lba).unwrap();
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.relocate_header(old_lba).unwrap();
+    assert_ne!(report.old_lba, report.new_lba);
+    let mut vol = m.into_volume();
+
+    let entry = vol.lookup(root, b"Payload").unwrap().unwrap();
+    assert_eq!(entry.lba, report.new_lba);
+    assert_eq!(vol.read_file(entry.lba).unwrap(), before_bytes);
+    assert_clean(&mut vol, "after a tier-2 file relocation (FFS)");
+}
+
+#[test]
+fn tier2_relocates_a_file_header_and_everything_still_reads_ofs() {
+    let mut vol = populated(Variant::OfsIntl, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Payload",
+            &amiga_ffs::Metadata::new(),
+            &pattern(50_000),
+        )
+        .unwrap();
+    });
+    let root = vol.root_lba();
+    let old_lba = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+    let before_bytes = vol.read_file(old_lba).unwrap();
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.relocate_header(old_lba).unwrap();
+    assert!(
+        report.dependents_relocated > 0,
+        "OFS: data blocks must be recopied"
+    );
+    let mut vol = m.into_volume();
+
+    let entry = vol.lookup(root, b"Payload").unwrap().unwrap();
+    assert_eq!(vol.read_file(entry.lba).unwrap(), before_bytes);
+    assert_clean(&mut vol, "after a tier-2 file relocation (OFS)");
+}
+
+#[test]
+fn tier2_relocates_a_directory_reparenting_its_children() {
+    let mut vol = populated(Variant::FfsIntlDircache, 512, 1760, |pop| {
+        let root = pop.root_lba();
+        let meta = amiga_ffs::Metadata::new();
+        let dir = pop.create_dir(root, b"Devs", &meta).unwrap();
+        pop.create_file(dir, b"a", &meta, b"one").unwrap();
+        pop.create_file(dir, b"b", &meta, b"two").unwrap();
+    });
+    let root = vol.root_lba();
+    let old_lba = vol.lookup(root, b"Devs").unwrap().unwrap().lba;
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.relocate_header(old_lba).unwrap();
+    assert_eq!(report.children_reparented, 2);
+    let mut vol = m.into_volume();
+
+    let dir = vol.lookup(root, b"Devs").unwrap().unwrap();
+    assert_eq!(dir.lba, report.new_lba);
+    let a = vol.lookup(dir.lba, b"a").unwrap().unwrap();
+    let b = vol.lookup(dir.lba, b"b").unwrap().unwrap();
+    assert_eq!(a.parent as u64, dir.lba);
+    assert_eq!(b.parent as u64, dir.lba);
+    assert_eq!(vol.read_file(a.lba).unwrap(), b"one");
+    assert_eq!(vol.read_file(b.lba).unwrap(), b"two");
+    assert_clean(&mut vol, "after a tier-2 directory relocation");
+}
+
+#[test]
+fn make_room_evacuates_an_occupied_range() {
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    let root = vol.root_lba();
+
+    // A range squarely inside the payload's own data: whatever tier this
+    // block belongs to, `make_room` must clear it.
+    let chain = vol.file_chain(header).unwrap();
+    let target = chain.blocks[chain.blocks.len() / 2] as u64;
+    let range = target..target + 4;
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.make_room(range.clone()).unwrap();
+    assert!(report.blocks_evacuated > 0);
+    let mut vol = m.into_volume();
+
+    for lba in range {
+        assert_ne!(
+            vol.read_bitmap().unwrap().is_allocated(lba),
+            Some(true),
+            "block {lba} should have been evacuated"
+        );
+    }
+    let entry = vol.lookup(root, b"Payload").unwrap().unwrap();
+    assert!(vol.read_file(entry.lba).is_ok());
+    assert_clean(&mut vol, "after make_room");
+}
+
+#[test]
+fn resize_evacuating_closes_the_root_target_occupied_gap() {
+    let bs = 512usize;
+    let old_n = 2000u64;
+
+    let mut vol = populated(Variant::Ffs, bs, old_n, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Big", &amiga_ffs::Metadata::new(), &pattern(600_000))
+            .unwrap();
+    });
+    let grown = old_n + 50;
+    let new_root = canonical_root_lba(grown, 2).unwrap();
+    assert_eq!(
+        vol.read_bitmap().unwrap().is_allocated(new_root),
+        Some(true),
+        "test setup: the new root's target must actually collide with data"
+    );
+    vol.source_mut().grow(grown);
+
+    // The plain method keeps refusing -- the chosen default.
+    let err = vol.resize(grown).unwrap_err();
+    assert!(matches!(err, ResizeError::RootTargetOccupied { .. }));
+
+    // The opt-in method clears the way and finishes the grow.
+    let (mut vol, result) = vol.resize_evacuating(grown);
+    result.expect("resize_evacuating should succeed once the target is clear");
+    assert_eq!(vol.block_count(), grown);
+    assert_eq!(vol.root_lba(), new_root);
+    let root = vol.root_lba();
+    let big = vol.lookup(root, b"Big").unwrap().unwrap();
+    assert_eq!(vol.read_file(big.lba).unwrap(), pattern(600_000));
+    assert_clean(&mut vol, "after resize_evacuating");
+}
+
+#[test]
+fn minimum_size_floor_is_never_looser_than_minimum_size() {
+    let bs = 512usize;
+    let n = 2000u64;
+    let mut vol = populated(Variant::Ffs, bs, n, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Big", &amiga_ffs::Metadata::new(), &pattern(600_000))
+            .unwrap();
+    });
+    let floor = vol.minimum_size_floor().unwrap();
+    let conservative = vol.minimum_size().unwrap();
+    assert!(
+        floor <= conservative,
+        "the true floor ({floor}) must never be a looser bound than the conservative \
+         answer ({conservative})"
+    );
+}
+
+#[test]
+fn tier1_crash_sweep_never_leaves_a_block_double_allocated_or_loses_bytes() {
+    let bs = 512usize;
+    let nblocks = 4000u64;
+
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, bs, nblocks);
+    let before_bytes = vol.read_file(header).unwrap();
+    vol.source_mut().clear_log();
+    // The fixture, still fragmented, before any defragmentation write —
+    // what every crashed attempt below starts from. Reusing the
+    // *already-defragmented* disk here would make every retried call a
+    // no-op (nothing left to move), which is the bug this comment is
+    // guarding against having crept back in.
+    let disk_before = vol.into_inner();
+
+    let total = {
+        let vol = Volume::open_with(disk_before.clone(), None, nblocks, 2).unwrap();
+        let mut m = Mutator::open(vol).unwrap();
+        m.defragment_file(header).unwrap();
+        m.into_volume().source_mut().write_log().len()
+    };
+    assert!(total > 0);
+
+    let mut crashed = 0;
+    for n in 0..total {
+        let mut disk = disk_before.clone();
+        disk.clear_log();
+        disk.fail_after(n);
+        let vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
+        let mut m = Mutator::open(vol).unwrap();
+        if m.defragment_file(header).is_err() {
+            crashed += 1;
+        }
+        let mut crashed_disk = m.into_volume().into_inner();
+        crashed_disk.stop_failing();
+
+        let mut vol = Volume::open_with(crashed_disk, None, nblocks, 2).unwrap();
+        let report = vol.validate();
+        assert_eq!(
+            report.summary.reachable_but_free, 0,
+            "crash after {n} writes: never a double allocation"
+        );
+        for finding in &report.findings {
+            assert!(
+                matches!(finding, Finding::OrphanBlock { .. }),
+                "crash after {n} writes: unexpected finding {finding}"
+            );
+        }
+        assert_eq!(
+            vol.read_file(header).unwrap(),
+            before_bytes,
+            "crash after {n} writes: file must be byte-identical (old or new, never mixed)"
+        );
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+#[test]
+fn tier2_crash_sweep_repair_is_safe_and_retry_reaches_byte_identical() {
+    let bs = 512usize;
+    let nblocks = 1760u64;
+
+    let mut vol = populated(Variant::FfsIntl, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Payload",
+            &amiga_ffs::Metadata::new(),
+            &pattern(50_000),
+        )
+        .unwrap();
+    });
+    let root = vol.root_lba();
+    let old_lba = vol.lookup(root, b"Payload").unwrap().unwrap().lba;
+    let before_bytes = vol.read_file(old_lba).unwrap();
+    vol.source_mut().clear_log();
+
+    let total = {
+        let mut m = Mutator::open(vol).unwrap();
+        m.relocate_header(old_lba).unwrap();
+        let mut vol2 = m.into_volume();
+        vol2.source_mut().write_log().len()
+    };
+    assert!(total > 0);
+
+    // Rebuild the same starting fixture fresh for the sweep.
+    let fixture = || -> Volume<MemDisk> {
+        populated(Variant::FfsIntl, bs, nblocks, |pop| {
+            let root = pop.root_lba();
+            pop.create_file(
+                root,
+                b"Payload",
+                &amiga_ffs::Metadata::new(),
+                &pattern(50_000),
+            )
+            .unwrap();
+        })
+    };
+
+    let mut crashed = 0;
+    for n in 0..total {
+        let mut vol = fixture();
+        vol.source_mut().fail_after(n);
+        let mut m = Mutator::open(vol).unwrap();
+        if m.relocate_header(old_lba).is_err() {
+            crashed += 1;
+        }
+        let mut crashed_disk = m.into_volume().into_inner();
+        crashed_disk.stop_failing();
+
+        // Path A: repair() alone must be safe -- never a double
+        // allocation, and every finding left over must be a leak, not
+        // corruption.
+        {
+            let mut vol_a = Volume::open_with(crashed_disk.clone(), None, nblocks, 2).unwrap();
+            let _ = vol_a.repair(&RepairOptions::new());
+            let report = vol_a.validate();
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "crash after {n} writes, tier 2: never a double allocation"
+            );
+        }
+
+        // Path B: repair() then a retry of the same relocation, looked
+        // up by name (its LBA may already have changed), reaches a
+        // clean, byte-identical volume.
+        {
+            let mut vol_b = Volume::open_with(crashed_disk.clone(), None, nblocks, 2).unwrap();
+            let _ = vol_b.repair(&RepairOptions::new());
+            let root = vol_b.root_lba();
+            let current = vol_b.lookup(root, b"Payload").unwrap().unwrap().lba;
+            let mut m = Mutator::open(vol_b).unwrap();
+            // A retry may itself need repeating once more if the crash
+            // landed inside the retry's own window; two attempts is
+            // enough for this fixture's write count.
+            if m.relocate_header(current).is_err() {
+                let vol2 = m.into_volume();
+                let mut vol2 = vol2;
+                let _ = vol2.repair(&RepairOptions::new());
+                let root2 = vol2.root_lba();
+                let current2 = vol2.lookup(root2, b"Payload").unwrap().unwrap().lba;
+                m = Mutator::open(vol2).unwrap();
+                let _ = m.relocate_header(current2);
+            }
+            let mut vol2 = m.into_volume();
+            // A retry cannot recover an *earlier*, already-abandoned
+            // attempt's half-written destination blocks -- the same
+            // "at most a harmless leak" cost `crate::resize`'s own
+            // retry story already accepts (see
+            // resize_shrink_crash_sweep_never_leaves_a_block_double_
+            // allocated's Path B). Never anything else, and never a
+            // double allocation.
+            let report = vol2.validate();
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "crash after {n} writes, tier 2, post-retry: never a double allocation"
+            );
+            for finding in &report.findings {
+                assert!(
+                    matches!(finding, Finding::OrphanBlock { .. }),
+                    "crash after {n} writes, tier 2, post-retry: unexpected finding {finding}"
+                );
+            }
+            let root2 = vol2.root_lba();
+            let entry = vol2.lookup(root2, b"Payload").unwrap().unwrap();
+            assert_eq!(
+                vol2.read_file(entry.lba).unwrap(),
+                before_bytes,
+                "crash after {n} writes, tier 2: bytes must survive the retry"
+            );
+        }
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+#[test]
+fn make_room_crash_sweep_repair_is_safe_and_retry_reaches_byte_identical() {
+    let bs = 512usize;
+    let nblocks = 4000u64;
+
+    let fixture = || fragmented_volume(Variant::FfsIntl, bs, nblocks);
+    let (mut vol, header) = fixture();
+    let before_bytes = vol.read_file(header).unwrap();
+    let chain = vol.file_chain(header).unwrap();
+    let target = chain.blocks[chain.blocks.len() / 2] as u64;
+    let range = target..target + 4;
+
+    let total = {
+        let vol2 = fixture().0;
+        let mut m = Mutator::open(vol2).unwrap();
+        m.make_room(range.clone()).unwrap();
+        m.into_volume().source_mut().write_log().len()
+    };
+    assert!(total > 0);
+
+    let mut crashed = 0;
+    for n in 0..total {
+        let (mut vol, _) = fixture();
+        vol.source_mut().fail_after(n);
+        let mut m = Mutator::open(vol).unwrap();
+        if m.make_room(range.clone()).is_err() {
+            crashed += 1;
+        }
+        let mut crashed_disk = m.into_volume().into_inner();
+        crashed_disk.stop_failing();
+
+        // Path A: repair() alone must be safe.
+        {
+            let mut vol_a = Volume::open_with(crashed_disk.clone(), None, nblocks, 2).unwrap();
+            let _ = vol_a.repair(&RepairOptions::new());
+            let report = vol_a.validate();
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "crash after {n} writes, make_room: never a double allocation"
+            );
+        }
+
+        // Path B: repair(), then a retry of the same evacuation, reaches
+        // a clean-or-leak-only volume with the file byte-identical.
+        {
+            let mut vol_b = Volume::open_with(crashed_disk, None, nblocks, 2).unwrap();
+            let _ = vol_b.repair(&RepairOptions::new());
+            let mut m = Mutator::open(vol_b).unwrap();
+            let _ = m.make_room(range.clone());
+            let mut vol_b = m.into_volume();
+            let _ = vol_b.repair(&RepairOptions::new());
+            let report = vol_b.validate();
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "crash after {n} writes, make_room, post-retry: never a double allocation"
+            );
+            for finding in &report.findings {
+                assert!(
+                    matches!(finding, Finding::OrphanBlock { .. }),
+                    "crash after {n} writes, make_room, post-retry: unexpected finding {finding}"
+                );
+            }
+            let root = vol_b.root_lba();
+            let entry = vol_b.lookup(root, b"Payload").unwrap().unwrap();
+            assert_eq!(
+                vol_b.read_file(entry.lba).unwrap(),
+                before_bytes,
+                "crash after {n} writes, make_room: bytes must survive the retry"
+            );
+        }
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
+}

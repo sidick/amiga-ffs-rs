@@ -1100,6 +1100,89 @@ fn xdftool_reads_a_volume_this_crate_mutated() {
     }
 }
 
+/// Wave 2's whole claim, from the outside: a volume this crate's own
+/// compactor has rewritten -- data blocks relocated (tier 1), a
+/// directory header moved (tier 2) -- is not merely readable by this
+/// crate's own reader again, it is a volume *neither oracle can tell was
+/// ever touched*. Both oracles read the same image; where they agree,
+/// the claim is about this crate's compactor specifically, not about
+/// whichever oracle happened to be installed.
+#[test]
+fn both_oracles_read_a_volume_this_crate_compacted() {
+    let scratch = Scratch::new("compact");
+    let image = mutable_adf(&scratch, Variant::FfsIntl, "compact.adf");
+
+    let created = pattern(9000);
+    let vol = Volume::open(ImageDisk::open(&image), None).expect("open");
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).expect("mutator");
+    let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+    m.create_file(devs, b"Big", &Metadata::new(), &created)
+        .expect("create_file");
+
+    // Tier 1: scatter "Big"'s data by rewriting it a few times through
+    // ordinary `Mutator` calls (which do not place by policy -- wave 1's
+    // own deliberate non-goal), then defragment it back to one run.
+    for _ in 0..3 {
+        m.truncate(devs, b"Big", 0).expect("truncate");
+        m.write_file(devs, b"Big", 0, &created).expect("rewrite");
+    }
+    let big = m.volume().lookup(devs, b"Big").unwrap().unwrap().lba;
+    m.defragment_file(big).expect("tier 1");
+
+    // Tier 2: relocate the directory header itself, reparenting its
+    // children in the process.
+    let report = m.relocate_header(devs).expect("tier 2");
+
+    let mut vol = m.into_volume();
+    assert!(vol.validate().is_clean(), "our own validator, post-compact");
+    vol.into_inner().save(&image);
+    let path = image.to_str().unwrap();
+
+    // xdftool: the tree and every byte, through a reader sharing no
+    // code with the compactor.
+    if let Some(argv) = xdftool() {
+        let listing = run(&argv, &[path, "list"]);
+        for present in ["Devs", "Big", "system-configuration"] {
+            assert!(
+                listing.contains(present),
+                "xdftool cannot see {present}:\n{listing}"
+            );
+        }
+        let back = scratch.path("back");
+        run(&argv, &[path, "read", "Devs/Big", back.to_str().unwrap()]);
+        assert_eq!(std::fs::read(&back).unwrap(), created, "xdftool: Devs/Big");
+    } else {
+        eprintln!("xdftool not found -- skipping its half of this differential check");
+    }
+
+    // fstool: the same claim, from an MIT-licensed, source-readable
+    // second implementation.
+    if let Some(bin) = fstool() {
+        let cat = fs_run(&bin, &["cat", path, "/Devs/Big"]);
+        assert_eq!(cat, created, "fstool: /Devs/Big");
+        let info = fs_text(&bin, &["info", path]);
+        assert!(
+            info.contains("fs kind:           affs"),
+            "fstool did not recognise the compacted image as AFFS:\n{info}"
+        );
+    } else {
+        eprintln!("fstool not found -- skipping its half of this differential check");
+    }
+
+    // And this crate's own reader, opening the file fresh from disk
+    // rather than trusting the in-memory `Mutator` session, agrees with
+    // both: the directory really did move, its child really was
+    // reparented, and the bytes really are what was written.
+    let mut vol = Volume::open(ImageDisk::open(&image), None).unwrap();
+    let root = vol.root_lba();
+    let devs = vol.lookup(root, b"Devs").unwrap().unwrap();
+    assert_eq!(devs.lba, report.new_lba);
+    let big = vol.lookup(devs.lba, b"Big").unwrap().unwrap();
+    assert_eq!(big.parent as u64, devs.lba);
+    assert_eq!(vol.read_file(big.lba).unwrap(), created);
+}
+
 /// The same operation sequence, applied through both implementations,
 /// must produce the same *tree*.
 ///

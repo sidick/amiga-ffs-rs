@@ -176,6 +176,33 @@ fn build_fragmented() -> MemDisk {
     m.into_volume().into_inner()
 }
 
+/// The fragmented image, run through wave 2's tier-1 compaction
+/// (`Mutator::defragment_file`), so the same `describe` this file already
+/// uses to report a run count can report it again afterwards. This is
+/// the "defragment, then measure" pairing PLAN.md's compaction entry
+/// asks for: boot `defragmented.adf` under Copperline with the same
+/// script this file's own module documentation describes for
+/// `contiguous.adf`/`fragmented.adf`, and the timing should land back
+/// near the contiguous number, not the fragmented one -- the real-ROM
+/// half of the claim this crate's compactor makes.
+fn build_defragmented() -> MemDisk {
+    let disk = build_fragmented();
+    let mut vol = Volume::open(disk, None).expect("open");
+    let root = vol.root_lba();
+    let header = vol
+        .lookup(root, b"Payload")
+        .expect("lookup")
+        .expect("present")
+        .lba;
+    let mut m = Mutator::open(vol).expect("mutator");
+    let report = m.defragment_file(header).expect("defragment_file");
+    eprintln!(
+        "defragment_file: {} runs before, {} after, {} blocks relocated",
+        report.runs_before, report.runs_after, report.blocks_relocated
+    );
+    m.into_volume().into_inner()
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: frag-bench <outdir>");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -183,10 +210,11 @@ fn main() {
     for (label, disk) in [
         ("contiguous", build_contiguous()),
         ("fragmented", build_fragmented()),
+        ("defragmented", build_defragmented()),
     ] {
         let (disk, desc) = describe(disk, b"Payload");
         println!("{label}: {desc}");
         std::fs::write(format!("{dir}/{label}.adf"), &disk.0).expect("write");
     }
-    println!("payload is {PAYLOAD} bytes in both images");
+    println!("payload is {PAYLOAD} bytes in every image");
 }

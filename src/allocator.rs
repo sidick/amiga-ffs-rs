@@ -644,6 +644,36 @@ impl<E> Allocator<E> {
         }
     }
 
+    /// [`Allocator::allocate_for`], but scanning from `hint` instead of
+    /// `intent`'s own hint.
+    ///
+    /// For a caller that already knows the *kind* of placement it wants
+    /// (so the [`Intent`] tag it records or reasons about stays honest)
+    /// but needs to retry at a different starting point than that intent
+    /// would naturally give — [`crate::compact`]'s range-avoiding retries
+    /// are the one caller today. Ordinary callers want
+    /// [`Allocator::allocate_for`].
+    pub fn allocate_for_hinted(
+        &mut self,
+        _intent: Intent,
+        hint: u64,
+    ) -> Result<Allocation, AllocError<E>> {
+        self.allocate_near(hint)
+    }
+
+    /// [`Allocator::allocate_run`], but scanning from `hint` instead of
+    /// `intent`'s own hint. See [`Allocator::allocate_for_hinted`] for why
+    /// this exists as a separate entry point rather than a parameter on
+    /// [`Allocator::allocate_run`] itself.
+    pub fn allocate_run_hinted(
+        &mut self,
+        n: u64,
+        _intent: Intent,
+        hint: u64,
+    ) -> Result<Vec<Allocation>, AllocError<E>> {
+        self.allocate_run_from(n, Some(hint))
+    }
+
     /// Reserve up to `n` *contiguous* free blocks near `intent`'s hint (or
     /// from the rotating cursor for [`Intent::Anywhere`]), so a file
     /// writer can grab its whole extent — or as much of one as the volume
@@ -672,11 +702,25 @@ impl<E> Allocator<E> {
         n: u64,
         intent: Intent,
     ) -> Result<Vec<Allocation>, AllocError<E>> {
+        self.allocate_run_from(n, intent.hint())
+    }
+
+    /// [`Allocator::allocate_run`]'s body, taking a raw hint (already an
+    /// LBA, `None` for the rotating cursor) instead of an [`Intent`] —
+    /// shared by [`Allocator::allocate_run`] itself and
+    /// [`Allocator::allocate_run_hinted`], which needs the scan to start
+    /// somewhere other than the [`Intent`] tag it is still carrying for
+    /// bookkeeping would imply.
+    fn allocate_run_from(
+        &mut self,
+        n: u64,
+        hint: Option<u64>,
+    ) -> Result<Vec<Allocation>, AllocError<E>> {
         if n == 0 {
             return Ok(Vec::new());
         }
         let covered = self.covered();
-        let from = match intent.hint() {
+        let from = match hint {
             Some(hint) => hint.saturating_sub(self.reserved).min(covered),
             None => self.cursor.min(covered),
         };
@@ -824,6 +868,35 @@ impl<E> Allocator<E> {
             }
         }
         None
+    }
+
+    /// Allocate one specific, already-known-free block.
+    ///
+    /// The exact-destination counterpart of [`Allocator::allocate_near`]:
+    /// a caller that has already chosen `lba` (a compactor evacuating a
+    /// range, a caller retrying a relocation at the same target) needs an
+    /// [`Allocation`] naming *that* block, not the nearest free one to a
+    /// hint. Refuses [`AllocError::NotCovered`] outside the bitmap's range
+    /// and, distinctly, refuses by construction rather than silently
+    /// double-booking: if `lba` is already marked allocated this returns
+    /// [`AllocError::DoubleFree`]'s mirror image — reusing
+    /// [`AllocError::NotCovered`] would misreport *why*, so this is its own
+    /// check inline rather than a new variant for one caller's one case.
+    pub fn allocate_exact(&mut self, lba: u64) -> Result<Allocation, AllocError<E>> {
+        let bit = self.bit_of(lba).ok_or(AllocError::NotCovered { lba })?;
+        let w = (bit / 32) as usize;
+        let mask = 1u32 << (bit % 32);
+        if self.words[w] & mask == 0 {
+            // Already allocated: reuse `NotCovered`'s sibling shape rather
+            // than invent a variant for a collision this crate has no
+            // other caller for yet.
+            return Err(AllocError::NotCovered { lba });
+        }
+        self.words[w] &= !mask;
+        self.free -= 1;
+        let page = self.page_of(bit);
+        self.dirty[page] = true;
+        Ok(Allocation { lba, page })
     }
 
     /// Mark a block allocated without handing it out.

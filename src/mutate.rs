@@ -559,8 +559,8 @@ impl<'a> MetaUpdate<'a> {
 /// and it is affordable here precisely because this module never lets the
 /// bitmap say "free" about a block something reaches.
 pub struct Mutator<S: BlockMedium> {
-    vol: Volume<S>,
-    alloc: Allocator<Transport<S>>,
+    pub(crate) vol: Volume<S>,
+    pub(crate) alloc: Allocator<Transport<S>>,
     clock: Option<DateStamp>,
 }
 
@@ -1398,13 +1398,13 @@ impl<S: BlockMedium> Mutator<S> {
 
     // -- shared machinery --------------------------------------------------
 
-    fn bs(&self) -> usize {
+    pub(crate) fn bs(&self) -> usize {
         self.vol.block_size()
     }
 
     /// The hash slot a name lands in on this volume, under its own fold
     /// table.
-    fn slot_of(&self, name: &[u8]) -> usize {
+    pub(crate) fn slot_of(&self, name: &[u8]) -> usize {
         let fold = self.vol.variant().fold();
         name_hash(name, fold, hash_table_size(self.bs())) as usize
     }
@@ -1419,7 +1419,7 @@ impl<S: BlockMedium> Mutator<S> {
         })
     }
 
-    fn expect_directory(&mut self, lba: u64) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn expect_directory(&mut self, lba: u64) -> Result<(), MutateError<Transport<S>>> {
         if lba == self.vol.root_lba() {
             return Ok(());
         }
@@ -1568,7 +1568,10 @@ impl<S: BlockMedium> Mutator<S> {
     /// This is the set [`Mutator::delete`] frees, so it is also where the
     /// non-empty-directory refusal lives: the check and the enumeration
     /// are the same walk, and separating them would let them disagree.
-    fn blocks_of(&mut self, entry: &Entry) -> Result<Vec<u64>, MutateError<Transport<S>>> {
+    pub(crate) fn blocks_of(
+        &mut self,
+        entry: &Entry,
+    ) -> Result<Vec<u64>, MutateError<Transport<S>>> {
         let mut out = vec![entry.lba];
         if entry.comment_block != 0 {
             out.push(entry.comment_block as u64);
@@ -1600,7 +1603,11 @@ impl<S: BlockMedium> Mutator<S> {
     /// The successor is re-read from the entry's block rather than taken
     /// from the caller's [`Entry`], so an entry that has been re-chained
     /// since it was looked up cannot be spliced with a stale pointer.
-    fn unlink(&mut self, dir: u64, entry: &Entry) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn unlink(
+        &mut self,
+        dir: u64,
+        entry: &Entry,
+    ) -> Result<(), MutateError<Transport<S>>> {
         let bs = self.bs();
         let block_count = self.vol.block_count();
         let slot = self.slot_of(&entry.name);
@@ -1732,7 +1739,7 @@ impl<S: BlockMedium> Mutator<S> {
     ///
     /// A no-op on the six variants without dircaches, so callers do not
     /// have to ask.
-    fn refresh_dircache(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn refresh_dircache(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
         if !self.vol.variant().has_dircache() {
             return Ok(());
         }
@@ -1815,7 +1822,7 @@ impl<S: BlockMedium> Mutator<S> {
     /// Stamp a directory's DateStamp and the root's `disk_altered`, if
     /// this session has a clock. See the module documentation for the
     /// four implementations this rule was read out of.
-    fn touch(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn touch(&mut self, dir: u64) -> Result<(), MutateError<Transport<S>>> {
         let now = match self.clock {
             Some(now) => now,
             None => return Ok(()),
@@ -1866,7 +1873,7 @@ impl<S: BlockMedium> Mutator<S> {
     // -- block I/O and the bitmap ------------------------------------------
 
     /// Read a metadata block whole, checksum verified.
-    fn get(&mut self, lba: u64) -> Result<Vec<u8>, MutateError<Transport<S>>> {
+    pub(crate) fn get(&mut self, lba: u64) -> Result<Vec<u8>, MutateError<Transport<S>>> {
         self.vol.read_raw(lba)?;
         if !checksum_ok(&self.vol.buf) {
             return Err(MutateError::Read(crate::read::Error::Checksum { lba }));
@@ -1875,7 +1882,11 @@ impl<S: BlockMedium> Mutator<S> {
     }
 
     /// Fix a metadata block's checksum at longword 5 and write it back.
-    fn put(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn put(
+        &mut self,
+        lba: u64,
+        buf: &mut [u8],
+    ) -> Result<(), MutateError<Transport<S>>> {
         finish_checksum(buf);
         self.write(lba, buf)?;
         // The `Volume`'s parsed root is a copy of the bytes as they were;
@@ -1887,7 +1898,7 @@ impl<S: BlockMedium> Mutator<S> {
         Ok(())
     }
 
-    fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), MutateError<Transport<S>>> {
         if lba >= self.vol.block_count() {
             return Err(MutateError::Read(crate::read::Error::LbaOutOfRange {
                 lba,
@@ -1902,7 +1913,7 @@ impl<S: BlockMedium> Mutator<S> {
     /// The hinge of the whole ordering: after this returns,
     /// [`Allocator::reference`] will hand out the blocks just allocated,
     /// and before it does it refuses them.
-    fn flush(&mut self) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn flush(&mut self) -> Result<(), MutateError<Transport<S>>> {
         self.alloc.flush(&mut self.vol.src)?;
         Ok(())
     }
@@ -1912,7 +1923,7 @@ impl<S: BlockMedium> Mutator<S> {
     ///
     /// A no-op on the six variants that have no such field, rather than a
     /// redundant root write on every operation.
-    fn stamp_blocks_used(&mut self) -> Result<(), MutateError<Transport<S>>> {
+    pub(crate) fn stamp_blocks_used(&mut self) -> Result<(), MutateError<Transport<S>>> {
         let variant = self.vol.variant();
         if !variant.has_long_names() {
             return Ok(());

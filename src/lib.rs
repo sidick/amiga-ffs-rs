@@ -98,6 +98,7 @@ pub mod bitmap;
 /// Two copies of that would be two chances to put an LNFS comment at the
 /// classic offset.
 mod build;
+pub mod compact;
 pub mod dircache;
 pub mod file;
 pub mod format;
@@ -122,6 +123,10 @@ pub use read::{
 
 pub use allocator::{AllocError, Allocation, Allocator, Intent};
 pub use bitmap::Bitmap;
+pub use compact::{
+    CompactError, CompactEvent, CompactOptions, CompactReport, FileDefragReport,
+    HeaderRelocateReport, MakeRoomReport,
+};
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
 pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
