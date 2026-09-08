@@ -7885,3 +7885,627 @@ fn make_room_crash_sweep_repair_is_safe_and_retry_reaches_byte_identical() {
     }
     assert!(crashed > 0, "at least one prefix must actually fail");
 }
+
+// ---------------------------------------------------------------------------
+// Compaction across every variant and block size
+// ---------------------------------------------------------------------------
+
+/// What `compaction_matrix_covers_every_variant_and_block_size` builds and
+/// checks against, per variant/block-size combination: a small tree with
+/// enough structure to exercise every tier this wave added, kept
+/// deliberately light (a handful of files, not `fragmented_volume`'s 120)
+/// because this test's job is *variant coverage*, not fragmentation depth
+/// -- that is already pinned by the FFS/OFS-at-512 tests above.
+struct CompactionFixture {
+    root: u64,
+    devs: u64,
+    payload: Vec<u8>,
+    inner: Vec<u8>,
+    /// `Some((name, comment))` only on `DOS\6`/`DOS\7`: a name over the
+    /// classic 30-byte limit with a comment that overflows into its own
+    /// `T_COMMENT` block -- the one shape that exercises the back-pointer
+    /// this wave's tier 2 has to keep both directions of.
+    long: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+fn compaction_fixture(variant: Variant, bs: usize) -> (Volume<MemDisk>, CompactionFixture) {
+    let ffs_payload_block = data_payload_size(bs, true);
+    let slots = hash_table_size(bs) as usize;
+    // Force the payload across at least one `T_LIST` extension boundary
+    // whenever that is practical (bs <= 4096 keeps it to a few MB): a
+    // header-relocation bug in the extension-chain re-pointing code, or
+    // in OFS's full-data-block-copy path, would be invisible on a file
+    // that never needs an extension block at all -- and a fixed size
+    // proportional to `bs` alone, as an earlier version of this fixture
+    // used, never crosses that boundary at any block size this crate
+    // supports. At bs == 32768 the same boundary is ~266 MB away, so
+    // that one case (added for block-size-scaled *offset* arithmetic,
+    // not for extension-chain coverage specifically) uses a small fixed
+    // size instead.
+    let payload_blocks = if bs <= 512 {
+        // Cheap at this block size, and worth exercising a *chain* of
+        // extension blocks, not just the one-boundary crossing -- the
+        // backward "last block first" write order among extension
+        // blocks themselves only gets tested with more than one.
+        slots * 2 + 20
+    } else if bs <= 4096 {
+        slots + 20
+    } else {
+        12
+    };
+    let payload = pattern(payload_blocks * ffs_payload_block);
+    let inner = pattern(3 * bs);
+    let nblocks = (payload_blocks as u64 * 6 + 4096).max(8 * 1024 * 1024 / bs as u64);
+    let long_name: Vec<u8> = (0..100).map(|i| b'a' + (i % 26) as u8).collect();
+    let long_comment: Vec<u8> = (0..COMMENT_MAX).map(|i| b'A' + (i % 26) as u8).collect();
+    let long = variant
+        .has_long_names()
+        .then(|| (long_name.clone(), long_comment.clone()));
+
+    let vol = populated(variant, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        let meta = amiga_ffs::Metadata::new();
+        let devs = pop.create_dir(root, b"Devs", &meta).unwrap();
+        pop.create_file(devs, b"Inner", &meta, &inner).unwrap();
+        pop.create_file(root, b"Payload", &meta, &payload).unwrap();
+        // A few filler files, then every other one deleted -- enough
+        // wear to give `defragment_file` and `make_room` something real
+        // to do without this test paying `fragmented_volume`'s cost.
+        for i in 0..20u32 {
+            pop.create_file(root, format!("F{i:02}").as_bytes(), &meta, b"filler")
+                .unwrap();
+        }
+        if let Some((name, comment)) = &long {
+            let meta = amiga_ffs::Metadata::new().comment(comment);
+            pop.create_file(root, name, &meta, b"long-named contents")
+                .unwrap();
+        }
+    });
+
+    let root = vol.root_lba();
+    let mut vol = vol;
+    for i in (0..20u32).step_by(2) {
+        // Deleting needs a Mutator; folded into one short session per
+        // filler so the fixture stays a plain `Volume` for the caller,
+        // matching every other fixture helper in this file.
+        let mut m = Mutator::open(vol).unwrap();
+        let name = format!("F{i:02}");
+        m.delete(root, name.as_bytes()).unwrap();
+        vol = m.into_volume();
+    }
+    let devs = vol.lookup(root, b"Devs").unwrap().unwrap().lba;
+
+    (
+        vol,
+        CompactionFixture {
+            root,
+            devs,
+            payload,
+            inner,
+            long,
+        },
+    )
+}
+
+/// Every operation this wave added, on every `DOS\0`-`DOS\7` variant, at
+/// 512 and 4096 bytes (plus one 32768-byte case for the tail): tier 1,
+/// both directions of tier 2 (a file header and a directory header, the
+/// latter reparenting a real child), `make_room`, a full `compact()`, and
+/// -- on the variants that carry them -- the two facts a "probably works"
+/// implementation gets wrong first: `DOS\4`/`DOS\5` dircache staleness,
+/// and `DOS\6`/`DOS\7` overflow-comment back-pointers in both directions
+/// (the header moving out from under its comment block, and the comment
+/// block moving out from under its header). Every step ends with
+/// `validate().is_clean()`, so a single missed re-point anywhere shows up
+/// as a named `Finding`, not a silent corruption.
+fn run_compaction_matrix(variant: Variant, bs: usize) {
+    let what = |op: &str| format!("{variant:?} @{bs}: {op}");
+    let (vol, fx) = compaction_fixture(variant, bs);
+    let mut m = Mutator::open(vol).unwrap();
+
+    // Tier 1: the big file's data, defragmented into as few runs as the
+    // volume's own free space allows.
+    let payload_lba = m.volume().lookup(fx.root, b"Payload").unwrap().unwrap().lba;
+    if bs <= 4096 {
+        // Pin the coverage claim itself: a fixture that quietly stopped
+        // crossing an extension boundary would make every assertion
+        // below pass for the wrong reason.
+        let chain = m.volume().file_chain(payload_lba).unwrap();
+        assert!(
+            !chain.extensions.is_empty(),
+            "{}",
+            what("test setup: Payload must cross a T_LIST boundary")
+        );
+    }
+    m.defragment_file(payload_lba).expect("defragment_file");
+    assert_clean(m.volume(), &what("post tier-1"));
+    assert_eq!(
+        m.volume().read_file(payload_lba).unwrap(),
+        fx.payload,
+        "{}",
+        what("tier-1 bytes")
+    );
+
+    // Tier 2, a file header.
+    let report = m
+        .relocate_header(payload_lba)
+        .expect("relocate_header (file)");
+    assert_clean(m.volume(), &what("post tier-2 file"));
+    let payload_lba = report.new_lba;
+    assert_eq!(
+        m.volume().lookup(fx.root, b"Payload").unwrap().unwrap().lba,
+        payload_lba,
+        "{}",
+        what("payload findable at its new lba")
+    );
+    assert_eq!(
+        m.volume().read_file(payload_lba).unwrap(),
+        fx.payload,
+        "{}",
+        what("tier-2 file bytes")
+    );
+
+    // Tier 2, a directory header: its child must still be found, still
+    // parented at the directory's *new* number, and still readable.
+    let report = m.relocate_header(fx.devs).expect("relocate_header (dir)");
+    assert_eq!(
+        report.children_reparented,
+        1,
+        "{}",
+        what("Devs has one child")
+    );
+    assert_clean(m.volume(), &what("post tier-2 dir"));
+    let devs = report.new_lba;
+    let inner = m.volume().lookup(devs, b"Inner").unwrap().unwrap();
+    assert_eq!(inner.parent as u64, devs, "{}", what("Inner reparented"));
+    assert_eq!(
+        m.volume().read_file(inner.lba).unwrap(),
+        fx.inner,
+        "{}",
+        what("Inner bytes")
+    );
+
+    // On DOS\4/DOS\5, both relocations above must have regenerated a
+    // dircache that agrees with the (now-moved) chains -- never stale.
+    if variant.has_dircache() {
+        for finding in &m.volume().validate().findings {
+            assert!(
+                !matches!(finding, Finding::DircacheStale { .. }),
+                "{}: {finding}",
+                what("dircache must not go stale across a relocation")
+            );
+        }
+    }
+
+    // On DOS\6/DOS\7: both directions of the overflow-comment
+    // back-pointer.
+    if let Some((name, comment)) = &fx.long {
+        let entry = m.volume().lookup(fx.root, name).unwrap().unwrap();
+        assert_ne!(
+            entry.comment_block,
+            0,
+            "{}",
+            what("test setup: must overflow")
+        );
+
+        // Direction A: the header moves. Its own comment gets a fresh
+        // copy, and the header's -18 longword must name it.
+        let report = m
+            .relocate_header(entry.lba)
+            .expect("relocate_header (long name)");
+        assert_clean(m.volume(), &what("post tier-2 long-name header move"));
+        let entry = m.volume().lookup(fx.root, name).unwrap().unwrap();
+        assert_eq!(entry.lba, report.new_lba);
+        assert_ne!(
+            entry.comment_block,
+            0,
+            "{}",
+            what("comment survives the move")
+        );
+        assert_eq!(
+            m.volume().comment(&entry).unwrap(),
+            *comment,
+            "{}",
+            what("comment bytes, post header move")
+        );
+
+        // Direction B: the comment block itself is what `make_room`
+        // finds occupying the range -- it (and, by this wave's own
+        // documented design, its owning header alongside it) must move
+        // out, and the back-pointer must still agree afterwards.
+        let cb = entry.comment_block as u64;
+        m.make_room(cb..cb + 1)
+            .expect("make_room over the comment block");
+        assert_clean(m.volume(), &what("post make_room over comment block"));
+        let entry = m.volume().lookup(fx.root, name).unwrap().unwrap();
+        assert_ne!(entry.comment_block, 0);
+        assert_eq!(
+            m.volume().comment(&entry).unwrap(),
+            *comment,
+            "{}",
+            what("comment bytes, post comment-block evacuation")
+        );
+        assert_eq!(
+            m.volume().read_file(entry.lba).unwrap(),
+            b"long-named contents"
+        );
+    }
+
+    // make_room over a range inside what remains of Payload's data.
+    let payload_lba = m.volume().lookup(fx.root, b"Payload").unwrap().unwrap().lba;
+    let chain = m.volume().file_chain(payload_lba).unwrap();
+    let target = chain.blocks[chain.blocks.len() / 2] as u64;
+    let report = m.make_room(target..target + 2).expect("make_room");
+    assert!(
+        report.blocks_evacuated > 0,
+        "{}",
+        what("make_room found something to move")
+    );
+    assert_clean(m.volume(), &what("post make_room"));
+    assert_eq!(
+        m.volume().read_file(payload_lba).unwrap(),
+        fx.payload,
+        "{}",
+        what("payload bytes survive make_room")
+    );
+
+    // A full compact, over whatever is left, must still leave every name
+    // findable and every byte intact.
+    let report = m
+        .compact(&CompactOptions::new().relocate_headers(true))
+        .unwrap();
+    assert!(
+        report.files_examined > 0,
+        "{}",
+        what("compact examined something")
+    );
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, &what("post full compact"));
+
+    let root = vol.root_lba();
+    let payload = vol.lookup(root, b"Payload").unwrap().unwrap();
+    assert_eq!(vol.read_file(payload.lba).unwrap(), fx.payload);
+    let devs = vol.lookup(root, b"Devs").unwrap().unwrap();
+    let inner = vol.lookup(devs.lba, b"Inner").unwrap().unwrap();
+    assert_eq!(vol.read_file(inner.lba).unwrap(), fx.inner);
+    if let Some((name, comment)) = &fx.long {
+        let entry = vol.lookup(root, name).unwrap().unwrap();
+        assert_eq!(vol.comment(&entry).unwrap(), *comment);
+        assert_eq!(vol.read_file(entry.lba).unwrap(), b"long-named contents");
+    }
+}
+
+#[test]
+fn compaction_matrix_covers_every_variant_and_block_size() {
+    for &variant in &ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            run_compaction_matrix(variant, bs);
+        }
+    }
+    // One 32 KB case for the tail: block-size-scaled offsets (the hash
+    // table, the tail fields, the comment/name layout) get their widest
+    // spread here, and LNFS -- the variant with the most block-size-
+    // dependent layout of the eight -- is the one most worth trying it
+    // on.
+    run_compaction_matrix(Variant::FfsIntlLongname, 32768);
+}
+
+// ---------------------------------------------------------------------------
+// Mutation *and* compaction against a model
+// ---------------------------------------------------------------------------
+
+/// Walk the volume's tree, recording every entry's path (the sequence of
+/// names from the root) alongside its *current* LBA. Paths are stable
+/// across every compaction operation this wave added (none of them
+/// rename, create or delete); LBAs are exactly what compaction changes.
+/// This is the read side of [`resync_model`]'s path-based matching.
+fn collect_disk_paths(
+    vol: &mut Volume<MemDisk>,
+    dir: u64,
+    prefix: &[Vec<u8>],
+    out: &mut Vec<(Vec<Vec<u8>>, u64)>,
+) {
+    for e in vol.read_dir(dir).expect("read_dir") {
+        let mut path = prefix.to_vec();
+        path.push(e.name.clone());
+        out.push((path.clone(), e.lba));
+        if e.kind == EntryKind::Directory {
+            collect_disk_paths(vol, e.lba, &path, out);
+        }
+    }
+}
+
+/// The model's side of the same walk, over the LBAs the model currently
+/// believes in (which, right after a compaction call, may already be
+/// stale -- that staleness is exactly what [`resync_model`] fixes).
+fn collect_model_paths(
+    model: &Model,
+    dir: u64,
+    prefix: &[Vec<u8>],
+    out: &mut Vec<(Vec<Vec<u8>>, u64)>,
+) {
+    for e in model.dirs[&dir].values() {
+        let mut path = prefix.to_vec();
+        path.push(e.name.clone());
+        out.push((path.clone(), e.lba));
+        if e.kind == EntryKind::Directory {
+            collect_model_paths(model, e.lba, &path, out);
+        }
+    }
+}
+
+/// Bring the model's LBAs back in line with the disk after a compaction
+/// call that may have relocated an arbitrary, unreported set of blocks
+/// (`make_room` in particular: its report counts blocks, it does not name
+/// them). Matches every entry by its *path* -- the one identity
+/// compaction never changes -- builds an old-LBA -> new-LBA map from that,
+/// and rewrites every `MEntry::lba`, `Model::dirs`' own keys (a moved
+/// directory is itself a key) and `Model::parent`'s keys and values
+/// through it. A path present in the model but missing from the disk (or
+/// vice versa) panics loudly: that is exactly the "compaction lost or
+/// invented an entry" bug this test exists to catch, and a silent partial
+/// resync would hide it instead.
+fn resync_model(vol: &mut Volume<MemDisk>, model: &mut Model) {
+    let mut disk_paths = Vec::new();
+    collect_disk_paths(vol, model.root, &[], &mut disk_paths);
+    let mut model_paths = Vec::new();
+    collect_model_paths(model, model.root, &[], &mut model_paths);
+
+    assert_eq!(
+        disk_paths.len(),
+        model_paths.len(),
+        "resync: disk and model disagree on how many entries exist"
+    );
+
+    let disk_map: std::collections::HashMap<Vec<Vec<u8>>, u64> = disk_paths.into_iter().collect();
+
+    let mut lba_map: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    lba_map.insert(model.root, model.root);
+    for (path, old_lba) in &model_paths {
+        let &new_lba = disk_map
+            .get(path)
+            .unwrap_or_else(|| panic!("resync: path {path:?} is on the model but not the disk"));
+        lba_map.insert(*old_lba, new_lba);
+    }
+
+    let old_dirs = std::mem::take(&mut model.dirs);
+    for (old_dir_lba, entries) in old_dirs {
+        let new_dir_lba = *lba_map.get(&old_dir_lba).unwrap_or(&old_dir_lba);
+        let mut new_entries = std::collections::BTreeMap::new();
+        for (key, mut e) in entries {
+            if let Some(&nl) = lba_map.get(&e.lba) {
+                e.lba = nl;
+            }
+            new_entries.insert(key, e);
+        }
+        model.dirs.insert(new_dir_lba, new_entries);
+    }
+
+    let old_parent = std::mem::take(&mut model.parent);
+    for (child, parent) in old_parent {
+        let nc = *lba_map.get(&child).unwrap_or(&child);
+        let np = *lba_map.get(&parent).unwrap_or(&parent);
+        model.parent.insert(nc, np);
+    }
+}
+
+/// Wave 2's own property test: everything
+/// `a_random_interleave_of_mutations_agrees_with_a_model` already checks,
+/// plus `defragment_file`, `relocate_header` and `make_room` interleaved
+/// among the ordinary mutations at random. `relocate_header` and
+/// `make_room` can move any entry's LBA (an unreported set, for
+/// `make_room`), so the model is resynced by path
+/// ([`resync_model`]) immediately after each one -- not deferred to the
+/// end of the batch, because a later mutation in the same batch (a
+/// `delete`, a `rename`) addresses entries by the LBA the model
+/// currently believes in, and a stale one would target the wrong block.
+///
+/// Run on `DOS\3` and `DOS\7` at 512 and 4096: an international-only
+/// classic variant and the long-name variant whose comment/name layout
+/// is where a re-pointing bug would most plausibly hide.
+#[test]
+fn a_random_interleave_of_mutations_and_compaction_agrees_with_a_model() {
+    for (v, variant) in [Variant::FfsIntl, Variant::FfsIntlLongname]
+        .into_iter()
+        .enumerate()
+    {
+        for (b, bs) in [512usize, 4096].into_iter().enumerate() {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut rng = Rng::new(0x30AC_7000 + (v * 16 + b) as u64);
+            let fold = variant.fold();
+            let max_name = if variant.has_long_names() {
+                MAX_NAME_LONG
+            } else {
+                MAX_NAME_CLASSIC
+            };
+
+            let vol = populated(variant, bs, nblocks, |_| {});
+            let root = vol.root_lba();
+            let mut model = Model::new(root);
+            let mut m = Mutator::open(vol).expect("mutator");
+            let mut counts = [0usize; 8];
+
+            for batch in 0..5 {
+                for _ in 0..20 {
+                    let dirs = model.dir_list();
+                    let dir = dirs[rng.below(dirs.len())];
+                    match rng.below(13) {
+                        0..=3 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let data = pattern(rng.below(3000));
+                            let comment = if rng.below(3) == 0 {
+                                b"a comment, which on LNFS may not fit beside the name".to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            let protection = rng.next() as u32;
+                            let meta = Metadata::new().comment(&comment).protection(protection);
+                            let lba = m
+                                .create_file(dir, &name, &meta, &data)
+                                .expect("create_file");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::File,
+                                    data,
+                                    comment,
+                                    protection,
+                                },
+                            );
+                            counts[0] += 1;
+                        }
+                        4..=5 => {
+                            let name = mutation_name(&mut rng, max_name);
+                            let key = folded(&name, fold);
+                            if model.dirs[&dir].contains_key(&key) {
+                                continue;
+                            }
+                            let protection = rng.next() as u32;
+                            let meta = Metadata::new().protection(protection);
+                            let lba = m.create_dir(dir, &name, &meta).expect("create_dir");
+                            model.dirs.get_mut(&dir).unwrap().insert(
+                                key,
+                                MEntry {
+                                    name,
+                                    lba,
+                                    kind: EntryKind::Directory,
+                                    data: Vec::new(),
+                                    comment: Vec::new(),
+                                    protection,
+                                },
+                            );
+                            model.dirs.insert(lba, Default::default());
+                            model.parent.insert(lba, dir);
+                            counts[1] += 1;
+                        }
+                        6..=7 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let e = model.dirs[&dir][&key].clone();
+                            if e.kind == EntryKind::Directory && !model.dirs[&e.lba].is_empty() {
+                                continue;
+                            }
+                            m.delete(dir, &e.name).expect("delete");
+                            model.dirs.get_mut(&dir).unwrap().remove(&key);
+                            if e.kind == EntryKind::Directory {
+                                model.dirs.remove(&e.lba);
+                                model.parent.remove(&e.lba);
+                            }
+                            counts[2] += 1;
+                        }
+                        8 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (from, key) = all[rng.below(all.len())].clone();
+                            let e = model.dirs[&from][&key].clone();
+                            let dirs = model.dir_list();
+                            let to = dirs[rng.below(dirs.len())];
+                            if e.kind == EntryKind::Directory && model.inside(e.lba, to) {
+                                continue;
+                            }
+                            let name = mutation_name(&mut rng, max_name);
+                            let new_key = folded(&name, fold);
+                            if model.dirs[&to].contains_key(&new_key)
+                                && !(to == from && new_key == key)
+                            {
+                                continue;
+                            }
+                            m.rename(from, &e.name, to, &name).expect("rename");
+                            model.dirs.get_mut(&from).unwrap().remove(&key);
+                            let mut moved = e.clone();
+                            moved.name = name;
+                            if moved.kind == EntryKind::Directory {
+                                model.parent.insert(moved.lba, to);
+                            }
+                            model.dirs.get_mut(&to).unwrap().insert(new_key, moved);
+                            counts[3] += 1;
+                        }
+                        9 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let protection = rng.next() as u32;
+                            let comment: Vec<u8> = match rng.below(3) {
+                                0 => Vec::new(),
+                                1 => b"short".to_vec(),
+                                _ => vec![b'c'; COMMENT_MAX],
+                            };
+                            let e = model.dirs.get_mut(&dir).unwrap().get_mut(&key).unwrap();
+                            m.set_metadata(
+                                e.lba,
+                                &MetaUpdate::new().protection(protection).comment(&comment),
+                            )
+                            .expect("set_metadata");
+                            e.protection = protection;
+                            e.comment = comment;
+                            counts[4] += 1;
+                        }
+                        // Tier 1: defragment a random file's data. Never
+                        // changes an LBA, so no resync is needed.
+                        10 => {
+                            let files: Vec<(u64, Vec<u8>)> = model
+                                .entry_list()
+                                .into_iter()
+                                .filter(|(d, k)| model.dirs[d][k].kind == EntryKind::File)
+                                .collect();
+                            if files.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = files[rng.below(files.len())].clone();
+                            let lba = model.dirs[&dir][&key].lba;
+                            m.defragment_file(lba).expect("defragment_file");
+                            counts[5] += 1;
+                        }
+                        // Tier 2: relocate a random entry's header.
+                        11 => {
+                            let all = model.entry_list();
+                            if all.is_empty() {
+                                continue;
+                            }
+                            let (dir, key) = all[rng.below(all.len())].clone();
+                            let lba = model.dirs[&dir][&key].lba;
+                            m.relocate_header(lba).expect("relocate_header");
+                            resync_model(m.volume(), &mut model);
+                            counts[6] += 1;
+                        }
+                        // make_room over a small range around a
+                        // currently-occupied block -- an unreported set
+                        // of relocations, per its own contract.
+                        _ => {
+                            let used = allocated_set(m.volume());
+                            if used.is_empty() {
+                                continue;
+                            }
+                            let pick = *used.iter().nth(rng.below(used.len())).unwrap();
+                            let len = 1 + rng.below(3) as u64;
+                            let _ = m.make_room(pick..pick + len);
+                            resync_model(m.volume(), &mut model);
+                            counts[7] += 1;
+                        }
+                    }
+                }
+
+                let what = format!("{variant:?} @{bs} batch {batch} (with compaction)");
+                verify_model(m.volume(), &model, &what);
+                assert_clean(m.volume(), &what);
+            }
+
+            for (i, n) in counts.iter().enumerate() {
+                assert!(*n > 0, "{variant:?} @{bs}: operation {i} never ran");
+            }
+        }
+    }
+}
