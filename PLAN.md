@@ -1275,6 +1275,26 @@ property of every image shipped, not a tuning detail.
 
 ## Cross-cutting
 
+- **Oracle discipline, on record so nobody "harmonises" it.** Each
+  oracle is used exactly as its licence permits, and the asymmetry is
+  deliberate, per-oracle, and already practised at every point of use:
+  **xdftool** (amitools) is GPL — *run, never read*; a disagreement
+  with it is investigated from our side and from MIT sources only.
+  **fstool** is MIT — read and cited freely; reading its source is how
+  its two `DOS\4`/`DOS\5` bugs were found and reported upstream
+  (issues #42/#43). **AmiPart**'s `ffsresize.c` is MIT — its algorithm
+  was ported with attribution, per the resize milestone. **AROS**
+  (`afs.handler`) is licence-incompatible for copying — read for
+  format *facts* only, always cited as such, and most valuable run
+  as-is inside a guest, where the licence boundary is also a process
+  boundary. **The ROM FFS itself** is the one oracle never read at
+  all: it is observed, deterministically, through Copperline. A
+  sibling PFS crate, if and when it exists, will have the opposite
+  situation — tonioni's `pfs3aio` reference is 4-clause BSD and can be
+  read and cited — and that difference should be stated in *that*
+  crate's plan the way this entry states ours, rather than either
+  crate borrowing the other's rule.
+
 - [x] Errors: `Display` everywhere, `std::error::Error` under `std` —
       `Error<E>` and every `validate()` `Finding` state their
       consequence, and the transport error survives via `source()`
