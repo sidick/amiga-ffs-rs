@@ -91,7 +91,11 @@ pub const BOOT_AREA_LEN: usize = 1024;
 /// Boot block, longword 2: the root block's LBA. Advisory — every mount
 /// recomputes the root from geometry — but it is part of the structure
 /// and both `Format` and xdftool fill it in.
-const OFF_BOOT_ROOT: usize = 8;
+///
+/// `pub(crate)` rather than private: [`crate::resize`] rewrites this
+/// longword too, when the root moves, for the same "advisory but still
+/// worth keeping honest" reason.
+pub(crate) const OFF_BOOT_ROOT: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Errors

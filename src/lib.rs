@@ -107,6 +107,7 @@ pub mod mutate;
 pub mod populate;
 pub mod read;
 pub mod repair;
+pub mod resize;
 pub mod validate;
 
 pub use layout::{
@@ -127,6 +128,7 @@ pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN
 pub use mutate::{MetaUpdate, MutateError, Mutator};
 pub use populate::{Metadata, PopulateError, Populator};
 pub use repair::{Action, RepairOptions, RepairReport};
+pub use resize::{ResizeError, ResizeReport};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.

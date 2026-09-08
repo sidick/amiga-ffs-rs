@@ -191,6 +191,26 @@ impl MemDisk {
     pub fn fail_after(&mut self, n: usize) {
         self.fail_after = Some(self.writes.len() + n);
     }
+
+    /// The medium is fixed: stop refusing writes. What a crash-sweep test
+    /// does before asking a repair to finish the job the interrupted
+    /// write left behind — the disk itself is not still failing, only the
+    /// operation that was running on it was interrupted once.
+    pub fn stop_failing(&mut self) {
+        self.fail_after = None;
+    }
+
+    /// Enlarge the medium to at least `new_blocks` blocks, zero-filled —
+    /// what a partition table's `high_cyl` growing looks like from this
+    /// crate's side of the seam, and the precondition
+    /// [`amiga_ffs::Volume::resize`] documents for growing: the medium
+    /// already reports the new size before the filesystem is asked to.
+    pub fn grow(&mut self, new_blocks: u64) {
+        let want = new_blocks as usize * self.bs;
+        if want > self.data.len() {
+            self.data.resize(want, 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6340,4 +6360,386 @@ fn a_random_interleave_of_writes_agrees_with_a_model_file() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// resize()
+// ---------------------------------------------------------------------------
+
+/// A populated volume with a random tree, and the tree itself so a resize
+/// test can check it survived.
+fn resizable(
+    variant: Variant,
+    bs: usize,
+    nblocks: u64,
+    seed: u64,
+    mut budget: usize,
+) -> (Volume<MemDisk>, Vec<Node>) {
+    let mut rng = Rng::new(seed);
+    let tree = random_tree(&mut rng, variant, 0, &mut budget);
+    let disk = MemDisk::filled(bs, nblocks, 0xA5);
+    let opts = FormatOptions::new(variant, nblocks, b"Resizable");
+    let mut pop = Populator::new(disk, &opts).expect("populate");
+    let root = pop.root_lba();
+    write_tree(&mut pop, root, &tree);
+    let disk = pop.finish().expect("finish");
+    let vol = Volume::open_with(disk, None, nblocks, 2).expect("open");
+    (vol, tree)
+}
+
+/// The bitmap covers exactly `reserved..block_count`, is valid, and every
+/// LNFS root field agrees with it.
+fn assert_bitmap_and_lnfs_fields_agree(vol: &mut Volume<MemDisk>, what: &str) {
+    let bm = vol.read_bitmap().unwrap();
+    assert!(bm.valid(), "{what}: bitmap not valid");
+    assert!(
+        bm.covers_whole_volume(),
+        "{what}: bitmap short of the new end"
+    );
+    assert_eq!(bm.end_block(), vol.block_count(), "{what}");
+    let variant = vol.variant();
+    if variant.has_long_names() {
+        assert_eq!(
+            vol.root().blocks_used,
+            Some(bm.allocated_count() as u32),
+            "{what}: NumBlocksUsed"
+        );
+        assert_eq!(
+            vol.root().fs_type,
+            Some(variant.dostype()),
+            "{what}: FileSystemType"
+        );
+    }
+}
+
+/// Grow and shrink back, every variant, every block size: the round trip
+/// the whole feature is for. Every file byte-identical, every name still
+/// resolvable (the re-parenting proof: a wrong parent pointer still
+/// enumerates and looks up fine, since lookup never follows `parent`),
+/// the bitmap covering exactly the new extent, and the LNFS fields
+/// agreeing with it in both directions.
+#[test]
+fn resize_grows_and_shrinks_every_variant_and_block_size() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 1024, 4096] {
+            let nblocks = 4 * 1024 * 1024 / bs as u64;
+            let grown = nblocks * 3;
+            let (mut vol, tree) = resizable(variant, bs, nblocks, 0xAB00_0000 + bs as u64, 300_000);
+            let root = vol.root_lba();
+            check_tree(&mut vol, root, &tree, "before grow");
+
+            vol.source_mut().grow(grown);
+            let report = vol
+                .resize(grown)
+                .unwrap_or_else(|e| panic!("{variant:?} @{bs} grow to {grown}: {e}"));
+            assert_eq!(report.old_block_count, nblocks);
+            assert_eq!(report.new_block_count, grown);
+            assert_eq!(
+                vol.root_lba(),
+                canonical_root_lba(grown, 2).unwrap(),
+                "{variant:?} @{bs}: root did not move to the new midpoint"
+            );
+            let root = vol.root_lba();
+            check_tree(&mut vol, root, &tree, "after grow");
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after grow"));
+            assert_bitmap_and_lnfs_fields_agree(&mut vol, "after grow");
+
+            let report = vol
+                .resize(nblocks)
+                .unwrap_or_else(|e| panic!("{variant:?} @{bs} shrink to {nblocks}: {e}"));
+            assert_eq!(report.new_block_count, nblocks);
+            assert_eq!(
+                vol.root_lba(),
+                canonical_root_lba(nblocks, 2).unwrap(),
+                "{variant:?} @{bs}: root did not move back"
+            );
+            let root = vol.root_lba();
+            check_tree(&mut vol, root, &tree, "after shrink");
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after shrink"));
+            assert_bitmap_and_lnfs_fields_agree(&mut vol, "after shrink");
+        }
+    }
+}
+
+/// Resizing to the size a volume already is writes nothing at all.
+#[test]
+fn resize_to_the_same_size_is_a_true_no_op() {
+    let (mut vol, _tree) = resizable(Variant::Ffs, 512, 1760, 1, 5000);
+    vol.source_mut().clear_log();
+    let report = vol.resize(1760).unwrap();
+    assert_eq!(report.old_root_lba, report.new_root_lba);
+    assert_eq!(report.children_reparented, 0);
+    assert!(vol.source_mut().write_log().is_empty());
+}
+
+/// Growing across the 25-bitmap-pointer boundary chains an extension
+/// block, and shrinking back drops it again -- the same "chain extension
+/// blocks when the root's 25 pointers are exhausted" arithmetic
+/// [`format`] uses at creation, exercised here by a resize instead.
+#[test]
+fn resize_crosses_the_bitmap_extension_boundary_in_both_directions() {
+    let bs = 512usize;
+    let small = 4096u64;
+    let big = 150_000u64; // (big - 2) / 4064 > 25: needs an extension block.
+
+    let (mut vol, tree) = resizable(Variant::FfsIntl, bs, small, 7, 20_000);
+    vol.source_mut().grow(big);
+
+    vol.resize(big)
+        .unwrap_or_else(|e| panic!("grow to {big}: {e}"));
+    let bm = vol.read_bitmap().unwrap();
+    assert!(
+        !bm.ext_blocks().is_empty(),
+        "a {big}-block volume at {bs} bytes needs a bitmap extension block"
+    );
+    assert!(bm.pages().len() > BITMAP_PAGES);
+    let root = vol.root_lba();
+    check_tree(
+        &mut vol,
+        root,
+        &tree,
+        "after growing past the extension boundary",
+    );
+    assert_clean(&mut vol, "after growing past the extension boundary");
+    assert_bitmap_and_lnfs_fields_agree(&mut vol, "after growing past the extension boundary");
+
+    vol.resize(small)
+        .unwrap_or_else(|e| panic!("shrink back to {small}: {e}"));
+    let bm = vol.read_bitmap().unwrap();
+    assert!(
+        bm.ext_blocks().is_empty(),
+        "shrinking back below the boundary must drop the extension block"
+    );
+    let root = vol.root_lba();
+    check_tree(
+        &mut vol,
+        root,
+        &tree,
+        "after shrinking back below the extension boundary",
+    );
+    assert_clean(
+        &mut vol,
+        "after shrinking back below the extension boundary",
+    );
+    assert_bitmap_and_lnfs_fields_agree(
+        &mut vol,
+        "after shrinking back below the extension boundary",
+    );
+}
+
+/// A shrink refuses when real, non-movable data would end up past the new
+/// end -- naming the offending block -- and [`Volume::minimum_size`]
+/// agrees exactly: the largest refused size plus one is the smallest size
+/// that succeeds.
+#[test]
+fn resize_shrink_refuses_user_data_past_the_cut_and_minimum_size_agrees() {
+    let bs = 512usize;
+    let nblocks = 20_000u64;
+
+    // A big filler (low LBAs, since this crate's allocator fills upward
+    // from `reserved`) deleted afterwards, and a small straggler that
+    // survives at the low end of what is now free space above it: the
+    // shape that makes `minimum_size` land well clear of the *new* root's
+    // own midpoint, so this test is only ever about the refusal, never
+    // about the new root's target also happening to collide with data.
+    let mut vol = populated(Variant::Ffs, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Filler",
+            &amiga_ffs::Metadata::new(),
+            &pattern(400_000),
+        )
+        .unwrap();
+        pop.create_file(
+            root,
+            b"Straggler",
+            &amiga_ffs::Metadata::new(),
+            &pattern(2000),
+        )
+        .unwrap();
+    });
+    let mut m = Mutator::open(vol).unwrap();
+    let root = m.volume().root_lba();
+    m.delete(root, b"Filler").unwrap();
+    vol = m.into_volume();
+    assert_clean(&mut vol, "after deleting the filler");
+
+    let min = vol.minimum_size().unwrap();
+    assert!(min > 2 && min < nblocks, "sanity: min={min}");
+
+    let err = vol.resize(min - 1).unwrap_err();
+    let (lba, refused_at) = match err {
+        ResizeError::UserDataPastCut {
+            lba,
+            new_block_count,
+        } => (lba, new_block_count),
+        other => panic!("expected UserDataPastCut, got {other}"),
+    };
+    assert_eq!(refused_at, min - 1);
+    assert!(lba >= min - 1, "the finding must actually be past the cut");
+
+    // The refusal must not have written anything.
+    assert_clean(&mut vol, "after a refused shrink");
+    assert_eq!(vol.block_count(), nblocks);
+
+    // And exactly the minimum succeeds.
+    vol.resize(min)
+        .unwrap_or_else(|e| panic!("resize to minimum_size {min}: {e}"));
+    assert_clean(&mut vol, "at minimum_size");
+    let root = vol.root_lba();
+    let straggler = vol.lookup(root, b"Straggler").unwrap().expect("Straggler");
+    assert_eq!(vol.read_file(straggler.lba).unwrap(), pattern(2000));
+}
+
+/// A root dircache chain long enough to span several blocks, shrunk down
+/// to `minimum_size()` -- which by definition may cut straight through
+/// where those blocks used to be, since the root's own dircache chain is
+/// movable metadata. Every block ends up back under the new end, every
+/// name is still findable, and the cache agrees with the chains
+/// afterwards (zero `DircacheStale`).
+#[test]
+fn resize_relocates_the_roots_dircache_chain_past_a_shrinking_cut() {
+    let bs = 512usize;
+    let nblocks = 6000u64;
+    let names: Vec<String> = (0..80u32).map(|i| format!("File{i:03}")).collect();
+    let mut vol = populated(Variant::FfsIntlDircache, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        for name in &names {
+            pop.create_file(root, name.as_bytes(), &amiga_ffs::Metadata::new(), b"x")
+                .unwrap();
+        }
+    });
+    let before = vol.read_dircache(vol.root_lba()).unwrap();
+    assert!(
+        before.blocks.len() > 1,
+        "need a multi-block root dircache to exercise relocation"
+    );
+
+    let min = vol.minimum_size().unwrap();
+    let report = vol
+        .resize(min)
+        .unwrap_or_else(|e| panic!("resize to minimum_size {min}: {e}"));
+
+    assert_clean(&mut vol, "after shrinking past the old dircache chain");
+    let after = vol.read_dircache(vol.root_lba()).unwrap();
+    assert_eq!(after.blocks.len(), before.blocks.len());
+    for &b in &after.blocks {
+        assert!(
+            b < vol.block_count(),
+            "dircache block {b} left past the new end"
+        );
+    }
+    let root = vol.root_lba();
+    for name in &names {
+        let entry = vol
+            .lookup(root, name.as_bytes())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} missing after resize"));
+        assert_eq!(vol.read_file(entry.lba).unwrap(), b"x");
+    }
+    let _ = report;
+}
+
+/// A seeded sequence of grow and shrink calls, alternating more or less
+/// at random, with the tree checked byte for byte after every step.
+#[test]
+fn resize_random_grow_shrink_sequence_keeps_the_tree_intact() {
+    let bs = 512usize;
+    let variant = Variant::FfsIntlLongname;
+    let start = 4000u64;
+    let ceiling = 60_000u64;
+    let (mut vol, tree) = resizable(variant, bs, start, 0xF00D_5EED, 60_000);
+    vol.source_mut().grow(ceiling);
+
+    let mut rng = Rng::new(0x1234_5678);
+    let mut cur = start;
+    for step in 0..8 {
+        let min = vol.minimum_size().unwrap();
+        let grow = cur >= ceiling.saturating_sub(2000) || rng.below(2) == 0 && cur > min + 200;
+        let target = if grow && cur < ceiling {
+            (cur + 500 + rng.below(3000) as u64).min(ceiling)
+        } else {
+            let span = (cur - min + 1) as usize;
+            min + rng.below(span.max(1)) as u64
+        };
+        vol.resize(target)
+            .unwrap_or_else(|e| panic!("step {step}: resize {cur} -> {target}: {e}"));
+        cur = target;
+        let root = vol.root_lba();
+        check_tree(
+            &mut vol,
+            root,
+            &tree,
+            &format!("step {step} (now {cur} blocks)"),
+        );
+        assert_clean(&mut vol, &format!("step {step}"));
+        assert_bitmap_and_lnfs_fields_agree(&mut vol, &format!("step {step}"));
+    }
+}
+
+/// The crash-shape claim for this feature, over the whole write sequence
+/// of a grow: whatever prefix lands, the volume at the new geometry is
+/// either not mountable yet (the very first write -- the new root -- has
+/// not landed) or is mountable with `reachable_but_free == 0` always, and
+/// [`Volume::repair`] can always bring the bitmap back to valid with the
+/// tree's file contents intact. This scopes the claim to the new geometry
+/// deliberately: see the module's "Whose job is what" documentation for
+/// why a crash is only meaningfully recoverable once the caller's own
+/// geometry authority (the RDB) agrees a resize was already under way.
+#[test]
+fn resize_grow_crash_sweep_never_leaves_a_block_double_allocated() {
+    let bs = 512usize;
+    let old_n = 1760u64;
+    let new_n = 4000u64;
+
+    let total = {
+        let mut vol = allocatable(Variant::FfsIntl, bs, old_n);
+        vol.source_mut().grow(new_n);
+        vol.source_mut().clear_log();
+        vol.resize(new_n).unwrap();
+        vol.source_mut().write_log().len()
+    };
+    assert!(total > 0);
+
+    let mut crashed = 0;
+    for n in 0..total {
+        let mut vol = allocatable(Variant::FfsIntl, bs, old_n);
+        vol.source_mut().grow(new_n);
+        vol.source_mut().fail_after(n);
+        if vol.resize(new_n).is_err() {
+            crashed += 1;
+        }
+
+        let mut disk = vol.into_inner();
+        disk.stop_failing();
+        let mut vol = match Volume::open_with(disk, None, new_n, 2) {
+            // The new root has not landed yet: a safe refusal to mount,
+            // not a state this crash sweep has anything further to check.
+            Err(_) => continue,
+            Ok(v) => v,
+        };
+        if let Ok(bm) = vol.read_bitmap() {
+            if bm.valid() {
+                assert_eq!(
+                    vol.validate().summary.reachable_but_free,
+                    0,
+                    "crash after {n} writes: a valid bitmap must never lie about a block in use"
+                );
+            }
+        }
+        let _ = vol.repair(&RepairOptions::new());
+        let bm = vol.read_bitmap().unwrap();
+        assert!(
+            bm.valid(),
+            "crash after {n} writes: repair must leave a valid bitmap"
+        );
+        assert_eq!(
+            vol.validate().summary.reachable_but_free,
+            0,
+            "crash after {n} writes, post-repair"
+        );
+        assert_tree_intact(&mut vol);
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
 }

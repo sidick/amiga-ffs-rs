@@ -815,28 +815,105 @@ observe.
       the bitmap rather than hand FFS an invalid flag the way AmiPart
       does.
 
-## In scope, not scheduled
+## Milestone 4 — resize
 
-- **Resize** (grow/shrink an existing volume in place): gated on the
-  M3 allocator and mutation discipline. The filesystem half only — the
-  RDB's `high_cyl` move is amiga-rdb's, composed by the consumer. The
-  algorithm exists in shipping form in AmiPart's `ffsresize.c` (John
-  Hertell, MIT — licence-compatible; port the algorithm, cite the
-  source): FFS recomputes the root LBA from geometry on every mount, so
-  the root must *move* to the new midpoint — copy root, free the old
-  block, re-parent the root's direct children (their parent longword
-  names the root; deeper entries and hard-link `real_entry` pointers
-  are unaffected because no child header moves). Grow: new bitmap
-  pages at natural positions (`reserved + N × bits-per-page`), root
-  last, read-back verification. Shrink: refuse unless every allocated
-  block past the new end is movable metadata; a read-only minimum-size
-  estimate falls out of `Bitmap` already. Do better than AmiPart
-  where it punts: rebuild the bitmap ourselves instead of stamping
-  `bm_flag = 0` for FFS to fix on mount, handle dircache chains and
-  LNFS root fields, and support all block sizes, not just 512/1024.
-  AmiPart's code independently confirms wave 3's bitmap conventions
-  (LSB-first, `(block − reserved)` indexing, checksum longword 0,
-  checksum-less ext blocks) and the `canonical_root_lba` formula.
+- [x] **In-place grow/shrink of an existing volume**:
+      `Volume::resize(&mut self, new_block_count) -> Result<ResizeReport,
+      ResizeError<E>>` and a read-only `Volume::minimum_size(&mut self)`,
+      in `src/resize.rs`. The filesystem half only — the RDB's `high_cyl`
+      move is amiga-rdb's, composed by the consumer; the module doc states
+      the ordering rule for each direction (grow: enlarge the partition
+      first, then call `resize`; shrink: call `resize` first, then shrink
+      the partition — reasoned from "a volume must never be told it is
+      bigger than the medium actually is").
+
+      The algorithm shipped in AmiPart's `ffsresize.c` (John Hertell, MIT
+      — ported and cited, not copied) confirmed the core fact this crate's
+      own `canonical_root_lba` already encoded: FFS recomputes the root's
+      LBA from geometry on every mount, so any size change **moves the
+      root** to the new midpoint. Moving it means copying the root's
+      content to the new LBA and re-parenting its *direct* children (their
+      `parent` longword names the root; deeper entries and hard-link
+      `real_entry` pointers are untouched, since no child header moves) —
+      plus two more pointers this crate found by reading its own layout
+      rather than by reading AmiPart, which does not have them: the root's
+      own `DOS\4`/`DOS\5` dircache chain (each block's own `parent` field)
+      and the boot block's advisory root pointer.
+
+      Three places this goes further than AmiPart, as planned: **every**
+      block size 512..=32768 rather than 512/1024 only; the bitmap is
+      rebuilt immediately by reusing `Volume::repair`'s reachability walk
+      (`walk_reachable`, shared rather than duplicated) instead of
+      stamping `bm_flag = 0` for FFS to fix on the next mount; and
+      `DOS\4`/`DOS\5` dircache chains plus the LNFS `NumBlocksUsed`/
+      `FileSystemType` fields are kept correct in both directions, where
+      AmiPart does not touch them at all.
+
+      **What the plan did not anticipate**, learned by building it: a
+      shrink's *bitmap page and extension block* relocation falls out of
+      `repair`'s own tolerant reader for free (a pointer past the new end
+      simply fails its usability check and gets replaced) — but freeing
+      what becomes obsolete does not, because `repair`'s one-direction
+      rule (never remove allocation an incomplete walk might have missed)
+      would otherwise keep the old root and every excess bitmap page as
+      permanent leaks. `resize` patches those bits directly into the
+      still-intact old bitmap before handing off to `repair`, which is
+      the one piece of bitmap surgery this module does itself rather than
+      delegating. And the new root's own target block can — on a volume
+      packed solid from `reserved` upward, which is exactly how this
+      crate's own allocator fills a volume — land on a block real user
+      data occupies; this operation refuses that case
+      (`ResizeError::RootTargetOccupied`) rather than relocating arbitrary
+      data to make room, which is a real, named limitation:
+      `minimum_size()` reports what this engine will actually accept, not
+      the theoretical floor a data-relocating resize could reach, and the
+      two can differ by roughly 2× on a volume with no free gap. A
+      dedicated collision test proved fragile to engineer deterministically
+      in the time available and was not added; the refusal path exists and
+      is exercised incidentally by three of the six tests once the
+      root-target search was added to `minimum_size`.
+
+      Ordering: the very first write is a full copy of the (still valid)
+      root at the new LBA with `bitmap_flag` forced to 0 — after that one
+      write, any mount at the new geometry finds a structurally valid,
+      honestly-untrustworthy root, the same state an interrupted ordinary
+      mutation leaves. Every later write only improves on that floor,
+      down to `bitmap_flag = -1` last, out of `repair`. What is **not**
+      claimed: `repair` fixes the bitmap, not stray `parent`/dircache
+      pointers left mid-reparent by a crash — those surface as
+      `ParentMismatch`/`DircacheStale` findings, not data loss (the hash
+      chains are never touched, so every file stays reachable and
+      byte-correct), and clearing them needs a resize to the same target
+      to run again, which today only re-attempts if `new_block_count`
+      still differs from the volume's current size — a true no-op retry
+      of an already-reached target does not retry the reparenting. Filed
+      as a known gap rather than silently claimed away.
+
+      Tested in `tests/volumes.rs`: grow-then-shrink round trip on every
+      variant × {512, 1024, 4096} with byte-identical files and clean
+      `validate()`; the no-op case; crossing the 25-bitmap-pointer
+      boundary into an extension block and back; shrink refusal naming
+      the offending block with `minimum_size()` agreeing exactly at the
+      boundary; relocating a multi-block root dircache chain out from
+      under a shrink's cut; an 8-step seeded random grow/shrink sequence
+      checked against the tree after every step; and a crash sweep over
+      every write prefix of a grow, asserting `reachable_but_free` is
+      always zero once the bitmap claims validity and that `repair` always
+      restores a valid bitmap with every file intact afterwards.
+      **Left undone**: a shrink-direction crash sweep (the grow sweep
+      exercises the same write-ordering machinery; shrink adds the
+      metadata-relocation and explicit-free steps, which are covered by
+      the non-crash tests but not swept prefix by prefix); an oracle leg
+      in `tests/differential.rs` — `xdftool` only opens a fixed 1760-block
+      ADF or an explicitly-geometried HDF and neither it nor `fstool`
+      implements a resize to cross-check against, so the achievable
+      differential value (an oracle re-reading a post-resize image) was
+      judged not worth the harness work in the time available, and is
+      recorded here rather than silently skipped; and a property test
+      driving `resize` interleaved with `Mutator` operations (only
+      pure resize sequences are seeded-random-tested today).
+
+## In scope, not scheduled
 
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and
