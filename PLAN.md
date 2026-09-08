@@ -810,10 +810,20 @@ observe.
 - [x] Errors: `Display` everywhere, `std::error::Error` under `std` —
       `Error<E>` and every `validate()` `Finding` state their
       consequence, and the transport error survives via `source()`
-- [ ] crates.io publish at read-complete; `#![deny(missing_docs)]`
-      once the surface settles. Read-complete is *reached* — the gate
-      now is deciding the surface is one worth freezing, which is
-      worth a pass over the API after M2 shapes the write side
+- [x] crates.io publish — **0.2.0 is out** (`v0.2.0`, tagged and
+      released), carrying all three milestones rather than the
+      read-only surface this box originally anticipated. Version 0.1
+      is the primitives section above; 0.2 is read, create and mutate.
+- [ ] `#![deny(missing_docs)]` and the API-surface pass that earns a
+      1.0. Every public item *is* documented — the crate would very
+      nearly pass the lint today — but turning it on is a promise
+      about the surface, and the surface is worth one deliberate read
+      first: `Populator` and `Mutator` grew from opposite ends and
+      overlap (`Metadata` vs `MetaUpdate`, two ways to create a file);
+      `Volume`'s inherent-impl surface is now spread over six modules;
+      and the error types have multiplied (`Error`, `FormatError`,
+      `AllocError`, `MutateError`, `PopulateError`) in ways that are
+      right per-operation but worth checking read as one crate.
 
 ## Non-goals
 
