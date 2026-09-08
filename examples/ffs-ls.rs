@@ -3,7 +3,7 @@
 //!
 //! `cargo run --example ffs-ls -- image.adf`
 
-use amiga_ffs::{BlockSource, EntryKind, Variant, Volume};
+use amiga_ffs::{BlockSource, EntryKind, Volume};
 
 struct FileDisk {
     data: Vec<u8>,
@@ -51,7 +51,8 @@ fn main() {
     let path = std::env::args().nth(1).expect("usage: ffs-ls <image>");
     let data = std::fs::read(&path).expect("read image");
     let disk = FileDisk { data };
-    let mut vol = Volume::open(disk, Some(Variant::FfsIntl)).expect("open");
+    // `None` means "believe the disk": the boot block's dostype decides.
+    let mut vol = Volume::open(disk, None).expect("open");
     println!(
         "volume {:?}, {:?}",
         String::from_utf8_lossy(&vol.root().name.clone()),
