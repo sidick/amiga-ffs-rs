@@ -208,12 +208,66 @@
 //! the one line that supplies it.
 //!
 //! [`AllocError::BitmapInvalid`]: crate::AllocError::BitmapInvalid
+//!
+//! # Block layout policy: passive reorganisation
+//!
+//! Wave 3 of PLAN.md's "Block layout policy, and compaction" entry.
+//! Waves 1 and 2 gave the allocator an [`Intent`] vocabulary and gave
+//! [`Mutator`] the primitives to *retroactively* fix a volume's layout
+//! (`crate::compact`'s `defragment_file`/`relocate_header`) — both driven
+//! by hand, or by [`Mutator::compact`]. This wave spends none of that on
+//! a separate pass: it changes what [`Mutator`]'s own everyday writes do
+//! with the blocks they were already going to allocate, so a volume gets
+//! a little better every time something writes to it rather than only
+//! when a defragmenter is run.
+//!
+//! Aminet's `PFS2DefragTry` (credited in PLAN.md) defragments by copying
+//! a file out and back, trusting the filesystem to lay it down afresh —
+//! which works on PFS2/AFS because *their* allocators seek contiguous
+//! runs, and does not transfer to stock FFS, whose allocator is a bare
+//! next-fit rover with no such intent (`docs/layout-survey.md` §4). But
+//! this crate *is* the writer whenever [`Mutator`] is the one mutating,
+//! and it chooses placement rather than hoping — so [`Mutator::write_file`]
+//! recognises the copy-out-copy-back shape (a write that replaces a
+//! file's entire content) and lands the replacement as one run when the
+//! volume has room for it, which is the PFS2DefragTry trick working
+//! *through* FFS for the first time. See `Mutator::edit_file`'s
+//! `full_rewrite` for where that is decided, and
+//! `tests/volumes.rs`'s `pfs2defragtry_pattern_yields_one_run` for the
+//! closed loop.
+//!
+//! Three changes, all gated by [`Mutator::layout_policy`] (on by
+//! default):
+//!
+//! 1. [`Mutator::create_file`] allocates its data-and-extension sequence
+//!    as one [`Allocator::allocate_run`] instead of one block at a time —
+//!    a new file is born as one run whenever a run exists, not merely
+//!    "usually contiguous by accident of an ascending hint," which is all
+//!    the pre-wave-3 per-block loop guaranteed.
+//! 2. [`Mutator::create_dir`]'s `T_DIRCACHE` block places itself with
+//!    [`Intent::MetadataNearRoot`] instead of next to its own header,
+//!    matching wave 1's finding that dircache blocks belong near the
+//!    root, not near the directory they describe.
+//! 3. `Mutator::edit_file` (the private body behind
+//!    [`Mutator::write_file`], [`Mutator::append`] and
+//!    [`Mutator::truncate`]) places genuinely fresh blocks — growth, or
+//!    every block of a full-content rewrite — with [`Intent::DataFor`];
+//!    a small append still extends near the file's own last block
+//!    (`Intent::DataFor`'s own hint), unchanged from before this wave,
+//!    because passive means the caller's operation dictates the work and
+//!    only *where* it lands is this wave's business.
+//!
+//! Turning the policy off reproduces the exact pre-wave-3 allocation
+//! sequence — every hint this module used before this wave still exists,
+//! just gated — for a caller that wants byte-predictable placement: a
+//! differential comparison, or a test asserting an exact LBA as a proxy
+//! for something the test actually cares about.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::allocator::{AllocError, Allocation, Allocator};
+use crate::allocator::{AllocError, Allocation, Allocator, Intent};
 use crate::build::{
     build_comment_block, build_data_block, build_dircache_block, dircache_record, finish_checksum,
     needs_comment_block, write_date, write_entry_header, write_name_and_comment, CacheFacts,
@@ -562,6 +616,7 @@ pub struct Mutator<S: BlockMedium> {
     pub(crate) vol: Volume<S>,
     pub(crate) alloc: Allocator<Transport<S>>,
     clock: Option<DateStamp>,
+    layout_policy: bool,
 }
 
 impl<S: BlockMedium> Mutator<S> {
@@ -570,12 +625,17 @@ impl<S: BlockMedium> Mutator<S> {
     /// Refuses a volume whose `bitmap_flag` is 0 — see this module's
     /// documentation, and [`Allocator::load`], which is where the refusal
     /// actually lives.
+    ///
+    /// The block-layout policy (this module's "Block layout policy:
+    /// passive reorganisation" section) starts on; [`Mutator::layout_policy`]
+    /// turns it off.
     pub fn open(mut vol: Volume<S>) -> Result<Self, MutateError<Transport<S>>> {
         let alloc = Allocator::load(&mut vol)?;
         Ok(Self {
             vol,
             alloc,
             clock: None,
+            layout_policy: true,
         })
     }
 
@@ -588,6 +648,21 @@ impl<S: BlockMedium> Mutator<S> {
     /// date on disk is worse than an old true one.
     pub fn clock(mut self, now: DateStamp) -> Self {
         self.clock = Some(now);
+        self
+    }
+
+    /// Turn the block-layout policy (this module's "Block layout policy:
+    /// passive reorganisation" section) on or off. On by default.
+    ///
+    /// The policy only changes *where* a write that was already going to
+    /// allocate blocks puts them — it never changes what gets written, so
+    /// there is no compatibility risk in leaving it on. Turn it off for a
+    /// caller that wants this session's allocation sequence to match the
+    /// pre-wave-3 one exactly: a differential comparison against a tool
+    /// that predicts LBAs, or a test asserting an exact placement as a
+    /// proxy for something else it actually means.
+    pub fn layout_policy(mut self, enabled: bool) -> Self {
+        self.layout_policy = enabled;
         self
     }
 
@@ -645,7 +720,18 @@ impl<S: BlockMedium> Mutator<S> {
         // empty cache is not a null pointer, and the oracle's directories
         // have one too.
         if self.vol.variant().has_dircache() {
-            let dc = self.alloc.allocate_near(prep.lba)?;
+            // Near the root, not next to the directory's own header --
+            // wave 1's finding (`docs/layout-survey.md` §4a's addendum,
+            // `Intent::MetadataNearRoot`'s own documentation): a dircache
+            // block is touched during a walk, not at open, so its
+            // locality wants the walk's one anchor.
+            let dc = if self.layout_policy {
+                self.alloc.allocate_for(Intent::MetadataNearRoot {
+                    root_lba: self.vol.root_lba(),
+                })?
+            } else {
+                self.alloc.allocate_near(prep.lba)?
+            };
             self.flush()?;
             let dc = self.alloc.reference(&dc)?;
             let mut buf = vec![0u8; bs];
@@ -697,16 +783,50 @@ impl<S: BlockMedium> Mutator<S> {
         // no pointer can name a block the bitmap still calls free.
         let mut data_at: Vec<Allocation> = Vec::with_capacity(n_data);
         let mut ext_at: Vec<Allocation> = Vec::with_capacity(n_ext);
-        let mut hint = prep.lba;
-        for i in 0..n_data {
-            if i >= slots && (i - slots) % slots == 0 {
+        if self.layout_policy {
+            // Born as one run whenever a run exists: the interleaved
+            // fetch-order positions (data blocks with `T_LIST` extension
+            // blocks spliced in exactly where a streaming reader meets
+            // them, `docs/layout-survey.md` §4a's wave-1 addendum), filled
+            // from one `allocate_run` near the header instead of one block
+            // at a time — a stronger guarantee than the per-block hint
+            // loop below ever gave, which was merely usually contiguous.
+            let positions = interleaved_positions(n_data, n_ext, slots);
+            let total = positions.len() as u64;
+            let mut got = 0u64;
+            let mut hint = prep.lba;
+            let mut allocs: Vec<Allocation> = Vec::with_capacity(positions.len());
+            while got < total {
+                let run = self.alloc.allocate_run_hinted(
+                    total - got,
+                    Intent::DataFor {
+                        header_lba: prep.lba,
+                    },
+                    hint,
+                )?;
+                hint = run.last().map(|a| a.block() + 1).unwrap_or(hint);
+                got += run.len() as u64;
+                allocs.extend(run);
+            }
+            for (is_ext, a) in positions.into_iter().zip(allocs) {
+                if is_ext {
+                    ext_at.push(a);
+                } else {
+                    data_at.push(a);
+                }
+            }
+        } else {
+            let mut hint = prep.lba;
+            for i in 0..n_data {
+                if i >= slots && (i - slots) % slots == 0 {
+                    let a = self.alloc.allocate_near(hint)?;
+                    hint = a.block();
+                    ext_at.push(a);
+                }
                 let a = self.alloc.allocate_near(hint)?;
                 hint = a.block();
-                ext_at.push(a);
+                data_at.push(a);
             }
-            let a = self.alloc.allocate_near(hint)?;
-            hint = a.block();
-            data_at.push(a);
         }
         self.flush()?;
 
@@ -890,7 +1010,27 @@ impl<S: BlockMedium> Mutator<S> {
         let old_size = chain.byte_size as u64;
         let n_old = chain.blocks.len();
         let n_new = div_ceil(new_size, payload) as usize;
-        let kept = n_old.min(n_new);
+
+        // The copy-out-copy-back shape: a write that replaces the file's
+        // entire visible content (`offset == 0`, and `data` reaches at
+        // least as far as the old end, so nothing of the old file
+        // survives unread). This is deliberately narrower than "big
+        // write" — an append, or a write into the middle, never qualifies
+        // no matter its size, because passive means the caller's own
+        // operation dictates the work; this only changes *where* a write
+        // that was already discarding the whole old chain puts the
+        // replacement. See this module's "Block layout policy" section:
+        // this is the PFS2DefragTry pattern closed through the one writer
+        // that can choose placement instead of hoping the allocator will.
+        let full_rewrite = self.layout_policy && offset == 0 && data.len() as u64 >= old_size;
+        // For every decision below about which *positions* reuse an old
+        // block in place, a full rewrite treats the old chain as if it
+        // had nothing to reuse — every position is fresh. The real
+        // `n_old` is still what the final free pass and the OFS
+        // read-modify-write path (guarded by `!untouchable`, which a full
+        // rewrite never reaches) need, so both names stay in scope.
+        let eff_n_old = if full_rewrite { 0 } else { n_old };
+        let kept = eff_n_old.min(n_new);
 
         // How many bytes of block `i` the file uses at a given length.
         let len_at = |size: u64, i: usize| -> usize {
@@ -908,34 +1048,74 @@ impl<S: BlockMedium> Mutator<S> {
 
         // Whether the extension chain's *contents* change. The header's
         // own table holds the first `slots` pointers, so a file that stays
-        // inside it never touches the chain at all.
+        // inside it never touches the chain at all. A full rewrite always
+        // rebuilds it: every data pointer in it is about to be fresh.
         let n_ext_new = ext_block_count(n_new, slots);
-        let ext_dirty = (n_new != n_old && (n_new > slots || n_old > slots))
+        let ext_dirty = full_rewrite
+            || (n_new != eff_n_old && (n_new > slots || eff_n_old > slots))
             || matches!(cow_index, Some(i) if i >= slots);
 
         // Everything up front, then one flush: after it every block number
         // below is durable, so `reference` never refuses.
-        let mut hint = chain.blocks.last().map(|&b| b as u64).unwrap_or(entry.lba);
-        let mut fresh: Vec<Allocation> = Vec::with_capacity(n_new.saturating_sub(n_old));
-        for _ in n_old..n_new {
-            let a = self.alloc.allocate_near(hint)?;
-            hint = a.block();
-            fresh.push(a);
-        }
-        let cow_at = match cow_index {
-            Some(_) => {
-                let a = self.alloc.allocate_near(hint)?;
-                hint = a.block();
-                Some(a)
-            }
-            None => None,
-        };
+        let mut fresh: Vec<Allocation> = Vec::with_capacity(n_new.saturating_sub(eff_n_old));
+        let mut cow_at: Option<Allocation> = None;
         let mut ext_at: Vec<Allocation> = Vec::new();
-        if ext_dirty {
-            for _ in 0..n_ext_new {
+        if full_rewrite {
+            // One contiguous run, interleaved with the extension chain at
+            // its natural fetch-order position — `Mutator::create_file`'s
+            // own reasoning, applied here to a replacement instead of a
+            // birth. `allocate_run`'s own documented fallback (the
+            // longest run available, called again for the remainder)
+            // means a badly fragmented volume still finishes the write,
+            // just not in one piece. `cow_index` is always `None` here —
+            // `kept` is 0, since `eff_n_old` is — so there is no
+            // copy-on-write block to interleave in as well.
+            let positions = interleaved_positions(n_new, n_ext_new, slots);
+            let total = positions.len() as u64;
+            let mut got = 0u64;
+            let mut hint = header;
+            let mut allocs: Vec<Allocation> = Vec::with_capacity(positions.len());
+            while got < total {
+                let run = self.alloc.allocate_run_hinted(
+                    total - got,
+                    Intent::DataFor { header_lba: header },
+                    hint,
+                )?;
+                hint = run.last().map(|a| a.block() + 1).unwrap_or(hint);
+                got += run.len() as u64;
+                allocs.extend(run);
+            }
+            for (is_ext, a) in positions.into_iter().zip(allocs) {
+                if is_ext {
+                    ext_at.push(a);
+                } else {
+                    fresh.push(a);
+                }
+            }
+        } else {
+            // The pre-wave-3 shape, unchanged: growth extends near the
+            // file's own last block (`Intent::DataFor`'s own hint,
+            // already what this hint was before it had a name), then the
+            // copy-on-write block, then a rebuilt extension chain, one
+            // hint threaded through all three so each lands next to the
+            // last thing this call allocated.
+            let mut hint = chain.blocks.last().map(|&b| b as u64).unwrap_or(entry.lba);
+            for _ in eff_n_old..n_new {
                 let a = self.alloc.allocate_near(hint)?;
                 hint = a.block();
-                ext_at.push(a);
+                fresh.push(a);
+            }
+            if cow_index.is_some() {
+                let a = self.alloc.allocate_near(hint)?;
+                hint = a.block();
+                cow_at = Some(a);
+            }
+            if ext_dirty {
+                for _ in 0..n_ext_new {
+                    let a = self.alloc.allocate_near(hint)?;
+                    hint = a.block();
+                    ext_at.push(a);
+                }
             }
         }
         self.flush()?;
@@ -956,8 +1136,8 @@ impl<S: BlockMedium> Mutator<S> {
         // The file's blocks as they will be: kept, replaced, or new.
         let mut blocks: Vec<u64> = Vec::with_capacity(n_new);
         for i in 0..n_new {
-            if i >= n_old {
-                blocks.push(fresh_lba[i - n_old]);
+            if i >= eff_n_old {
+                blocks.push(fresh_lba[i - eff_n_old]);
             } else if Some(i) == cow_index {
                 blocks.push(cow_lba.expect("a cow index implies a cow block"));
             } else {
@@ -979,7 +1159,7 @@ impl<S: BlockMedium> Mutator<S> {
         // in-place caveat.
         for pass in 0..2 {
             for i in 0..n_new {
-                let untouchable = i >= n_old || Some(i) == cow_index;
+                let untouchable = i >= eff_n_old || Some(i) == cow_index;
                 if untouchable != (pass == 0) {
                     continue;
                 }
@@ -1005,7 +1185,7 @@ impl<S: BlockMedium> Mutator<S> {
                 // than trusted.
                 let mut payload_buf = vec![0u8; len];
                 let keep = len_at(old_size, i).min(len);
-                if keep > 0 && i < n_old {
+                if keep > 0 && i < eff_n_old {
                     let got = self
                         .vol
                         .read_range(&chain, start, &mut payload_buf[..keep])?;
@@ -1086,7 +1266,11 @@ impl<S: BlockMedium> Mutator<S> {
         // a bit is cleared only once nothing on the disk names the block.
         self.refresh_dircache(entry.parent as u64)?;
         self.touch_disk()?;
-        for i in n_new..n_old {
+        // A full rewrite reused none of the old data blocks (`eff_n_old`
+        // was 0 throughout), so every one of them — not just the ones
+        // past the new length — is now unreachable.
+        let free_from = if full_rewrite { 0 } else { n_new };
+        for i in free_from..n_old {
             self.alloc.free(chain.blocks[i] as u64)?;
         }
         if let Some(i) = cow_index {
@@ -1490,7 +1674,13 @@ impl<S: BlockMedium> Mutator<S> {
             });
         }
 
-        let a = self.alloc.allocate_near(parent)?;
+        // A file or directory's own header, near the directory it is
+        // filed in — `Intent::HeaderIn`'s own reasoning, and (`hint()`
+        // returning `dir_lba` unchanged) exactly the hint this call used
+        // before wave 3 gave it a name.
+        let a = self
+            .alloc
+            .allocate_for(Intent::HeaderIn { dir_lba: parent })?;
         self.flush()?;
         let lba = self.alloc.reference(&a)?;
 
@@ -1777,18 +1967,65 @@ impl<S: BlockMedium> Mutator<S> {
 
         let old = self.vol.read_dircache(dir)?.blocks;
         let mut blocks = old.clone();
+
+        // Light-touch directory pull (this module's "Block layout policy"
+        // section, item 3): every *kept* dircache block past the first
+        // gets its content rewritten below regardless of whether the
+        // chain grew or shrank, so trying to relocate one costs nothing
+        // beyond the relocated block itself -- no extra read, since the
+        // write that already had to happen just lands somewhere else, and
+        // no extra write when the attempt is declined (a tentative
+        // allocation that turns out not to help is freed again before it
+        // is ever flushed, so it never reaches the disk).
+        //
+        // The chain's own *first* block is deliberately left out: moving
+        // it would also require a second write to retarget `dir`'s own
+        // `TL_EXTENSION` pointer, which every other kept block does not
+        // need (its predecessor's `next` field is already being rewritten
+        // below) -- outside the "at most the relocated blocks themselves"
+        // budget this item was given, so it is skipped rather than forced.
+        //
+        // "Nearer" means nearer to `dir`, not blindly nearer to the root:
+        // a candidate is adopted only when it measurably beats what is
+        // already there, so a directory whose cache is already well
+        // placed pays nothing here at all.
+        let mut pull: Vec<(usize, Allocation)> = Vec::new();
+        if self.layout_policy {
+            let root_lba = self.vol.root_lba();
+            let kept = old.len().min(pages.len());
+            for (i, &current) in blocks.iter().enumerate().take(kept).skip(1) {
+                let candidate = self
+                    .alloc
+                    .allocate_for(Intent::MetadataNearRoot { root_lba })?;
+                let current_dist = (current as i64 - dir as i64).unsigned_abs();
+                let candidate_dist = (candidate.block() as i64 - dir as i64).unsigned_abs();
+                if candidate_dist < current_dist {
+                    pull.push((i, candidate));
+                } else {
+                    self.alloc.free(candidate.block())?;
+                }
+            }
+        }
+
+        let mut fresh: Vec<Allocation> = Vec::new();
         if pages.len() > blocks.len() {
-            let mut fresh = Vec::new();
             let mut hint = dir;
             for _ in blocks.len()..pages.len() {
                 let a = self.alloc.allocate_near(hint)?;
                 hint = a.block();
                 fresh.push(a);
             }
+        }
+        if !pull.is_empty() || !fresh.is_empty() {
             self.flush()?;
-            for a in &fresh {
-                blocks.push(self.alloc.reference(a)?);
-            }
+        }
+        let mut pulled_old: Vec<u64> = Vec::with_capacity(pull.len());
+        for (i, a) in &pull {
+            pulled_old.push(blocks[*i]);
+            blocks[*i] = self.alloc.reference(a)?;
+        }
+        for a in &fresh {
+            blocks.push(self.alloc.reference(a)?);
         }
 
         for (i, (records, count)) in pages.iter().enumerate().rev() {
@@ -1812,6 +2049,9 @@ impl<S: BlockMedium> Mutator<S> {
         }
 
         for &lba in blocks.iter().skip(pages.len()) {
+            self.alloc.free(lba)?;
+        }
+        for lba in pulled_old {
             self.alloc.free(lba)?;
         }
         self.flush()
@@ -1956,6 +2196,33 @@ struct Prepared<'a> {
 fn ext_block_count(n_data: usize, slots: usize) -> usize {
     let over = n_data.saturating_sub(slots);
     over / slots + usize::from(over % slots != 0)
+}
+
+/// The interleaved fetch-order positions for a **new** chain of `n_data`
+/// data blocks and `n_ext` extension blocks, before any of them has an
+/// LBA yet: `true` at each position an extension block belongs, `false`
+/// at a data block. Mirrors `crate::compact`'s `fetch_order`, which walks
+/// the same interleaving over a chain that already exists; this is the
+/// version for one that is about to be allocated in one run.
+///
+/// An extension block lands right after the last data block of the
+/// `slots`-sized group it closes — matching the order the pre-wave-3
+/// per-block loop already produced by allocating it just before that
+/// group's first data block, which is the same position, one call
+/// earlier — so the run this produces reads in the order a streaming
+/// reader actually walks it.
+fn interleaved_positions(n_data: usize, n_ext: usize, slots: usize) -> Vec<bool> {
+    let mut out = Vec::with_capacity(n_data + n_ext);
+    let mut ext_used = 0usize;
+    for i in 0..n_data {
+        out.push(false);
+        if ext_used < n_ext && (i + 1) % slots == 0 {
+            out.push(true);
+            ext_used += 1;
+        }
+    }
+    debug_assert_eq!(ext_used, n_ext);
+    out
 }
 
 /// Does the block starting at `start` and `len` bytes long overlap the

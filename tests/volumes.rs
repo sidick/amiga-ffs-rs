@@ -6462,6 +6462,17 @@ fn write_refuses_what_has_no_contents_of_its_own() {
 /// untouched, so every prefix of the write is a volume that validates with
 /// *zero* findings -- not even a leak -- and holds a file of the right
 /// length made of some old blocks and some new ones.
+///
+/// Layout policy off, deliberately: this test's subject is the **in-place**
+/// overwrite path (same blocks, patched byte-for-byte), which is exactly
+/// what wave 3's `full_rewrite` relocation (this module's "Block layout
+/// policy" section) opts a same-offset, whole-content overwrite *out* of by
+/// design, since landing the replacement as one fresh run is the point.
+/// That path's own crash safety is the ordinary allocate-then-one-header-
+/// commit shape every other growing write already has, and is exercised
+/// with the policy on (the default) by
+/// `an_interrupted_file_write_leaks_and_never_double_allocates`, which
+/// already tolerates the leaked blocks a crash before that commit leaves.
 #[test]
 fn an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else() {
     for variant in [Variant::Ofs, Variant::Ffs] {
@@ -6474,11 +6485,11 @@ fn an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else() {
         let total = {
             let vol = writable(variant, bs, nblocks, &old);
             let root = vol.root_lba();
-            let mut m = Mutator::open(vol).unwrap();
+            let mut m = Mutator::open(vol).unwrap().layout_policy(false);
             m.write_file(root, b"Doc", 0, &new).unwrap();
             let mut vol = m.into_volume();
             vol.source_mut().clear_log();
-            let mut m = Mutator::open(vol).unwrap();
+            let mut m = Mutator::open(vol).unwrap().layout_policy(false);
             m.write_file(root, b"Doc", 0, &old).unwrap();
             m.into_volume().into_inner().write_log().len()
         };
@@ -6488,7 +6499,7 @@ fn an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else() {
         for n in 0..=total {
             let vol = writable(variant, bs, nblocks, &old);
             let root = vol.root_lba();
-            let mut m = Mutator::open(vol).unwrap();
+            let mut m = Mutator::open(vol).unwrap().layout_policy(false);
             m.volume().source_mut().clear_log();
             m.volume().source_mut().fail_after(n);
             if m.write_file(root, b"Doc", 0, &new).is_err() {
@@ -7334,13 +7345,23 @@ fn file_run_count(vol: &mut Volume<MemDisk>, header_lba: u64) -> usize {
 /// every other file of a filler set -- the same rig
 /// `examples/frag-bench.rs`'s `build_fragmented` uses, and the shape a
 /// volume takes after months of use, not sabotage.
+///
+/// Built with the wave-3 layout policy turned **off**. That policy is
+/// exactly what would otherwise defeat this fixture: `create_file`'s own
+/// `allocate_run` would skip straight past the small holes this function
+/// deliberately threads a file through and grab a large clean run instead
+/// (correct behaviour for a real caller, wrong for a fixture whose whole
+/// job is to build something fragmented to defragment). This is the
+/// off-switch's documented use — a test whose real subject is
+/// `defragment_file`/`compact`, for which "the file starts fragmented" is
+/// a proxy, not the behaviour under test.
 fn fragmented_volume(variant: Variant, bs: usize, nblocks: u64) -> (Volume<MemDisk>, u64) {
     let mut disk = MemDisk::filled(bs, nblocks, 0xA5);
     let opts = FormatOptions::new(variant, nblocks, b"Frag");
     amiga_ffs::format(&mut disk, &opts).unwrap();
     let vol = Volume::open_with(disk, None, nblocks, 2).unwrap();
     let root = vol.root_lba();
-    let mut m = Mutator::open(vol).unwrap();
+    let mut m = Mutator::open(vol).unwrap().layout_policy(false);
     let filler = pattern(bs * 2);
     let mut names = Vec::new();
     for i in 0..120u32 {
@@ -8508,4 +8529,163 @@ fn a_random_interleave_of_mutations_and_compaction_agrees_with_a_model() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block layout policy (wave 3: passive reorganisation)
+// ---------------------------------------------------------------------------
+
+/// `Mutator::create_file` under the default layout policy: a new file is
+/// born as one run, on every variant and every block size the format
+/// supports -- not merely "usually contiguous," which is all the
+/// pre-wave-3 per-block hint loop ever guaranteed. Reuses
+/// `file_run_count`, wave 2's own run-over-fetch-order metric.
+#[test]
+fn a_new_file_is_born_as_one_run_across_variants_and_block_sizes() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 1024, 4096] {
+            let nblocks = 1_800_000 / bs as u64;
+            let vol = populated(variant, bs, nblocks, |_| {});
+            let root = vol.root_lba();
+            let mut m = Mutator::open(vol).unwrap();
+            let payload = pattern(50_000);
+            let header = m
+                .create_file(root, b"Payload", &amiga_ffs::Metadata::new(), &payload)
+                .unwrap();
+            let mut vol = m.into_volume();
+            assert_eq!(
+                file_run_count(&mut vol, header),
+                1,
+                "{variant:?} @{bs}: a fresh file on a fresh volume must land as one run"
+            );
+            assert_eq!(vol.read_file(header).unwrap(), payload);
+            assert_clean(&mut vol, "after create_file");
+        }
+    }
+}
+
+/// The PFS2DefragTry pattern (PLAN.md's "Passive reorganisation": Aminet's
+/// tool by Martin Steigerwald, 1998, crediting Simon for the idea) closed
+/// through the one writer that can actually choose placement.
+/// `docs/layout-survey.md` §4 establishes why the trick -- copy a
+/// fragmented file out, delete it, recreate it with the same content, let
+/// the filesystem lay it down afresh -- does **not** defragment stock
+/// FFS: FFS's own allocator is a bare next-fit rover with no notion of a
+/// contiguous run to seek, unlike PFS2/AFS's, which is what the trick
+/// actually relies on. This crate *is* the writer whenever `Mutator` is
+/// the one mutating, so the same recipe, run through `Mutator` instead of
+/// a real ROM's FFS, does work -- which is exactly what this test pins.
+#[test]
+fn pfs2defragtry_pattern_yields_one_run() {
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    assert!(
+        file_run_count(&mut vol, header) > 1,
+        "test setup: the file must start fragmented"
+    );
+    let bytes = vol.read_file(header).unwrap();
+
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    m.delete(root, b"Payload").unwrap();
+    let header = m
+        .create_file(root, b"Payload", &amiga_ffs::Metadata::new(), &bytes)
+        .unwrap();
+    let mut vol = m.into_volume();
+
+    assert_eq!(vol.read_file(header).unwrap(), bytes);
+    assert_eq!(
+        file_run_count(&mut vol, header),
+        1,
+        "PFS2DefragTry's own trick, working through this crate's own writer"
+    );
+    assert_clean(&mut vol, "after the PFS2DefragTry pattern");
+}
+
+/// The other shape the same idea takes: not delete-and-recreate but a
+/// straight `write_file` at offset 0 covering the whole old length --
+/// `Mutator::edit_file`'s own `full_rewrite` detection, the copy-out-
+/// copy-back shape a user's "copy the file elsewhere and back" produces
+/// without ever deleting the original.
+#[test]
+fn a_full_content_overwrite_lands_as_one_run() {
+    let (mut vol, header) = fragmented_volume(Variant::FfsIntl, 512, 4000);
+    assert!(
+        file_run_count(&mut vol, header) > 1,
+        "test setup: the file must start fragmented"
+    );
+    let bytes = vol.read_file(header).unwrap();
+
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    m.write_file(root, b"Payload", 0, &bytes).unwrap();
+    let mut vol = m.into_volume();
+
+    assert_eq!(vol.read_file(header).unwrap(), bytes);
+    assert_eq!(
+        file_run_count(&mut vol, header),
+        1,
+        "a full-content overwrite must land as one run when the volume has room"
+    );
+    assert_clean(&mut vol, "after a full-content rewrite");
+}
+
+/// A small append extends near the file's own last block when there is
+/// room there -- `Intent::DataFor`'s own hint, which this wave did not
+/// change for growth -- rather than being swept into the full-rewrite
+/// relocation `Mutator::edit_file`'s `full_rewrite` reserves for a write
+/// that replaces the whole file. Passive means the caller's own operation
+/// dictates the work; an append is not a rewrite and must not be treated
+/// as one.
+#[test]
+fn a_small_append_stays_adjacent_to_the_files_last_block() {
+    let vol = populated(Variant::FfsIntl, 512, 2000, |_| {});
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let header = m
+        .create_file(root, b"Doc", &amiga_ffs::Metadata::new(), &pattern(20_000))
+        .unwrap();
+    assert_eq!(
+        file_run_count(m.volume(), header),
+        1,
+        "test setup: the file must start as one run"
+    );
+
+    m.append(root, b"Doc", &pattern(500)).unwrap();
+    let mut vol = m.into_volume();
+    assert_eq!(
+        file_run_count(&mut vol, header),
+        1,
+        "a small append with room ahead stays adjacent, not scattered"
+    );
+    assert_clean(&mut vol, "after a small append");
+}
+
+/// Turning the layout policy off reproduces the exact pre-wave-3
+/// allocation this crate always used: `create_file`'s per-block hint loop
+/// can be threaded through holes exactly like `fragmented_volume` relies
+/// on, and a same-length `write_file` at offset 0 stays the in-place
+/// overwrite it always was rather than becoming a relocation. This is the
+/// off-switch's own contract, pinned directly rather than only relied on
+/// by other tests' fixtures.
+#[test]
+fn layout_policy_off_reproduces_the_pre_wave_3_placement() {
+    let vol = populated(Variant::FfsIntl, 512, 2000, |_| {});
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap().layout_policy(false);
+    let header = m
+        .create_file(root, b"Doc", &amiga_ffs::Metadata::new(), &pattern(20_000))
+        .unwrap();
+    let before = m.volume().file_chain(header).unwrap().blocks.clone();
+
+    // A same-length full-content rewrite, with the policy off, patches
+    // the very same blocks in place -- no allocation, no relocation.
+    let content = pattern(20_000);
+    m.volume().source_mut().clear_log();
+    m.write_file(root, b"Doc", 0, &content).unwrap();
+    let after = m.volume().file_chain(header).unwrap().blocks.clone();
+    assert_eq!(before, after, "an in-place overwrite must not move a block");
+
+    let mut vol = m.into_volume();
+    assert_eq!(vol.read_file(header).unwrap(), content);
+    assert_clean(&mut vol, "after a policy-off overwrite");
 }

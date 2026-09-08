@@ -937,15 +937,20 @@ observe.
       with `Mutator` operations (only pure resize sequences are
       seeded-random-tested today).
 
-## In scope, not scheduled
+## Milestone 5 — block layout policy and compaction
 
-- **Block layout policy, and compaction** — one subject, at two points
-  in a volume's life. The premise: this crate's output is not only
-  emulator images. It writes filesystems that land on **real Amiga
-  hardware** — CF cards, real drives, real floppies — where a seek is a
-  head stepping across a platter and costs milliseconds, not an offset
-  into a host file costing nothing. Layout is therefore a durable
-  property of every image shipped, not a tuning detail.
+**Landed.** All three waves: wave 1 — the survey (`docs/layout-survey.md`)
+and creation-time policy, `Allocator`'s `Intent` vocabulary and
+`allocate_run`, `Populator`'s two-cursor split; wave 2 — compaction,
+`src/compact.rs`'s two tiers plus `make_room` and `resize_evacuating`;
+wave 3 — passive reorganisation, `Mutator`'s own everyday writes adopting
+`Intent` for their own placement. One subject, at two points in a
+volume's life. The premise throughout: this crate's output is not only
+emulator images. It writes filesystems that land on **real Amiga
+hardware** — CF cards, real drives, real floppies — where a seek is a
+head stepping across a platter and costs milliseconds, not an offset
+into a host file costing nothing. Layout is therefore a durable
+property of every image shipped, not a tuning detail.
 
   **Wave 1 landed**: `docs/layout-survey.md` (the survey this entry
   itself asked for, done first, plus a wave-1 addendum to §4a — see
@@ -978,10 +983,11 @@ observe.
   (the differential test against xdftool still agrees block for block);
   the policy only changes what `Populator` adds on top of it. Items 2
   and 3 below — compaction, and passive reorganisation through
-  `Mutator` — are still open; so is `Mutator` ever adopting `Intent` for
-  its own placement, which is a deliberate wave-1 non-goal, not an
-  oversight (frag-bench's *fragmented* image is still built through
-  `Mutator`, unchanged, on purpose).
+  `Mutator` — were still open at the end of this wave; so was `Mutator`
+  ever adopting `Intent` for its own placement, which was a deliberate
+  wave-1 non-goal, not an oversight (frag-bench's *fragmented* image was
+  still built through `Mutator`, unchanged, on purpose — and still is,
+  now through `.layout_policy(false)`, since wave 3 changed the default).
 
   **Wave 2 landed**: item 2 (compaction) and, for the one refusal it
   named, item 3 (closing `resize`'s gap). New module `src/compact.rs`,
@@ -1080,16 +1086,102 @@ observe.
   gaps worth closing before this lands as anything more than "landed and
   working," not oversights papered over.
 
-  **Wave 3, passive reorganisation, stays open** — item after item 3 in
-  this entry's own original ordering, and not attempted this wave: making
-  `Mutator`'s own day-to-day writes place blocks by `Intent` instead of
-  by whatever hint they use today, so a volume gets a little better every
-  time it is written to rather than only when a compaction is run by
-  hand. Wave 2's tier 1/tier 2 primitives are exactly the machinery a
-  passive pass would call into (the same `defragment_file`/
-  `relocate_header` shapes, triggered opportunistically rather than
-  swept end to end), so this is now unblocked, not merely still-a-good-
-  idea.
+  **Wave 3 landed**: passive reorganisation — `Mutator`'s own day-to-day
+  writes now place blocks by `Intent` instead of by the bare hint they
+  used through wave 2, so a volume gets a little better every time it is
+  written to rather than only when a compaction is run by hand. Three
+  changes, all gated by a new `Mutator::layout_policy(bool)` (on by
+  default — the policy only changes *where* a write that was already
+  going to allocate blocks puts them, never what gets written, so there
+  is no compatibility risk in leaving it on):
+  `Mutator::create_file` allocates its data-and-extension sequence as one
+  `Allocator::allocate_run` instead of one block at a time, so a new file
+  is born as one run whenever a run exists, not merely "usually
+  contiguous by accident"; `Mutator::create_dir`'s `T_DIRCACHE` block
+  places itself with `Intent::MetadataNearRoot` instead of next to its
+  own header, matching wave 1's finding that dircache blocks belong near
+  the root; and `Mutator::edit_file` recognises the copy-out-copy-back
+  shape a full-content rewrite produces (`offset == 0` and the write
+  reaches at least as far as the old end of file — an append or a
+  mid-file write never qualifies, deliberately, since passive means the
+  caller's own operation dictates the work and this only chooses *where*
+  a write that was already discarding the whole old chain puts the
+  replacement) and lands the replacement as one contiguous run, the same
+  `interleaved_positions` fetch-order splicing `create_file` uses. A
+  small append still extends near the file's own last block
+  (`Intent::DataFor`'s own hint), unchanged from wave 2.
+
+  This is the PFS2DefragTry idea (credited below) closed for real:
+  Aminet's tool copies a file out and back trusting the filesystem to lay
+  it down afresh, which works on PFS2/AFS because *their* allocators seek
+  contiguous runs and does not transfer to stock FFS's bare next-fit
+  rover (`docs/layout-survey.md` §4) — but this crate *is* the writer
+  whenever `Mutator` mutates, and `examples/frag-bench.rs`'s own
+  fragmented image, copied out, deleted and recreated through `Mutator`
+  with the policy at its default, now comes back as the same one run
+  `defragment_file` produces by hand (`reorged.adf`, alongside
+  `contiguous.adf`/`fragmented.adf`/`defragmented.adf`).
+
+  A fourth item, light-touch directory pull, made its stated budget:
+  `Mutator`'s dircache regeneration (`refresh_dircache`, `DOS\4`/`DOS\5`)
+  already rewrites every *kept* cache block's content on every create,
+  delete, rename and metadata change regardless of whether the chain grew
+  or shrank, so trying to relocate one nearer the root costs nothing
+  beyond the relocated block itself: a declined attempt (the candidate
+  turns out no closer than what is already there) is freed again before
+  it is ever flushed, so it never reaches the disk. The chain's own
+  *first* block is left out of this — moving it would need a second write
+  to `dir`'s own `TL_EXTENSION` pointer, which every other kept block does
+  not, and that write is outside the budget this item was given, so it is
+  skipped rather than forced, honestly, per this item's own instruction.
+
+  Tested: `a_new_file_is_born_as_one_run_across_variants_and_block_sizes`
+  (every variant, 512/1024/4096); `pfs2defragtry_pattern_yields_one_run`
+  and `a_full_content_overwrite_lands_as_one_run` (the two shapes the
+  copy-out-copy-back pattern takes — delete-and-recreate, and a straight
+  `write_file`); `a_small_append_stays_adjacent_to_the_files_last_block`
+  (growth does not get swept into a rewrite it did not ask for);
+  `layout_policy_off_reproduces_the_pre_wave_3_placement` (the knob's own
+  contract, pinned directly). The wave 2 seeded property test
+  (`a_random_interleave_of_mutations_and_compaction_agrees_with_a_model`)
+  and the general mutation ones
+  (`a_random_interleave_of_mutations_agrees_with_a_model`,
+  `a_random_interleave_of_writes_agrees_with_a_model_file`) pass unchanged
+  with the policy on by default, confirming placement changes do not
+  change semantics; every existing crash sweep passes unchanged too,
+  since placement is chosen before any write begins, so the ordering
+  discipline every sweep checks is untouched. Six existing tests needed
+  the off switch or an updated expectation once the policy defaulted to
+  on: `fragmented_volume` (the `tests/volumes.rs` fixture four compaction
+  tests build on) now builds with `.layout_policy(false)`, because its
+  whole job is threading a file through small holes on purpose, which
+  `create_file`'s new `allocate_run` would otherwise skip past for a
+  larger clean run — correct behaviour for a real caller, wrong for a
+  fixture whose fragmentation *is* the point;
+  `an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else`
+  is about the in-place overwrite path specifically (its own doc comment
+  says so), which a same-offset whole-content rewrite now opts out of by
+  design, so it too now builds with the policy off, with a note pointing
+  at the general write crash sweep for the relocation path's own crash
+  safety (the ordinary allocate-then-one-header-commit shape, already
+  exercised with the policy on). `examples/frag-bench.rs`'s own
+  `build_fragmented` got the same fix, for the same reason.
+
+  **Narrower than this item's full ask, honestly**: the directory-pull
+  relocation is exercised only incidentally, by the existing multi-block
+  dircache tests continuing to pass — no dedicated test constructs a
+  directory whose second cache block starts far from it and checks the
+  pull closes the gap, because doing so deterministically through
+  `Mutator`'s own public surface (rather than by poking bytes directly,
+  which every other synthetic-volume test in `tests/volumes.rs` does, but
+  which this item's own modest scope did not seem to warrant) turned out
+  to need more scaffolding than the item's budget justified. And wave 2's
+  own honestly-recorded gaps are still open: the extension-boundary
+  property-test interleaving noted in `f55994e`, and the full
+  512/4096 × every-variant-including-LNFS compaction sweep (narrowed to
+  FFS/OFS at 512 for the crash sweeps specifically, though
+  `compaction_matrix_covers_every_variant_and_block_size` does cover the
+  full variant/block-size matrix for the non-crash-sweep assertions).
 
   The format itself is the evidence. The root sits at the *midpoint* of
   the volume — the whole reason `canonical_root_lba` exists and the
@@ -1101,9 +1193,9 @@ observe.
   step per block. A design that put its root in the middle was designed
   around seek.
 
-  So, in the order they should be built (1 and 2/3 below are the wave 1
-  and wave 2 landed above; this numbered list is kept as the original
-  planning record rather than rewritten):
+  So, in the order they were built (1 is wave 1, 2/3 are wave 2, passive
+  reorganisation below is wave 3 — all landed above; this numbered list is
+  kept as the original planning record rather than rewritten):
 
   1. **Policy at creation.** `format` and `Populator` already produce
      contiguous files, but by accident of a forward-cursor allocator
@@ -1153,6 +1245,8 @@ observe.
   better than it was found. The cost is that it makes writes place
   blocks by policy rather than by cursor, which is the same machinery
   item 1 needs — which is why the two belong in one piece of work.
+  **Landed as wave 3, above**, including the directory-pull half within
+  the budget it was given.
 
   **Survey before designing the policy**, the way the allocator and the
   LNFS layout were surveyed: ReOrg and the other commercial Amiga
@@ -1161,6 +1255,8 @@ observe.
   One modern wrinkle for the notes: CF and SD-via-adapter have no seek
   cost but do have erase blocks, so contiguity still pays while
   cylinder-alignment reasoning does not transfer.
+
+## In scope, not scheduled
 
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and

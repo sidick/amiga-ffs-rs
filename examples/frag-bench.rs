@@ -1,11 +1,21 @@
-//! Build two ADFs that differ only in block layout, for measuring what
-//! layout actually costs a real ROM's FFS.
+//! Build ADFs that differ only in block layout, for measuring what layout
+//! actually costs a real ROM's FFS.
 //!
-//! Both volumes are `DOS\3`, both contain one file of identical bytes.
+//! All volumes are `DOS\3`, all contain one file of identical bytes.
 //! In `contiguous.adf` its data blocks are one ascending run; in
 //! `fragmented.adf` the same file is threaded through holes left by
 //! deleting every other file of a filler set, which is what a volume
-//! that has been lived in looks like.
+//! that has been lived in looks like. `defragmented.adf` is
+//! `fragmented.adf` run through wave 2's `Mutator::defragment_file`, by
+//! hand. `reorged.adf` is `fragmented.adf`'s own file copied out, deleted
+//! and recreated through `Mutator` with wave 3's layout policy on (the
+//! default) and nothing else done by hand — PLAN.md's "Passive
+//! reorganisation" closing Aminet's `PFS2DefragTry` (Martin Steigerwald,
+//! 1998, crediting Simon for the idea) loop: that copy-out-copy-back
+//! trick does not defragment stock FFS, whose allocator has no notion of
+//! contiguous runs to seek (`docs/layout-survey.md` §4), but does work
+//! through this crate, which is the writer and chooses placement rather
+//! than hoping.
 //!
 //! `cargo run --example frag-bench -- outdir`
 //!
@@ -147,13 +157,22 @@ fn build_contiguous() -> MemDisk {
     pop.finish().expect("finish")
 }
 
+/// A volume with one large file threaded through holes left by deleting
+/// every other file of a filler set.
+///
+/// Layout policy off, deliberately: wave 3 gave `Mutator::create_file` an
+/// `allocate_run` that would otherwise skip straight past the small holes
+/// this function threads the payload through and grab a large clean run
+/// instead of a fragmented one — correct behaviour for a real caller,
+/// wrong for a fixture whose whole job is to build something fragmented.
+/// See `build_reorged` for where the policy is deliberately back on.
 fn build_fragmented() -> MemDisk {
     let mut disk = blank();
     let opts = FormatOptions::new(Variant::FfsIntl, BLOCKS, b"Frag");
     amiga_ffs::format(&mut disk, &opts).expect("format");
     let vol = Volume::open(disk, None).expect("open");
     let root = vol.root_lba();
-    let mut m = Mutator::open(vol).expect("mutator");
+    let mut m = Mutator::open(vol).expect("mutator").layout_policy(false);
 
     // Lay down a filler set, then punch every other one out. The holes
     // are what the payload will be threaded through: this is wear, not
@@ -203,6 +222,36 @@ fn build_defragmented() -> MemDisk {
     m.into_volume().into_inner()
 }
 
+/// The PFS2DefragTry pattern itself: `build_fragmented`'s own file,
+/// copied out to host memory, deleted, and recreated with the same bytes
+/// — nothing else done by hand, and the layout policy left at its
+/// default (on). This is wave 3's whole point, and the closed loop this
+/// module's own documentation describes: the trick `docs/layout-survey.md`
+/// §4 says does not defragment stock FFS works through this crate,
+/// because this crate is the writer and `Mutator::create_file` chooses
+/// placement instead of leaving it to a rover that was never contiguity-
+/// aware to begin with.
+fn build_reorged() -> MemDisk {
+    let disk = build_fragmented();
+    let mut vol = Volume::open(disk, None).expect("open");
+    let root = vol.root_lba();
+    let bytes = {
+        let header = vol
+            .lookup(root, b"Payload")
+            .expect("lookup")
+            .expect("present")
+            .lba;
+        vol.read_file(header).expect("read")
+    };
+    // Layout policy at its default (on): this is the one build in this
+    // file where that matters, and where leaving it on is the point.
+    let mut m = Mutator::open(vol).expect("mutator");
+    m.delete(root, b"Payload").expect("delete");
+    m.create_file(root, b"Payload", &Metadata::new(), &bytes)
+        .expect("recreate");
+    m.into_volume().into_inner()
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: frag-bench <outdir>");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -211,6 +260,7 @@ fn main() {
         ("contiguous", build_contiguous()),
         ("fragmented", build_fragmented()),
         ("defragmented", build_defragmented()),
+        ("reorged", build_reorged()),
     ] {
         let (disk, desc) = describe(disk, b"Payload");
         println!("{label}: {desc}");

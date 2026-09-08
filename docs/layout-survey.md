@@ -529,6 +529,36 @@ to the root inserts two long seeks into every extension-block boundary
 instead of zero. Extension blocks stay interleaved with file data;
 headers, dircache and comment-overflow blocks stay near the root.
 
+**Addendum, wave 3 implementation (2026-09-08).** `examples/frag-bench.rs`
+gained a fourth image, `reorged.adf`: `fragmented.adf`'s own 391-block
+file, copied out to host memory, deleted and recreated through `Mutator`
+with the wave-3 layout policy at its default (on) — nothing else done by
+hand. This is the PFS2DefragTry pattern (§4a's own subject throughout,
+credited in PLAN.md) run through this crate instead of through a real
+ROM's FFS. Block-level result, one run, matching `defragmented.adf`
+exactly (`defragment_file`'s own explicit tier-1 pass):
+
+| image | runs | first | last | head travel |
+|---|---|---|---|---|
+| contiguous | 1 | 2 | 397 | 395 |
+| fragmented | 80 | 883 | 1673 | 790 |
+| defragmented | 1 | 24 | 419 | 395 |
+| reorged | 1 | 24 | 419 | 395 |
+
+`reorged.adf` lands on the *same* extent `defragmented.adf` does — not a
+coincidence: both start from the identical fragmented image and both ask
+the same allocator for one contiguous run near the file's own header, so
+they find the same hole. This is the block-level half of the claim this
+section's own §4a table already measured a real ROM's timing for; the
+real-ROM half — booting `reorged.adf` next to `contiguous.adf` and
+`fragmented.adf` under the same script — was not repeated this wave
+(§4a's own contiguous/fragmented numbers already establish the timing
+gap a run-count difference like this one implies, and `reorged.adf`'s
+run count is identical to `defragmented.adf`'s, which *was* run-count-
+verified against `defragment_file`'s own explicit report). Reproducing it
+is the same recipe §4a already documents, against `reorged.adf` in place
+of `fragmented.adf`.
+
 ## 5. What could not be established
 
 - Whether the real Commodore ROM FFS batches contiguous block reads
