@@ -81,13 +81,51 @@
 //! a safe state into an unsafe one. An interruption anywhere in that
 //! window leaves a volume with some pointers still naming the old root —
 //! reported as `ParentMismatch`/`DircacheStale` by
-//! [`validate`](crate::Volume::validate), not data loss — and a
-//! [`Volume::repair`] call finishes rebuilding the bitmap around whatever
-//! state the writes reached. The old root block itself is freed
-//! explicitly (see [`Volume::resize`]'s documentation) rather than left
-//! for [`Volume::repair`] to find, because repair's one-direction rule —
-//! never remove allocation an incomplete walk might have missed — would
-//! otherwise keep it allocated forever as a phantom leak.
+//! [`validate`](crate::Volume::validate), not data loss, since the hash
+//! chains themselves are never touched and every file stays reachable and
+//! byte-correct throughout.
+//!
+//! # Retrying
+//!
+//! [`Volume::repair`] alone only ever rebuilds the bitmap — it has no
+//! opinion on a stray `parent` longword or a dircache chain mid-move, so
+//! calling it after an interrupted [`Volume::resize`] leaves a volume with
+//! a valid bitmap and *may* still leave `ParentMismatch`/`DircacheStale`
+//! findings behind. What finishes the job is calling [`Volume::resize`]
+//! **again with the same `new_block_count`**: every write past the first
+//! is idempotent (the same parent value, the same dircache content,
+//! written again is a no-op on disk), so a retry redoes only what an
+//! earlier call left undone, rather than being a no-op itself — a plain
+//! "nothing to do" return only happens when the size is already right
+//! *and* `bitmap_flag` already reads valid, which is precisely the signal
+//! that nothing was left mid-update.
+//!
+//! Two things a retry cannot recover, both bounded to the safe (never
+//! `ReachableButFree`) direction and both pinned by the shrink crash sweep
+//! in `tests/volumes.rs` rather than left as prose:
+//!
+//! - The *very first* root position, from before any call in the
+//!   sequence, if the crash landed after that root moved but before its
+//!   block was explicitly freed. A retry's notion of "the old root" is
+//!   the position the *current* call found on entry, which by then is
+//!   already the new one — so the original block is not rediscovered, and
+//!   stays allocated as an ordinary, harmless
+//!   [`Finding::OrphanBlock`](crate::Finding::OrphanBlock) leak rather
+//!   than being freed.
+//! - The root's own dircache chain, if the crash landed after the first
+//!   write (which forces `bitmap_flag` to 0 but otherwise carries the old
+//!   root's fields verbatim, dircache pointer included) but before that
+//!   pointer was updated — a retry can then find the pointer naming a
+//!   block a shrink has since sliced clean off the volume, unreadable
+//!   through any bound this call still has a use for. Rather than fail
+//!   the whole retry over a cache, the pointer is cleared and the chain
+//!   is treated as gone: [`Finding::DircacheStale`](crate::Finding::DircacheStale)
+//!   reports it, and any
+//!   later [`Mutator`](crate::Mutator) operation on the root regenerates
+//!   it from the (untouched, never-at-risk) hash chains.
+//!
+//! Both are losses of *bookkeeping*, not of data: nothing here ever frees
+//! a block something still reaches, and nothing here ever loses a file.
 //!
 //! # Whose job is what
 //!
@@ -409,7 +447,16 @@ impl<S: BlockMedium> Volume<S> {
         let old_block_count = self.block_count();
         let old_root_lba = self.root_lba();
 
-        if new_block_count == old_block_count {
+        // A true no-op only when the size is already right *and* nothing
+        // was left unfinished: `bitmap_flag == -1` means either nothing
+        // has touched this volume, or a previous call (a resize or
+        // anything else) already ran the whole thing, root pointer moves
+        // and all, to completion. Everything below this point is
+        // otherwise safe to redo — see "Retrying" below — which is what
+        // makes a same-target retry able to finish a resize a crash
+        // interrupted, rather than only being able to leave the bitmap
+        // valid over an otherwise-unfinished move.
+        if new_block_count == old_block_count && self.root().bitmap_flag == -1 {
             return Ok(ResizeReport {
                 old_block_count,
                 new_block_count,
@@ -439,13 +486,41 @@ impl<S: BlockMedium> Volume<S> {
             }
         }
 
+        // A retry of an interrupted resize: the current root may still
+        // carry a stale copy of the *previous* geometry's bitmap
+        // pointers, which the ordinary (trusting) read below cannot
+        // survive if any of them are now out of range. Rebuild first,
+        // through the same tolerant reader `repair` always uses, so
+        // everything from here on can trust what it reads. A no-op, and
+        // harmless, whenever there was nothing to fix.
+        if self.root().bitmap_flag != -1 {
+            self.repair(&RepairOptions::default())?;
+        }
+
         // Everything read-only, before a single byte is written: the old
         // bitmap (the authority for every "is this free" question asked
         // below), the movable set, and — for a shrink — the refusal check
         // itself.
         let old_bitmap = self.read_bitmap()?;
+        // The root's own dircache pointer is not something `repair` fixes
+        // (it rebuilds the bitmap, nothing else), so on the same kind of
+        // retry it can still be a stale pointer this call can no longer
+        // read — most likely one a *previous* attempt was mid-relocating
+        // when the crash landed. There being nothing left to recover
+        // through it is treated the same as there being no chain at all:
+        // the pointer is cleared once a fresh one is known (see below),
+        // and losing it costs nothing but the cache itself, which is
+        // advisory and gets regenerated by the next `Mutator` operation
+        // that touches the root.
+        let mut dircache_pointer_unreadable = false;
         let root_dircache = if self.variant().has_dircache() {
-            self.read_dircache(old_root_lba)?.blocks
+            match self.read_dircache(old_root_lba) {
+                Ok(dc) => dc.blocks,
+                Err(_) => {
+                    dircache_pointer_unreadable = true;
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -522,7 +597,15 @@ impl<S: BlockMedium> Volume<S> {
         let mut children_reparented = 0u64;
         let mut dircache_blocks_relocated = 0u64;
 
-        if root_moved {
+        // Not gated on `root_moved`: every write below is idempotent
+        // (the same parent value, the same dircache content, written
+        // again is a no-op on disk) and unconditional, so that a retry —
+        // calling `resize` again with the same target after a crash, with
+        // `bitmap_flag` still 0 from before — finishes whatever a
+        // previous call left half-done rather than only rebuilding the
+        // bitmap around it. See "Retrying" in this module's
+        // documentation.
+        {
             // Direct children only: the entries the root's own hash table
             // names. A deeper entry's parent is its own directory, not
             // the root, and is untouched.
@@ -571,7 +654,11 @@ impl<S: BlockMedium> Volume<S> {
                     dircache_blocks_relocated += 1;
                 }
             }
-            if let Some(&new_head) = dircache_final.first() {
+            // Written whenever there is a fresh head to point at, *or*
+            // the previous pointer turned out to be unreadable and has to
+            // be cleared rather than left dangling.
+            if !dircache_final.is_empty() || dircache_pointer_unreadable {
+                let new_head = dircache_final.first().copied().unwrap_or(0);
                 self.read_checked(new_root_lba)?;
                 let mut buf = self.buf.clone();
                 wr32(&mut buf, tail(bs, TL_EXTENSION), new_head as u32);

@@ -39,6 +39,7 @@ impl std::fmt::Display for MemError {
 
 impl std::error::Error for MemError {}
 
+#[derive(Clone)]
 pub struct MemDisk {
     bs: usize,
     data: Vec<u8>,
@@ -6742,4 +6743,188 @@ fn resize_grow_crash_sweep_never_leaves_a_block_double_allocated() {
         assert_tree_intact(&mut vol);
     }
     assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+/// The more dangerous direction: a shrink also relocates metadata (excess
+/// bitmap pages, and here a root dircache chain that would otherwise be
+/// stranded) and issues explicit frees -- exactly the ingredients a
+/// double allocation would come from if the ordering were wrong, and
+/// paths the grow sweep above never exercises. From the same crashed
+/// state, two independent recoveries are checked: [`Volume::repair`]
+/// alone, which this module documents as fixing only the bitmap, and a
+/// same-target retry of [`Volume::resize`], which this module documents
+/// as able to finish reparenting a crash caught mid-move (see
+/// `src/resize.rs`'s "Retrying"). Both are pinned rather than assumed.
+#[test]
+fn resize_shrink_crash_sweep_never_leaves_a_block_double_allocated() {
+    let bs = 512usize;
+    let old_n = 1760u64;
+    let new_n = 200u64; // Below the old root (~880): it must move, and
+                        // the old dircache/bitmap-page blocks (~881+)
+                        // end up past the new end and must relocate.
+
+    let total = {
+        let mut vol = allocatable(Variant::FfsIntlDircache, bs, old_n);
+        vol.source_mut().clear_log();
+        vol.resize(new_n).unwrap();
+        vol.source_mut().write_log().len()
+    };
+    assert!(total > 0);
+
+    let mut crashed = 0;
+    for n in 0..total {
+        let mut vol = allocatable(Variant::FfsIntlDircache, bs, old_n);
+        vol.source_mut().fail_after(n);
+        if vol.resize(new_n).is_err() {
+            crashed += 1;
+        }
+
+        let mut crashed_disk = vol.into_inner();
+        crashed_disk.stop_failing();
+        let mut vol = match Volume::open_with(crashed_disk.clone(), None, new_n, 2) {
+            // The new root has not landed yet: a safe refusal to mount,
+            // not a state this sweep has anything further to check.
+            Err(_) => continue,
+            Ok(v) => v,
+        };
+        if let Ok(bm) = vol.read_bitmap() {
+            if bm.valid() {
+                assert_eq!(
+                    vol.validate().summary.reachable_but_free,
+                    0,
+                    "crash after {n} writes: a valid bitmap must never lie about a block in use"
+                );
+            }
+        }
+
+        // Path A: `repair()` alone. Documented as fixing only the bitmap
+        // -- pin that rather than assume it: whatever findings are left
+        // must be exactly the shapes a stray, not-yet-updated pointer
+        // produces -- a child or a dircache block still naming the old
+        // root (`ParentMismatch`/`DircacheStale`), the root's own
+        // dircache pointer still naming a block a shrink already sliced
+        // off before the pointer was updated to point at its relocated
+        // replacement (`Unreadable`/`LbaOutOfRange`), or a block a
+        // relocation or an explicit free left nothing pointing at
+        // (`OrphanBlock`, the recoverable leak direction) -- never
+        // anything that says a block is double-used.
+        {
+            let mut vol_a = Volume::open_with(crashed_disk.clone(), None, new_n, 2).unwrap();
+            let _ = vol_a.repair(&RepairOptions::new());
+            let bm = vol_a.read_bitmap().unwrap();
+            assert!(
+                bm.valid(),
+                "crash after {n} writes: repair must leave a valid bitmap"
+            );
+            let report = vol_a.validate();
+            assert_eq!(
+                report.summary.reachable_but_free, 0,
+                "crash after {n} writes, post-repair"
+            );
+            for finding in &report.findings {
+                let expected = matches!(
+                    finding,
+                    Finding::ParentMismatch { .. }
+                        | Finding::DircacheStale { .. }
+                        | Finding::OrphanBlock { .. }
+                        | Finding::Unreadable {
+                            error: Error::LbaOutOfRange { .. },
+                            ..
+                        }
+                );
+                assert!(
+                    expected,
+                    "crash after {n} writes: repair alone left an unexpected finding: {finding}"
+                );
+            }
+            assert_tree_intact(&mut vol_a);
+        }
+
+        // Path B: a same-target `resize` retry, from the same crashed
+        // state. Documented as able to finish the reparenting a plain
+        // repair cannot -- checked here down to every direct child's own
+        // parent longword, the re-parenting proof in full -- at the cost
+        // of two things a retry has no way to recover, both pinned
+        // rather than assumed away: at most one harmless leak (the very
+        // first root position, once superseded), and -- only when the
+        // root's own dircache pointer was itself caught mid-relocation
+        // and this retry could no longer read what it pointed at -- a
+        // dropped cache, rebuilt empty rather than recovered, which
+        // `DircacheStale` reports and any later `Mutator` operation on
+        // the root regenerates. Never anything else, and never more than
+        // one leak.
+        vol.resize(new_n)
+            .unwrap_or_else(|e| panic!("crash after {n} writes: retry resize failed: {e}"));
+        let report = vol.validate();
+        assert_eq!(
+            report.summary.reachable_but_free, 0,
+            "crash after {n} writes, post-retry"
+        );
+        let mut orphans = 0;
+        for finding in &report.findings {
+            match finding {
+                Finding::OrphanBlock { .. } => orphans += 1,
+                Finding::DircacheStale { .. } => {}
+                other => panic!("crash after {n} writes: retry left a non-leak finding: {other}"),
+            }
+        }
+        assert!(
+            orphans <= 1,
+            "crash after {n} writes: {orphans} leaks after retry, expected at most one"
+        );
+        assert_tree_intact(&mut vol);
+        let root = vol.root_lba();
+        for e in vol.read_dir(root).unwrap() {
+            assert_eq!(
+                e.parent as u64, root,
+                "crash after {n} writes, post-retry: block {} not fully re-parented",
+                e.lba
+            );
+        }
+    }
+    assert!(crashed > 0, "at least one prefix must actually fail");
+}
+
+/// [`ResizeError::RootTargetOccupied`], engineered directly rather than
+/// hit incidentally: a volume packed with data from `reserved` upward
+/// (this crate's own allocator's normal shape) grown to a size whose new
+/// midpoint lands squarely inside that data.
+#[test]
+fn resize_refuses_a_root_target_occupied_by_real_data() {
+    let bs = 512usize;
+    let old_n = 2000u64;
+
+    // A file spanning well past the halfway point, so even the smallest
+    // possible grow -- whose new midpoint starts just past the *old*
+    // one, since the midpoint moves by half a block per block of growth
+    // -- still lands inside it.
+    let mut vol = populated(Variant::Ffs, bs, old_n, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(root, b"Big", &amiga_ffs::Metadata::new(), &pattern(600_000))
+            .unwrap();
+    });
+    let before = allocated_set(&mut vol);
+
+    let grown = old_n + 50;
+    let new_root = canonical_root_lba(grown, 2).unwrap();
+    assert_eq!(
+        vol.read_bitmap().unwrap().is_allocated(new_root),
+        Some(true),
+        "test setup: the new root's target must actually collide with data"
+    );
+
+    vol.source_mut().grow(grown);
+    let err = vol.resize(grown).unwrap_err();
+    match err {
+        ResizeError::RootTargetOccupied { lba } => assert_eq!(lba, new_root),
+        other => panic!("expected RootTargetOccupied, got {other}"),
+    }
+
+    // A refusal must not have written anything the volume did not
+    // already have -- same size, same root, same allocated set, still
+    // clean.
+    assert_eq!(vol.block_count(), old_n);
+    assert_eq!(vol.root_lba(), canonical_root_lba(old_n, 2).unwrap());
+    assert_eq!(allocated_set(&mut vol), before);
+    assert_clean(&mut vol, "after a refused grow");
 }

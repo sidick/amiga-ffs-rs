@@ -867,27 +867,44 @@ observe.
       data to make room, which is a real, named limitation:
       `minimum_size()` reports what this engine will actually accept, not
       the theoretical floor a data-relocating resize could reach, and the
-      two can differ by roughly 2× on a volume with no free gap. A
-      dedicated collision test proved fragile to engineer deterministically
-      in the time available and was not added; the refusal path exists and
-      is exercised incidentally by three of the six tests once the
-      root-target search was added to `minimum_size`.
+      two can differ by roughly 2× on a volume with no free gap. Engineered
+      directly (a volume filled from `reserved` upward with one big file,
+      grown by the smallest possible step so the new midpoint lands inside
+      it) rather than only hit incidentally, once a deterministic
+      construction was worked out.
 
       Ordering: the very first write is a full copy of the (still valid)
       root at the new LBA with `bitmap_flag` forced to 0 — after that one
       write, any mount at the new geometry finds a structurally valid,
       honestly-untrustworthy root, the same state an interrupted ordinary
-      mutation leaves. Every later write only improves on that floor,
-      down to `bitmap_flag = -1` last, out of `repair`. What is **not**
-      claimed: `repair` fixes the bitmap, not stray `parent`/dircache
-      pointers left mid-reparent by a crash — those surface as
-      `ParentMismatch`/`DircacheStale` findings, not data loss (the hash
-      chains are never touched, so every file stays reachable and
-      byte-correct), and clearing them needs a resize to the same target
-      to run again, which today only re-attempts if `new_block_count`
-      still differs from the volume's current size — a true no-op retry
-      of an already-reached target does not retry the reparenting. Filed
-      as a known gap rather than silently claimed away.
+      mutation leaves. Every later write only improves on that floor, down
+      to `bitmap_flag = -1` last, out of `repair`.
+
+      `repair` alone only ever rebuilds the bitmap, and calling it after an
+      interrupted `resize` can leave `ParentMismatch`/`DircacheStale`
+      findings it has no opinion on. What finishes the job — found while
+      writing the shrink crash sweep below, in response to review feedback
+      asking whether the gap was inherent — is calling `resize` **again
+      with the same target**: every write past the first is idempotent, so
+      a retry redoes only what an earlier call left undone rather than
+      being a no-op itself, and the "nothing to do" fast path now checks
+      `bitmap_flag` as well as the size before deciding there is truly
+      nothing to redo. Two things a retry still cannot recover, both
+      bounded to leaks rather than anything dangerous and both pinned by
+      the shrink crash sweep rather than left as prose: the *very first*
+      root position in a sequence of retries, once a later call's notion of
+      "the old root" has already moved past it (stays allocated as an
+      `OrphanBlock`); and the root's own dircache pointer, if a crash lands
+      after the first write (which carries it over unchanged) but before it
+      is updated, leaving it unreadable through any bound a retry still has
+      a use for — the pointer is cleared rather than the whole retry
+      failing, `DircacheStale` reports it, and any later `Mutator`
+      operation on the root regenerates it from the hash chains, which are
+      never at risk. What was genuinely inherent (turning the documented
+      gap into a solved problem, per the review's framing) was solved;
+      what remained after that is two narrowly-scoped, safe-direction
+      losses of bookkeeping, not of data — and now a test asserts exactly
+      that shape rather than a wider "trust me".
 
       Tested in `tests/volumes.rs`: grow-then-shrink round trip on every
       variant × {512, 1024, 4096} with byte-identical files and clean
@@ -896,22 +913,29 @@ observe.
       the offending block with `minimum_size()` agreeing exactly at the
       boundary; relocating a multi-block root dircache chain out from
       under a shrink's cut; an 8-step seeded random grow/shrink sequence
-      checked against the tree after every step; and a crash sweep over
-      every write prefix of a grow, asserting `reachable_but_free` is
-      always zero once the bitmap claims validity and that `repair` always
-      restores a valid bitmap with every file intact afterwards.
-      **Left undone**: a shrink-direction crash sweep (the grow sweep
-      exercises the same write-ordering machinery; shrink adds the
-      metadata-relocation and explicit-free steps, which are covered by
-      the non-crash tests but not swept prefix by prefix); an oracle leg
-      in `tests/differential.rs` — `xdftool` only opens a fixed 1760-block
-      ADF or an explicitly-geometried HDF and neither it nor `fstool`
-      implements a resize to cross-check against, so the achievable
-      differential value (an oracle re-reading a post-resize image) was
-      judged not worth the harness work in the time available, and is
-      recorded here rather than silently skipped; and a property test
-      driving `resize` interleaved with `Mutator` operations (only
-      pure resize sequences are seeded-random-tested today).
+      checked against the tree after every step; `RootTargetOccupied`
+      engineered directly; and two crash sweeps, one per direction, each
+      over every write prefix, asserting `reachable_but_free` is always
+      zero once the bitmap claims validity, and — from the same crashed
+      state — that `repair` alone leaves only the bitmap-fixed, findings
+      it cannot address named and bounded, *and* that a same-target
+      `resize` retry finishes the reparenting in full (checked down to
+      every direct child's own parent longword) modulo the two named,
+      pinned exceptions above. The shrink sweep is the one review asked
+      for by name, since shrink is the direction that relocates metadata
+      and issues explicit frees — exactly where a double allocation would
+      come from if the ordering were wrong — and the grow sweep alone
+      never exercises those paths.
+
+      **Left undone**: an oracle leg in `tests/differential.rs` —
+      `xdftool` only opens a fixed 1760-block ADF or an
+      explicitly-geometried HDF and neither it nor `fstool` implements a
+      resize to cross-check against, so the achievable differential value
+      (an oracle re-reading a post-resize image) was judged not worth the
+      harness work in the time available, and is recorded here rather than
+      silently skipped; and a property test driving `resize` interleaved
+      with `Mutator` operations (only pure resize sequences are
+      seeded-random-tested today).
 
 ## In scope, not scheduled
 
