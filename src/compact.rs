@@ -159,7 +159,7 @@ use core::fmt;
 use core::ops::Range;
 
 use crate::allocator::{AllocError, Allocation, Intent};
-use crate::build::finish_checksum;
+use crate::build::{build_extension_block, finish_checksum};
 use crate::format::wr32;
 use crate::layout::*;
 use crate::mutate::{MutateError, Mutator};
@@ -579,25 +579,13 @@ impl<S: BlockMedium> Mutator<S> {
         for k in (0..new_ext.len()).rev() {
             let first = slots + k * slots;
             let count = (new_data.len().saturating_sub(first)).min(slots);
+            let pointers: Vec<u32> = new_data[first..first + count]
+                .iter()
+                .map(|&d| d as u32)
+                .collect();
+            let next = new_ext.get(k + 1).copied().unwrap_or(0) as u32;
             let mut eb = vec![0u8; bs];
-            wr32(&mut eb, OFF_TYPE, T_LIST);
-            wr32(&mut eb, OFF_OWN_KEY, new_ext[k] as u32);
-            wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
-            wr32(&mut eb, tail(bs, TL_PARENT), header_lba as u32);
-            wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
-            wr32(
-                &mut eb,
-                tail(bs, TL_EXTENSION),
-                new_ext.get(k + 1).copied().unwrap_or(0) as u32,
-            );
-            for i in 0..count {
-                wr32(
-                    &mut eb,
-                    data_pointer_offset(bs, i as u32 + 1),
-                    new_data[first + i] as u32,
-                );
-            }
-            finish_checksum(&mut eb);
+            build_extension_block(&mut eb, new_ext[k], header_lba, &pointers, next);
             self.write(new_ext[k], &eb)?;
         }
 
@@ -881,28 +869,20 @@ impl<S: BlockMedium> Mutator<S> {
             for k in (0..new_ext.len()).rev() {
                 let first = slots + k * slots;
                 let count = (ch.blocks.len().saturating_sub(first)).min(slots);
+                let pointers: Vec<u32> = (0..count)
+                    .map(|i| {
+                        let old_d = ch.blocks[first + i] as u64;
+                        if ffs {
+                            old_d as u32
+                        } else {
+                            let idx = ch.blocks.iter().position(|&b| b as u64 == old_d).unwrap();
+                            new_data[idx] as u32
+                        }
+                    })
+                    .collect();
+                let next = new_ext.get(k + 1).copied().unwrap_or(0) as u32;
                 let mut eb = vec![0u8; bs];
-                wr32(&mut eb, OFF_TYPE, T_LIST);
-                wr32(&mut eb, OFF_OWN_KEY, new_ext[k] as u32);
-                wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
-                wr32(&mut eb, tail(bs, TL_PARENT), new_lba as u32);
-                wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
-                wr32(
-                    &mut eb,
-                    tail(bs, TL_EXTENSION),
-                    new_ext.get(k + 1).copied().unwrap_or(0) as u32,
-                );
-                for i in 0..count {
-                    let old_d = ch.blocks[first + i] as u64;
-                    let v = if ffs {
-                        old_d
-                    } else {
-                        let idx = ch.blocks.iter().position(|&b| b as u64 == old_d).unwrap();
-                        new_data[idx]
-                    };
-                    wr32(&mut eb, data_pointer_offset(bs, i as u32 + 1), v as u32);
-                }
-                finish_checksum(&mut eb);
+                build_extension_block(&mut eb, new_ext[k], new_lba, &pointers, next);
                 self.write(new_ext[k], &eb)?;
             }
             if !ffs {

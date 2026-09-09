@@ -355,9 +355,9 @@ use core::fmt;
 
 use crate::allocator::{AllocError, Allocation, Allocator, Intent};
 use crate::build::{
-    build_comment_block, build_data_block, build_dircache_block, dircache_record, finish_checksum,
-    needs_comment_block, write_date, write_entry_header, write_name_and_comment, CacheFacts,
-    EntryFields,
+    build_comment_block, build_data_block, build_dircache_block, build_extension_block,
+    dircache_record, finish_checksum, needs_comment_block, write_date, write_entry_header,
+    write_name_and_comment, CacheFacts, EntryFields,
 };
 use crate::dircache::Dircache;
 use crate::file::FileChain;
@@ -367,9 +367,7 @@ use crate::populate::Metadata;
 use crate::read::{DateStamp, Entry, EntryKind, Error, RootBlock, Volume};
 use crate::validate::Report;
 use crate::{be32, checksum_ok, hash_table_size, name_hash};
-use crate::{
-    Bitmap, BlockMedium, BlockSource, Transport, Variant, MAX_NAME_CLASSIC, MAX_NAME_LONG,
-};
+use crate::{Bitmap, BlockMedium, BlockSource, Transport, Variant};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -807,11 +805,7 @@ impl<S: BlockMedium> Mutator<S> {
 
     /// The longest name this volume's variant can store.
     pub fn max_name_len(&self) -> usize {
-        if self.vol.variant().has_long_names() {
-            MAX_NAME_LONG
-        } else {
-            MAX_NAME_CLASSIC
-        }
+        self.vol.variant().max_name_len()
     }
 
     // -- creating ----------------------------------------------------------
@@ -973,22 +967,13 @@ impl<S: BlockMedium> Mutator<S> {
         for (k, &lba) in ext_lba.iter().enumerate() {
             let first = slots + k * slots;
             let count = (n_data - first).min(slots);
+            let pointers: Vec<u32> = data_lba[first..first + count]
+                .iter()
+                .map(|&d| d as u32)
+                .collect();
+            let next = ext_lba.get(k + 1).copied().unwrap_or(0) as u32;
             let mut eb = vec![0u8; bs];
-            wr32(&mut eb, OFF_TYPE, T_LIST);
-            wr32(&mut eb, OFF_OWN_KEY, lba as u32);
-            wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
-            wr32(&mut eb, tail(bs, TL_PARENT), prep.lba as u32);
-            wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
-            wr32(
-                &mut eb,
-                tail(bs, TL_EXTENSION),
-                ext_lba.get(k + 1).copied().unwrap_or(0) as u32,
-            );
-            for i in 0..count {
-                let off = data_pointer_offset(bs, i as u32 + 1);
-                wr32(&mut eb, off, data_lba[first + i] as u32);
-            }
-            finish_checksum(&mut eb);
+            build_extension_block(&mut eb, lba, prep.lba, &pointers, next);
             self.write(lba, &eb)?;
         }
 
@@ -1332,25 +1317,13 @@ impl<S: BlockMedium> Mutator<S> {
         for (k, &lba) in ext_lba.iter().enumerate().rev() {
             let first = slots + k * slots;
             let count = (n_new - first).min(slots);
+            let pointers: Vec<u32> = blocks[first..first + count]
+                .iter()
+                .map(|&d| d as u32)
+                .collect();
+            let next = ext_lba.get(k + 1).copied().unwrap_or(0) as u32;
             let mut eb = vec![0u8; bs];
-            wr32(&mut eb, OFF_TYPE, T_LIST);
-            wr32(&mut eb, OFF_OWN_KEY, lba as u32);
-            wr32(&mut eb, OFF_HIGH_SEQ, count as u32);
-            wr32(&mut eb, tail(bs, TL_PARENT), header as u32);
-            wr32(&mut eb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
-            wr32(
-                &mut eb,
-                tail(bs, TL_EXTENSION),
-                ext_lba.get(k + 1).copied().unwrap_or(0) as u32,
-            );
-            for i in 0..count {
-                wr32(
-                    &mut eb,
-                    data_pointer_offset(bs, i as u32 + 1),
-                    blocks[first + i] as u32,
-                );
-            }
-            finish_checksum(&mut eb);
+            build_extension_block(&mut eb, lba, header, &pointers, next);
             self.write(lba, &eb)?;
         }
 

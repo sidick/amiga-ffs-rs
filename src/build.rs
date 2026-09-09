@@ -196,6 +196,42 @@ pub(crate) fn build_comment_block(buf: &mut [u8], lba: u64, header: u64, comment
     finish_checksum(buf);
 }
 
+/// Assemble one `T_LIST` extension block: type, own key, high_seq, parent,
+/// `ST_FILE` secondary type, the data-pointer table and the chain pointer
+/// to the next extension block (0 for the last one).
+///
+/// `pointers` is this block's own slice of the file's data-pointer table,
+/// already in order; `pointers.len()` becomes `high_seq`. Two writers
+/// assemble that slice differently — [`Mutator`](crate::Mutator) and
+/// [`crate::compact`] already know a file's whole block count and hand
+/// over a complete slice in one call, while [`Populator`](crate::Populator)
+/// discovers data blocks one at a time from a streaming callback and
+/// accumulates them into a block's worth of pointers before calling this —
+/// but the six fixed longwords and the table they surround are one
+/// implementation either way.
+pub(crate) fn build_extension_block(
+    buf: &mut [u8],
+    lba: u64,
+    header: u64,
+    pointers: &[u32],
+    next: u32,
+) {
+    let bs = buf.len();
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    wr32(buf, OFF_TYPE, T_LIST);
+    wr32(buf, OFF_OWN_KEY, lba as u32);
+    wr32(buf, OFF_HIGH_SEQ, pointers.len() as u32);
+    wr32(buf, tail(bs, TL_PARENT), header as u32);
+    wr32(buf, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
+    wr32(buf, tail(bs, TL_EXTENSION), next);
+    for (i, &p) in pointers.iter().enumerate() {
+        wr32(buf, data_pointer_offset(bs, i as u32 + 1), p);
+    }
+    finish_checksum(buf);
+}
+
 /// Assemble one data block: raw payload on FFS, six longwords of header
 /// and a checksum on OFS.
 ///

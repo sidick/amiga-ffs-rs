@@ -660,6 +660,28 @@ fn split_nac(nac: &[u8]) -> (&[u8], &[u8]) {
     (name, comment)
 }
 
+/// A header block's own name, at whichever offset this variant's layout
+/// keeps it — classic's fixed `TL_NAME` field, or LNFS's merged `NaC`
+/// field where the comment's length byte follows wherever the name
+/// happened to end.
+///
+/// This is the one branch this format's signature trap lives in (see this
+/// module's own documentation): reading a long-name volume's name at the
+/// classic offset finds padding, not a name. [`parse_entry`] is the
+/// authoritative caller; [`crate::populate::Populator`]'s duplicate-name
+/// check is the other one, and has a block but no reason to build a whole
+/// [`Entry`] just to read one field, which is why this returns a slice
+/// rather than something heavier.
+pub(crate) fn entry_name(block: &[u8], variant: Variant) -> &[u8] {
+    let bs = block.len();
+    if variant.has_long_names() {
+        let off = tail(bs, TL_NAC);
+        split_nac(&block[off..off + NAC_LEN]).0
+    } else {
+        bcpl_str(block, tail(bs, TL_NAME), MAX_NAME_CLASSIC)
+    }
+}
+
 fn parse_entry(block: &[u8], lba: u64, variant: Variant) -> Result<Entry, EntryError> {
     let bs = block.len();
     let ty = be32(block, OFF_TYPE);
@@ -669,18 +691,17 @@ fn parse_entry(block: &[u8], lba: u64, variant: Variant) -> Result<Entry, EntryE
     let st = be32(block, tail(bs, TL_SECONDARY_TYPE)) as i32;
     let kind = EntryKind::from_secondary_type(st).ok_or(EntryError::UnknownSecondary(st))?;
 
-    let (name, comment, date, comment_block) = if variant.has_long_names() {
+    let name = entry_name(block, variant).to_vec();
+    let (comment, date, comment_block) = if variant.has_long_names() {
         let off = tail(bs, TL_NAC);
-        let (name, comment) = split_nac(&block[off..off + NAC_LEN]);
+        let comment = split_nac(&block[off..off + NAC_LEN]).1;
         (
-            name.to_vec(),
             comment.to_vec(),
             DateStamp::at(block, tail(bs, TL_DATE_LONG)),
             be32(block, tail(bs, TL_COMMENT_BLOCK)),
         )
     } else {
         (
-            bcpl_str(block, tail(bs, TL_NAME), MAX_NAME_CLASSIC).to_vec(),
             bcpl_str(block, tail(bs, TL_COMMENT), COMMENT_MAX).to_vec(),
             DateStamp::at(block, tail(bs, TL_DATE)),
             0,
@@ -933,11 +954,7 @@ impl<S: crate::BlockSource> Volume<S> {
 
     /// The longest name this volume's variant can store.
     pub fn max_name_len(&self) -> usize {
-        if self.variant.has_long_names() {
-            MAX_NAME_LONG
-        } else {
-            MAX_NAME_CLASSIC
-        }
+        self.variant.max_name_len()
     }
 
     /// Read `lba` into the scratch buffer, range-checked, with no

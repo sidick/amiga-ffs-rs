@@ -254,6 +254,19 @@ pub enum AllocError<E> {
         /// Which page (0-based, in coverage order).
         index: usize,
     },
+    /// [`Allocator::allocate_exact`] was asked for a block the bitmap
+    /// already marks allocated. Distinct from [`AllocError::NotCovered`]
+    /// on purpose: `NotCovered` means the volume has no bit for `lba` at
+    /// all (outside `reserved..block_count`, or past a short bitmap's
+    /// coverage), which is a fact about the volume's *geometry*; this is
+    /// a fact about the block's *occupancy* — a caller that gets this back
+    /// knows the destination is inside the volume and merely occupied, so
+    /// evacuating it first is worth trying, where a caller told
+    /// `NotCovered` would be wasting its time.
+    AlreadyAllocated {
+        /// The block.
+        lba: u64,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for AllocError<E> {
@@ -284,6 +297,9 @@ impl<E: fmt::Display> fmt::Display for AllocError<E> {
             ),
             Self::PageMissing { index } => {
                 write!(f, "bitmap page {index} has bits to write and no block")
+            }
+            Self::AlreadyAllocated { lba } => {
+                write!(f, "block {lba} is already allocated")
             }
         }
     }
@@ -882,21 +898,19 @@ impl<E> Allocator<E> {
     /// a caller that has already chosen `lba` (a compactor evacuating a
     /// range, a caller retrying a relocation at the same target) needs an
     /// [`Allocation`] naming *that* block, not the nearest free one to a
-    /// hint. Refuses [`AllocError::NotCovered`] outside the bitmap's range
-    /// and, distinctly, refuses by construction rather than silently
-    /// double-booking: if `lba` is already marked allocated this returns
-    /// [`AllocError::DoubleFree`]'s mirror image — reusing
-    /// [`AllocError::NotCovered`] would misreport *why*, so this is its own
-    /// check inline rather than a new variant for one caller's one case.
+    /// hint. Refuses [`AllocError::NotCovered`] for a block the volume has
+    /// no bit for at all, and, distinctly, [`AllocError::AlreadyAllocated`]
+    /// for a block the bitmap covers but already marks in use — the two
+    /// are different facts (geometry versus occupancy) and a caller that
+    /// wants to distinguish "evacuate this block first" from "this LBA
+    /// isn't even in the volume" needs them as different variants, not one
+    /// reused for both.
     pub fn allocate_exact(&mut self, lba: u64) -> Result<Allocation, AllocError<E>> {
         let bit = self.bit_of(lba).ok_or(AllocError::NotCovered { lba })?;
         let w = (bit / 32) as usize;
         let mask = 1u32 << (bit % 32);
         if self.words[w] & mask == 0 {
-            // Already allocated: reuse `NotCovered`'s sibling shape rather
-            // than invent a variant for a collision this crate has no
-            // other caller for yet.
-            return Err(AllocError::NotCovered { lba });
+            return Err(AllocError::AlreadyAllocated { lba });
         }
         self.words[w] &= !mask;
         self.free -= 1;

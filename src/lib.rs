@@ -427,6 +427,19 @@ impl Variant {
             classic_toupper
         }
     }
+
+    /// The longest name this variant can store: [`MAX_NAME_LONG`] on
+    /// `DOS\6`/`DOS\7`, [`MAX_NAME_CLASSIC`] everywhere else. One answer,
+    /// next to every other capability question a variant settles, rather
+    /// than three copies of the same `has_long_names()` branch on
+    /// [`Volume`], [`Mutator`] and [`Populator`].
+    pub fn max_name_len(self) -> usize {
+        if self.has_long_names() {
+            MAX_NAME_LONG
+        } else {
+            MAX_NAME_CLASSIC
+        }
+    }
 }
 
 /// Maximum name length on classic variants (`DOS\0`–`DOS\5`).
@@ -580,6 +593,23 @@ mod tests {
         assert!(!v0.is_ffs() && !v0.is_intl() && !v0.has_long_names());
         let v5 = Variant::from_dostype(0x444F_5305).unwrap();
         assert!(v5.has_dircache() && !v5.has_long_names());
+    }
+
+    #[test]
+    fn max_name_len_follows_has_long_names() {
+        for v in [
+            Variant::Ofs,
+            Variant::Ffs,
+            Variant::OfsIntl,
+            Variant::FfsIntl,
+            Variant::OfsIntlDircache,
+            Variant::FfsIntlDircache,
+        ] {
+            assert_eq!(v.max_name_len(), MAX_NAME_CLASSIC, "{v:?}");
+        }
+        for v in [Variant::OfsIntlLongname, Variant::FfsIntlLongname] {
+            assert_eq!(v.max_name_len(), MAX_NAME_LONG, "{v:?}");
+        }
     }
 
     #[test]

@@ -173,8 +173,9 @@ use core::fmt;
 
 use crate::bitmap::pack_ranges;
 use crate::build::{
-    build_comment_block, build_data_block, build_dircache_block, dircache_record, dircache_used,
-    needs_comment_block, write_entry_header, CacheFacts, EntryFields,
+    build_comment_block, build_data_block, build_dircache_block, build_extension_block,
+    dircache_record, dircache_used, needs_comment_block, write_entry_header, CacheFacts,
+    EntryFields,
 };
 use crate::format::{
     check_name_bytes, format, wr32, FormatError, FormatLayout, FormatOptions, NameProblem,
@@ -182,7 +183,7 @@ use crate::format::{
 use crate::layout::*;
 use crate::read::{DateStamp, EntryKind};
 use crate::{be32, checksum_compute, hash_table_size, name_hash, names_equal};
-use crate::{BlockSource, Variant, MAX_NAME_CLASSIC, MAX_NAME_LONG};
+use crate::{BlockSource, Variant};
 
 // The two names this module used to define, and which the rest of the
 // write side now shares: they moved to the crate root when the allocator
@@ -615,11 +616,7 @@ impl<S: BlockMedium> Populator<S> {
 
     /// The longest name this volume's variant can store.
     pub fn max_name_len(&self) -> usize {
-        if self.variant.has_long_names() {
-            MAX_NAME_LONG
-        } else {
-            MAX_NAME_CLASSIC
-        }
+        self.variant.max_name_len()
     }
 
     /// Write the bitmap, restore the root's `bitmap_flag`, and hand the
@@ -790,8 +787,11 @@ impl<S: BlockMedium> Populator<S> {
 
         let mut hdr = vec![0u8; bs];
         // The extension block currently being filled, held until its
-        // successor's LBA is known (or the file ends).
-        let mut ext: Option<(u64, Vec<u8>)> = None;
+        // successor's LBA is known (or the file ends) -- its data-pointer
+        // table accumulates here rather than in bytes, so the fixed
+        // fields and the checksum only ever get written once, through
+        // `build_extension_block`, at the point the block is complete.
+        let mut ext: Option<(u64, Vec<u32>)> = None;
         let mut in_table = 0usize;
         let mut total: u64 = 0;
         let mut seq: u32 = 0;
@@ -827,17 +827,13 @@ impl<S: BlockMedium> Populator<S> {
                 let ext_lba = self.alloc_data()?;
                 match ext.take() {
                     None => wr32(&mut hdr, tail(bs, TL_EXTENSION), ext_lba as u32),
-                    Some((prev, mut prev_buf)) => {
-                        wr32(&mut prev_buf, tail(bs, TL_EXTENSION), ext_lba as u32);
-                        self.put_buf_checked(prev, &mut prev_buf)?;
+                    Some((prev, pointers)) => {
+                        let mut eb = vec![0u8; bs];
+                        build_extension_block(&mut eb, prev, hdr_lba, &pointers, ext_lba as u32);
+                        self.write(prev, &eb)?;
                     }
                 }
-                let mut nb = vec![0u8; bs];
-                wr32(&mut nb, OFF_TYPE, T_LIST);
-                wr32(&mut nb, OFF_OWN_KEY, ext_lba as u32);
-                wr32(&mut nb, tail(bs, TL_PARENT), hdr_lba as u32);
-                wr32(&mut nb, tail(bs, TL_SECONDARY_TYPE), ST_FILE as u32);
-                ext = Some((ext_lba, nb));
+                ext = Some((ext_lba, Vec::with_capacity(slots)));
                 in_table = 0;
             }
 
@@ -853,20 +849,23 @@ impl<S: BlockMedium> Populator<S> {
             pending = Some((lba, n, seq));
 
             in_table += 1;
-            let off = data_pointer_offset(bs, in_table as u32);
-            let table = match ext {
-                Some((_, ref mut buf)) => buf,
-                None => &mut hdr,
-            };
-            wr32(table, off, lba as u32);
-            wr32(table, OFF_HIGH_SEQ, in_table as u32);
+            match ext {
+                Some((_, ref mut pointers)) => pointers.push(lba as u32),
+                None => {
+                    let off = data_pointer_offset(bs, in_table as u32);
+                    wr32(&mut hdr, off, lba as u32);
+                    wr32(&mut hdr, OFF_HIGH_SEQ, in_table as u32);
+                }
+            }
         }
 
         if let Some((prev, len, pseq)) = pending.take() {
             self.write_data_block(prev, hdr_lba, pseq, &held[..len], 0, ffs)?;
         }
-        if let Some((lba, mut buf)) = ext.take() {
-            self.put_buf_checked(lba, &mut buf)?;
+        if let Some((lba, pointers)) = ext.take() {
+            let mut eb = vec![0u8; bs];
+            build_extension_block(&mut eb, lba, hdr_lba, &pointers, 0);
+            self.write(lba, &eb)?;
         }
 
         self.emit(&prep, EntryKind::File, total as u32, &mut hdr)
@@ -1100,14 +1099,16 @@ impl<S: BlockMedium> Populator<S> {
     }
 
     /// The name and hash chain of an entry, for the duplicate check.
+    ///
+    /// The name offset is [`crate::read::entry_name`]'s decision, not a
+    /// second one made here: this crate's one classic-vs-NaC branch lives
+    /// on the read side, and a populator re-deriving it independently is
+    /// exactly the second chance to get it wrong that module's own
+    /// documentation exists to rule out.
     fn entry_name_at(&mut self, lba: u64) -> Result<(Vec<u8>, u32), PopulateError<Transport<S>>> {
         let bs = self.block_size;
         self.read_checked(lba)?;
-        let name = if self.variant.has_long_names() {
-            crate::bcpl_str(&self.buf, tail(bs, TL_NAC), MAX_NAME_LONG).to_vec()
-        } else {
-            crate::bcpl_str(&self.buf, tail(bs, TL_NAME), MAX_NAME_CLASSIC).to_vec()
-        };
+        let name = crate::read::entry_name(&self.buf, self.variant).to_vec();
         Ok((name, be32(&self.buf, tail(bs, TL_HASH_CHAIN))))
     }
 
@@ -1209,16 +1210,6 @@ impl<S: BlockMedium> Populator<S> {
             });
         }
         self.src.write_block(lba, block).map_err(PopulateError::Io)
-    }
-
-    fn put_buf_checked(
-        &mut self,
-        lba: u64,
-        block: &mut [u8],
-    ) -> Result<(), PopulateError<Transport<S>>> {
-        let ck = checksum_compute(block, CHECKSUM_INDEX);
-        wr32(block, OFF_CHECKSUM, ck);
-        self.write(lba, block)
     }
 }
 

@@ -3710,6 +3710,56 @@ fn a_duplicate_name_is_refused_under_the_volumes_own_fold_table() {
 }
 
 #[test]
+fn a_duplicate_long_name_past_30_bytes_is_refused_on_lnfs() {
+    // `Populator::entry_name_at`'s duplicate check reads the LNFS `NaC`
+    // field through `crate::read::entry_name`, the same offset decision
+    // `parse_entry` makes for the read path -- this exercises it on a
+    // name well past the classic 30-byte field, where a reader using the
+    // classic offset would find padding instead and never see the clash.
+    let long_name = b"A-name-that-is-well-past-thirty-bytes-long";
+    assert!(long_name.len() > 30);
+    let disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::FfsIntlLongname, 1760, b"Longnames");
+    let mut pop = Populator::new(disk, &opts).unwrap();
+    let root = pop.root_lba();
+    pop.create_file(root, long_name, &amiga_ffs::Metadata::new(), b"one")
+        .unwrap();
+
+    let again = pop.create_dir(root, long_name, &amiga_ffs::Metadata::new());
+    assert!(matches!(again, Err(PopulateError::DuplicateName { .. })));
+
+    // Case-folded (intl table) still collides, same as the classic test.
+    let mut upper = long_name.to_vec();
+    upper.make_ascii_uppercase();
+    let again_folded = pop.create_dir(root, &upper, &amiga_ffs::Metadata::new());
+    assert!(matches!(
+        again_folded,
+        Err(PopulateError::DuplicateName { .. })
+    ));
+
+    // A name that differs only past byte 30 is a genuinely different name
+    // and must be accepted -- proof the check is reading the whole LNFS
+    // field and not truncating at the classic length the way the wrong
+    // offset would.
+    let mut different_tail = long_name.to_vec();
+    *different_tail.last_mut().unwrap() = b'Z';
+    pop.create_dir(root, &different_tail, &amiga_ffs::Metadata::new())
+        .unwrap();
+
+    let disk = pop.finish().unwrap();
+    let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
+    assert!(vol.validate().is_clean());
+    let names: Vec<Vec<u8>> = vol
+        .read_dir(vol.root_lba())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.contains(&long_name.to_vec()));
+    assert!(names.contains(&different_tail));
+}
+
+#[test]
 fn names_and_comments_are_checked_per_variant() {
     let disk = MemDisk::blank(512, 1760);
     let opts = FormatOptions::new(Variant::FfsIntl, 1760, b"Checked");
@@ -4155,6 +4205,46 @@ fn the_allocator_hands_out_every_free_block_exactly_once_and_then_says_full() {
             alloc.free(lba),
             Err(AllocError::NotCovered { .. })
         ));
+    }
+}
+
+#[test]
+fn allocate_exact_on_an_occupied_block_reports_already_allocated_not_not_covered() {
+    // `allocate_exact`'s whole point is telling "occupied" apart from
+    // "outside the volume" -- a caller deciding whether to evacuate a
+    // destination first needs the two to be distinguishable, and reusing
+    // `NotCovered` for both would misreport why the exact block failed.
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let before = allocated_set(&mut vol);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    let occupied = *before
+        .iter()
+        .find(|lba| (2..1760).contains(*lba))
+        .expect("the volume has at least one allocated block in range");
+
+    assert!(matches!(
+        alloc.allocate_exact(occupied),
+        Err(AllocError::AlreadyAllocated { lba }) if lba == occupied
+    ));
+    // Refused, not double-booked: the bit is still exactly as it was.
+    assert_eq!(alloc.is_allocated(occupied), Some(true));
+}
+
+#[test]
+fn allocate_exact_outside_the_bitmaps_coverage_still_reports_not_covered() {
+    // The other half of the same distinction: a block the bitmap has no
+    // bit for at all (a boot block, or past the end of the volume) is a
+    // fact about geometry, not occupancy, and must still come back as
+    // `NotCovered` -- confirming the rename above did not just relabel
+    // every refusal `allocate_exact` can give.
+    let mut vol = allocatable(Variant::FfsIntl, 512, 1760);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+
+    for lba in [0, 1, 1760, 9999] {
+        assert!(
+            matches!(alloc.allocate_exact(lba), Err(AllocError::NotCovered { lba: l }) if l == lba),
+            "lba {lba} should be refused as NotCovered"
+        );
     }
 }
 

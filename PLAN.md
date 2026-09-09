@@ -11,7 +11,20 @@ plan, which owns everything outside the partition.
       `&mut self` — each choice deliberate, each confirmed by watching
       another implementation choose differently and pay for it
 - [x] `Variant`: the eight `DOS\0`–`DOS\7` types with their axes
-      (FFS/OFS, intl, dircache, long names); unknown dostypes refused
+      (FFS/OFS, intl, dircache, long names); unknown dostypes refused.
+      **2026-09-09, as-built — a maintainability pass, found by
+      independent review.** `Volume::max_name_len`, `Mutator::max_name_len`
+      and `Populator::max_name_len` had byte-identical bodies (`if
+      variant.has_long_names() { MAX_NAME_LONG } else {
+      MAX_NAME_CLASSIC }`), each just reaching its own `Variant` a
+      different way — the one capability question `Variant` did not
+      already answer itself, next to `is_ffs`/`is_intl`/`has_dircache`/
+      `has_long_names`/`fold`. Added `Variant::max_name_len(self) ->
+      usize`; the three public methods (kept, unchanged signatures —
+      an internal delegation, not an API change) now call
+      `self.variant().max_name_len()`. `MutatorVolume::max_name_len`
+      already forwarded to `Volume::max_name_len`, so it picks up the
+      same answer with no change of its own.
 - [x] Both checksum algorithms (standard zero-sum at any block size;
       boot block's end-around-carry) with round-trip tests
 - [x] Both case-folding tables (classic ASCII-only vs intl Latin-1,
@@ -358,6 +371,33 @@ it under a real Kickstart 3.1.
       uid/gid, because truncating one into a 16-bit muFS UID would invent
       an owner. Names are converted from UTF-8 to Latin-1 where every
       character fits and refused by name where one does not.
+
+      **2026-09-09, as-built — a maintainability pass, found by
+      independent review.** `lib.rs`'s "shape of the API" section and
+      `build.rs`'s own doc both state that this format's signature
+      trap — reading a long-name volume's name at the wrong offset —
+      must have exactly one implementation, but `Populator`'s internal
+      `entry_name_at` (used only for the duplicate-name check before
+      creating an entry) re-derived the same `variant.has_long_names()`
+      branch and the same field offsets independently of `read.rs`'s
+      `parse_entry`/`split_nac`, which already make that decision for
+      the read path. Confirmed the two were computing the same bytes
+      before touching anything — they were. Factored into
+      `crate::read::entry_name(block, variant) -> &[u8]`, a
+      `pub(crate)` free function next to `split_nac` (its natural home:
+      `read.rs` already owns the authoritative decision, and the
+      function needs a block slice and a `Variant`, not a `Volume`,
+      which is exactly what `Populator` has on hand for a block it just
+      read into its scratch buffer). `parse_entry` now calls it too, so
+      there is one branch instead of two that merely agreed by
+      construction. Tested with a name past the classic 30-byte limit
+      on an LNFS volume
+      (`a_duplicate_long_name_past_30_bytes_is_refused_on_lnfs`):
+      duplicate detection under both the raw and the intl-folded name,
+      and a name differing only past byte 30 accepted as genuinely
+      different — proof the shared path reads the whole LNFS field
+      rather than truncating at the classic length the wrong offset
+      would.
 - [x] **Round-trip property tests**: `tests/volumes.rs` builds a seeded
       pseudo-random tree (a xorshift written out rather than a dependency
       taken) for **every variant × {512, 1024, 4096}** — varying depth,
@@ -527,6 +567,26 @@ observe.
       and a crash sweep that stops the medium after every prefix of a
       session's writes: the damage is always leak-shaped (`OrphanBlock`
       allowed) and `ReachableButFree` never appears.
+
+      **2026-09-09, as-built — a maintainability pass, found by
+      independent review, not an integrity bug.** `allocate_exact`'s own
+      doc comment said reusing `AllocError::NotCovered` for an
+      already-allocated destination "would misreport *why*" — and then
+      the code did exactly that, leaving a caller unable to tell "this
+      destination is occupied, evacuate it first" apart from "this LBA
+      isn't even in the volume." Fixed by adding
+      `AllocError::AlreadyAllocated { lba }` and returning it where the
+      code used to reuse `NotCovered`, and rewriting the doc comment to
+      match what the code now actually does rather than what it used to
+      contradict. Checked every call site (`compact.rs`'s
+      `DestPick::Exact`, the only one): none pattern-matches on
+      `NotCovered` to catch this case specifically, so the fix is the
+      variant and the doc, not a behaviour change any existing caller
+      depended on. Tested both directions
+      (`allocate_exact_on_an_occupied_block_reports_already_allocated_not_not_covered`,
+      `allocate_exact_outside_the_bitmaps_coverage_still_reports_not_covered`)
+      so the rename is proven to distinguish the two cases rather than
+      just relabel every refusal.
 - [x] **Create/delete/rename** in existing volumes: hash-chain
       insertion/removal under both fold tables, dircache invalidation
       (`DOS\4`/`5`: update or clear, never leave stale). `Mutator` in
@@ -547,6 +607,33 @@ observe.
       second implementation of "where does an LNFS comment go" is a second
       chance to put it at the classic offset, which is the mistake this
       crate exists to not make.
+
+      **2026-09-09, as-built — `T_LIST` closed the same gap, found by
+      independent review.** `build.rs`'s own module doc states the
+      principle — what a header, comment, data or dircache block
+      contains must exist once — but the extension block was the one
+      block type left out of it, hand-assembled in five places:
+      `mutate.rs`'s `create_file` and `edit_file`, `compact.rs`'s
+      `defragment_file_avoiding` and `relocate_header_core`, and
+      `populate.rs`'s `create_file_with`. All five wrote byte-identical
+      blocks before this — confirmed field by field, not assumed — so
+      this was a pure consolidation with no discrepancy to reconcile.
+      `build_extension_block(buf, lba, header, pointers: &[u32], next)`
+      now owns the six fixed longwords, the table and the checksum;
+      the four batch writers (which already know a file's whole block
+      count) hand it a complete slice, and `Populator::create_file_with`
+      — which discovers data blocks one at a time from a streaming
+      callback and has to write forward, patching a predecessor's
+      pointer once its successor's LBA is known, rather than backwards
+      like the other four — now accumulates a `Vec<u32>` of pointers
+      per extension block instead of writing bytes directly, and calls
+      the shared function once each block is complete, at exactly the
+      point it used to call `put_buf_checked`. Write timing, order and
+      byte content are unchanged; `put_buf_checked` became dead code
+      and was removed. Verified against the full differential suite
+      (both the xdftool and fstool legs, 21 tests, all green) as well
+      as the whole test suite on both feature sets, not just the unit
+      tests touching the five call sites.
 
       Four decisions worth stating.
 
