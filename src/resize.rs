@@ -926,6 +926,53 @@ fn pick_free(bitmap: &Bitmap, claimed: &[u64], new_block_count: u64) -> Option<u
 /// has made obsolete — before [`Volume::repair`] gets a chance to
 /// preserve them as leaks.
 ///
+/// # Why this re-derives the bit math instead of calling `Allocator`
+///
+/// This is a deliberate parallel implementation, not a shortcut that
+/// happened to duplicate [`Bitmap`]'s bit conventions — checked again for
+/// this pass rather than assumed from an earlier reading. It reuses this
+/// crate's *shared* layout constants for all four of `bitmap.rs`'s
+/// conventions ([`OFF_BITMAP_BITS`], [`BITMAP_CHECKSUM_INDEX`],
+/// [`bitmap_bits_per_block`] for the LSB-first/`reserved`-offset bit
+/// index), so the conventions themselves are still stated in exactly one
+/// place; what has no shared home is the *procedure* — flip one bit in a
+/// specific, already-known-free page buffer and rewrite that page's
+/// checksum — because no session-shaped type in this crate can be asked
+/// to do that safely at the point this function runs:
+///
+/// - An [`Allocator`](crate::Allocator) session assumes a *currently
+///   loaded, currently valid* bitmap covering the volume's *current*
+///   geometry. By the time this function is called, `resize` has already
+///   written the new root with `bitmap_flag` forced to 0 (this module's
+///   documented "first write" — see "Ordering" above) and has already
+///   updated `self.block_count`/`self.root.lba` in memory to the *new*
+///   geometry. `Allocator::load` would refuse outright
+///   ([`AllocError::BitmapInvalid`]) against that root, and even ignoring
+///   that, the page/word arithmetic this function needs is the *old*
+///   bitmap's — a snapshot taken before any of this call's writes, whose
+///   page count and page LBAs can differ from what the new geometry's
+///   bitmap will have. There is no valid session over the *old* bitmap
+///   once the new one is what the volume claims to be.
+/// - `Allocator::rebuilt` is the other constructor, and it is not a
+///   shortcut either: building one *is* the reachability walk this
+///   function's caller runs immediately afterward via [`Volume::repair`].
+///   Free-bit patching exists precisely so that the handful of blocks
+///   this call already knows for certain are free do not get preserved as
+///   leaks by that walk's own one-directional "never remove allocation an
+///   incomplete walk might have missed" rule (see [`Volume::repair`]'s
+///   documentation) — it has to run *before* repair, on the physically
+///   intact old pages, using bits repair has not yet rebuilt.
+///
+/// So this function's job — patch specific known-free bits into specific
+/// old, physically-still-valid pages, ahead of and separate from the
+/// full-volume rebuild — has no shape that fits either `Allocator`
+/// constructor, and inventing a third session type purely to move this
+/// one bit-flip-and-checksum body out of `resize.rs` would add a new
+/// abstraction with exactly one call site and no reduction in what has to
+/// be reasoned about. The four bit conventions stay singly-stated via the
+/// shared constants; only this narrow, resize-specific procedure around
+/// them is resize's own.
+///
 /// A no-op, not an error, when the page that would need patching is
 /// itself past `new_block_count`: [`Volume::repair`] will replace that
 /// page wholesale from the walk (its pointer fails the same range check),

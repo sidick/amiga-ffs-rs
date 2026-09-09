@@ -1504,23 +1504,14 @@ impl<S: BlockMedium> Mutator<S> {
         let entry = self.vol.entry_at(header_lba)?;
 
         let slot = self.slot_of(&entry.name);
-        let block_count = self.vol.block_count();
-        let mut next = self.vol.hash_table(entry.parent as u64)?[slot];
-        let mut steps = 0u64;
-        while next != 0 {
-            if next as u64 == header_lba {
-                return Err(MutateError::StillLinked {
-                    lba: header_lba,
-                    parent: entry.parent as u64,
-                });
-            }
-            steps += 1;
-            if steps > block_count {
-                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
-                    lba: next as u64,
-                }));
-            }
-            next = self.vol.entry_at(next as u64)?.hash_chain;
+        if self
+            .locate_in_hash_chain(entry.parent as u64, slot, header_lba)?
+            .is_some()
+        {
+            return Err(MutateError::StillLinked {
+                lba: header_lba,
+                parent: entry.parent as u64,
+            });
         }
 
         let free = self.blocks_of(&entry)?;
@@ -2014,6 +2005,92 @@ impl<S: BlockMedium> Mutator<S> {
         Ok(out)
     }
 
+    /// Walk `dir`'s hash chain for `slot`, looking for the block whose
+    /// pointer already names `target` — either the slot's own head, or
+    /// some entry's longword −4.
+    ///
+    /// The one "find whoever's pointer names this block" primitive every
+    /// hash-chain walk in the crate now shares: [`Mutator::splice_from_hash_chain`]
+    /// removes what it finds and promotes the successor, [`Mutator::release`]
+    /// only asks whether `target` is still there, and
+    /// [`crate::compact`]'s `retarget_hash_chain` redirects the pointer to
+    /// a new address instead of removing it. All three want exactly the
+    /// same walk — the disagreement starts only after the predecessor is
+    /// found — so there is one implementation of "found at `prev`" and
+    /// three different things done with that answer.
+    ///
+    /// Returns the predecessor's LBA (`0` meaning the slot's own head)
+    /// when `target` is in the chain, `None` when the walk reaches the
+    /// end without finding it. The one `Err` is
+    /// [`crate::read::Error::ChainTooLong`], the same cycle bound every
+    /// chain walk here uses.
+    pub(crate) fn locate_in_hash_chain(
+        &mut self,
+        dir: u64,
+        slot: usize,
+        target: u64,
+    ) -> Result<Option<u64>, MutateError<Transport<S>>> {
+        let block_count = self.vol.block_count();
+        let mut next = self.vol.hash_table(dir)?[slot];
+        let mut prev = 0u64;
+        let mut steps = 0u64;
+        while next != 0 && next as u64 != target {
+            steps += 1;
+            if steps > block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
+                    lba: next as u64,
+                }));
+            }
+            let e = self.vol.entry_at(next as u64)?;
+            prev = next as u64;
+            next = e.hash_chain;
+        }
+        Ok((next != 0).then_some(prev))
+    }
+
+    /// Walk the chain of hard links naming `target` (starting at
+    /// `target`'s own longword −10, the field [`Entry::next_link`]
+    /// reads), looking for whichever block's own −10 currently names
+    /// `entry_lba`.
+    ///
+    /// The link-chain counterpart of [`Mutator::locate_in_hash_chain`],
+    /// shared by [`Mutator::unlink_from_link_chain`] (which removes what
+    /// it finds and promotes the successor) and [`crate::compact`]'s
+    /// `retarget_link_predecessor` (which redirects the pointer to a new
+    /// address instead). Returns the predecessor's LBA on success;
+    /// [`MutateError::NotInLinkChain`] if the walk runs off the end of
+    /// the chain, or [`crate::read::Error::ChainTooLong`] for a cycle.
+    pub(crate) fn locate_link_predecessor(
+        &mut self,
+        target: u64,
+        entry_lba: u64,
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let bs = self.bs();
+        let block_count = self.vol.block_count();
+        let mut prev = target;
+        let mut steps = 0u64;
+        loop {
+            let buf = self.get(prev)?;
+            let next = be32(&buf, tail(bs, TL_NEXT_LINK));
+            if next == 0 {
+                return Err(MutateError::NotInLinkChain {
+                    lba: entry_lba,
+                    target,
+                });
+            }
+            if next as u64 == entry_lba {
+                return Ok(prev);
+            }
+            steps += 1;
+            if steps > block_count {
+                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
+                    lba: next as u64,
+                }));
+            }
+            prev = next as u64;
+        }
+    }
+
     /// Splice an entry out of its parent's hash chain: the directory's
     /// own slot when it is the head, the previous entry's longword −4
     /// otherwise.
@@ -2021,6 +2098,10 @@ impl<S: BlockMedium> Mutator<S> {
     /// The successor is re-read from the entry's block rather than taken
     /// from the caller's [`Entry`], so an entry that has been re-chained
     /// since it was looked up cannot be spliced with a stale pointer.
+    /// [`Mutator::unlink_from_link_chain`]'s equivalent write does *not*
+    /// re-read the corresponding field the same way — see that function's
+    /// documentation for why that asymmetry is not a gap in its one
+    /// current call site.
     ///
     /// Named for the block it edits rather than for [`Mutator::unlink`],
     /// which is this plus the metadata half of a link splice plus the
@@ -2032,28 +2113,13 @@ impl<S: BlockMedium> Mutator<S> {
         entry: &Entry,
     ) -> Result<(), MutateError<Transport<S>>> {
         let bs = self.bs();
-        let block_count = self.vol.block_count();
         let slot = self.slot_of(&entry.name);
-        let mut next = self.vol.hash_table(dir)?[slot];
-        let mut prev = 0u64;
-        let mut steps = 0u64;
-        while next != 0 && next as u64 != entry.lba {
-            steps += 1;
-            if steps > block_count {
-                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
-                    lba: next as u64,
-                }));
-            }
-            let e = self.vol.entry_at(next as u64)?;
-            prev = next as u64;
-            next = e.hash_chain;
-        }
-        if next == 0 {
-            return Err(MutateError::NotInChain {
-                dir,
-                lba: entry.lba,
-            });
-        }
+        let prev =
+            self.locate_in_hash_chain(dir, slot, entry.lba)?
+                .ok_or(MutateError::NotInChain {
+                    dir,
+                    lba: entry.lba,
+                })?;
         let successor = self.vol.entry_at(entry.lba)?.hash_chain;
         if prev == 0 {
             let mut buf = self.get(dir)?;
@@ -2073,38 +2139,32 @@ impl<S: BlockMedium> Mutator<S> {
     /// Done *before* the link leaves its directory, so at no point does a
     /// live object's link chain name a block that is on its way to being
     /// freed.
+    ///
+    /// Writes `link.next_link` — the caller's already-in-hand [`Entry`]
+    /// field — rather than re-reading `link.lba`'s own longword −10 off
+    /// the disk the way [`Mutator::splice_from_hash_chain`] re-reads its
+    /// successor. Checked, not assumed: this function's one call site
+    /// ([`Mutator::unlink`]) captures `link` at the top of that function
+    /// and writes nothing to `link.lba` itself before calling this, so
+    /// `link.next_link` is still exactly what is on disk when this reads
+    /// it — there is no window in the current call sequence for it to go
+    /// stale. A future call site that captured its `Entry` earlier and
+    /// mutated `link.lba` in between would reopen exactly the hazard
+    /// [`Mutator::splice_from_hash_chain`]'s re-read exists to close; if
+    /// one is ever added, re-read here too rather than trusting this
+    /// comment to still be true.
     fn unlink_from_link_chain(&mut self, link: &Entry) -> Result<(), MutateError<Transport<S>>> {
         let bs = self.bs();
-        let block_count = self.vol.block_count();
         let target = link.real_entry as u64;
         if target == 0 {
             return Err(MutateError::Read(crate::read::Error::LinkTargetMissing {
                 lba: link.lba,
             }));
         }
-        let mut prev = target;
-        let mut steps = 0u64;
-        loop {
-            let mut buf = self.get(prev)?;
-            let next = be32(&buf, tail(bs, TL_NEXT_LINK));
-            if next == 0 {
-                return Err(MutateError::NotInLinkChain {
-                    lba: link.lba,
-                    target,
-                });
-            }
-            if next as u64 == link.lba {
-                wr32(&mut buf, tail(bs, TL_NEXT_LINK), link.next_link);
-                return self.put(prev, &mut buf);
-            }
-            steps += 1;
-            if steps > block_count {
-                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
-                    lba: next as u64,
-                }));
-            }
-            prev = next as u64;
-        }
+        let prev = self.locate_link_predecessor(target, link.lba)?;
+        let mut buf = self.get(prev)?;
+        wr32(&mut buf, tail(bs, TL_NEXT_LINK), link.next_link);
+        self.put(prev, &mut buf)
     }
 
     /// Refuse moving a directory into itself or into anything below it.

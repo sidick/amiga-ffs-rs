@@ -1777,6 +1777,123 @@ property of every image shipped, not a tuning detail.
   cost but do have erase blocks, so contiguity still pays while
   cylinder-alignment reasoning does not transfer.
 
+## Consolidation wave: the three items deferred from `26c994d`
+
+`26c994d` consolidated four duplications an independent review found, and
+deliberately deferred three more because all three touch the exact
+write-ordering code `a4b3c1d`/`3a4a4ea` had just spent real effort
+hardening against real bugs — consolidating crash-ordering-sensitive code
+right after fixing crash-ordering bugs in it is exactly the moment to be
+most careful, not least. **2026-09-09, as-built.** Worked one item at a
+time, in increasing risk order, with the full test matrix and every crash
+sweep (`tests/volumes.rs`'s `*_crash_sweep_*` and
+`an_interrupted_overwrite_leaves_old_bytes_or_new_bytes_and_nothing_else`)
+re-run after each change.
+
+- **Item A — `resize.rs`'s `free_bit_on_disk` re-implements the bitmap's
+  bit conventions.** Investigated and **left alone, documentation
+  tightened only.** The four conventions themselves are *not*
+  reimplemented independently — `free_bit_on_disk` already computes its
+  word offset and bit index through the same shared layout constants
+  (`OFF_BITMAP_BITS`, `BITMAP_CHECKSUM_INDEX`, `bitmap_bits_per_block`)
+  `Bitmap` itself is built on, so there is exactly one place those four
+  facts are stated. What has no shared home is the narrow *procedure* —
+  flip one bit in one already-known-free page buffer and rewrite that
+  page's checksum, ahead of and separate from a full rebuild — and no
+  existing session type can be asked to do that safely at the point this
+  function runs: an `Allocator::load` session assumes a *currently valid*
+  bitmap over the volume's *current* geometry, and by the time
+  `free_bit_on_disk` is called, `resize` has already forced
+  `bitmap_flag` to 0 on the freshly written new root and already flipped
+  `self.block_count`/`self.root.lba` to the new geometry in memory — a
+  session over the *old* bitmap's page layout is not a thing that can
+  exist at that point, and `Allocator::rebuilt` is not a shortcut either,
+  since building one *is* the reachability walk this function's caller
+  runs immediately afterward via `Volume::repair`, on bits this function
+  has not finished pre-seeding as free. Confirmed by reading
+  `free_bit_on_disk` fresh against the current tree, not from memory of
+  an earlier pass. `src/resize.rs`'s doc comment on the function now
+  states this reasoning directly ("Why this re-derives the bit math
+  instead of calling `Allocator`") so a future reader does not have to
+  re-derive it.
+
+- **Item B — five chain-walk "find the predecessor" copies, one with a
+  defensive re-read the other four lack.** Investigated and
+  **consolidated into two shared primitives**, no write-order or
+  written-value changes. `Mutator::splice_from_hash_chain`'s re-read of
+  the spliced entry's successor (rather than trusting the caller's
+  already-in-hand `Entry`) turned out to be necessary for *what splice
+  writes* — promoting a removed node's successor into its predecessor —
+  and structurally inapplicable to `compact::retarget_hash_chain` and
+  `compact::retarget_link_predecessor`, which never remove a node from a
+  chain at all: they redirect a predecessor's pointer to a caller-given
+  new address, so there is no successor value to go stale in the first
+  place. That is a real asymmetry, but not a gap — retarget's write does
+  not derive from anything that could have been re-chained since it was
+  read. `mutate.rs`'s `unlink_from_link_chain`, by contrast, *is* a
+  removal (the link-chain analogue of `splice_from_hash_chain`) and does
+  **not** re-read its own promoted value (`link.next_link`) the way
+  `splice_from_hash_chain` does. Checked its one call site
+  (`Mutator::unlink`) rather than assuming: `link` is captured at the top
+  of `unlink` and nothing writes to `link.lba` before
+  `unlink_from_link_chain` runs, so there is no window in the current
+  call sequence for `link.next_link` to go stale — a failing test could
+  not be constructed, so the asymmetry was documented rather than
+  "fixed" into a behaviour change nothing demonstrates is needed. Two new
+  `pub(crate)` primitives on `Mutator` do the shared walk-and-find-prev
+  work: `locate_in_hash_chain(dir, slot, target) -> Option<u64>` (used by
+  `splice_from_hash_chain`, `compact::retarget_hash_chain`, and
+  `Mutator::release`'s membership check — three copies collapsed into
+  one) and `locate_link_predecessor(target, entry_lba) -> u64` (used by
+  `unlink_from_link_chain` and `compact::retarget_link_predecessor` —
+  two copies collapsed into one). Each caller still decides, on its own,
+  what to do with the predecessor once found — splice/unlink promote a
+  successor, retarget writes a caller-given new address, `release` only
+  asks whether the chain still names the block — so nothing about *what*
+  gets written or in what order changed; only the walk that finds
+  "whoever's pointer names this block" is now stated once per chain
+  kind. Full test suite (both feature sets) and every crash sweep pass
+  unchanged after the change, which is the property this consolidation
+  had to preserve rather than merely hope for.
+
+- **Item C — the checked-read/checksum-write-with-root-reload primitive
+  exists four times, automatic in only one.** Investigated and **left
+  alone**, with the verification the item asked for written down rather
+  than assumed. `Mutator::put` (`src/mutate.rs`) is the one copy that
+  automatically calls `reload_root()` when the written LBA is the root.
+  The other three do not — but checked against the current tree, not
+  stale line numbers, all three are either already covered by an
+  adjacent manual reload or do not carry the hazard at all:
+  `repair.rs`'s `put_block` has two call sites that write the root
+  (inside `sever`'s `cut`, and the bitmap-pointer rewrite in `repair`
+  itself), and both are followed by an explicit `self.reload_root()` in
+  `repair()` (after `sever()` returns, and again after
+  `mark_bitmap_valid`) before `repair()` returns. `resize.rs`'s inline
+  write path writes the root twice (the first-write root copy, and the
+  dircache-extension-pointer patch) and calls `self.reload_root()`
+  immediately after each. `populate.rs`'s `put_checked` writes the root
+  (`set_bitmap_flag`) with no reload at all — but `Populator` holds no
+  `Volume` and therefore no cached root parse to go stale in the first
+  place; the invariant this item is about does not apply to a type that
+  never exposes a `Volume`-shaped read of its own root mid-session. A
+  shared primitive would have to unify four genuinely different things:
+  `Mutator<S>`'s bound-checked write returning `MutateError`,
+  `Volume<S>`'s unbound-checked write (`repair::put_block`, which writes
+  straight to `self.src` with no LBA range check at all) returning
+  `AllocError`, `resize`'s deliberately-differently-bounded write
+  (bounds-checked against `write_bound`, not `self.block_count()` — see
+  Item A's finding that `resize` is mid-geometry-transition and cannot
+  use the volume's own current bound) returning `ResizeError`, and
+  `Populator`'s write returning `PopulateError` against a type with no
+  `Volume` and no root cache to protect. Forcing one primitive across
+  four different bound-checking semantics and four different error
+  types, to fix a hazard that either does not exist at the current call
+  sites or does not apply to the type at all, is exactly the kind of
+  change the ground rule for this wave says not to force. No behaviour
+  changed; no test added, because there is no new structural invariant
+  to pin — the existing manual reloads, verified present and correctly
+  placed, are what the invariant already rests on.
+
 ## In scope, not scheduled
 
 - **muFS**: the MultiUser filesystem is explicitly in scope for this

@@ -1049,6 +1049,16 @@ impl<S: BlockMedium> Mutator<S> {
     /// entry's position in the chain. The commit: before this write
     /// `old` is authoritative and `new` is an unreachable full copy;
     /// after it, the reverse.
+    ///
+    /// The walk itself is [`Mutator::locate_in_hash_chain`], shared with
+    /// [`Mutator::splice_from_hash_chain`] and [`Mutator::release`] --
+    /// see that function's documentation for why the same "find the
+    /// predecessor" logic serves a redirect here, a removal there and a
+    /// membership check in `release`. There is no successor to re-read
+    /// the way a splice has to: retargeting never removes a node from
+    /// the chain, it only changes which address the predecessor names,
+    /// so nothing about the chain's *shape* is derived from a value that
+    /// could have gone stale.
     fn retarget_hash_chain(
         &mut self,
         dir: u64,
@@ -1057,25 +1067,10 @@ impl<S: BlockMedium> Mutator<S> {
         new: u64,
     ) -> Result<(), MutateError<Transport<S>>> {
         let bs = self.bs();
-        let block_count = self.vol.block_count();
         let slot = self.slot_of(name);
-        let mut next = self.vol.hash_table(dir)?[slot];
-        let mut prev = 0u64;
-        let mut steps = 0u64;
-        while next != 0 && next as u64 != old {
-            steps += 1;
-            if steps > block_count {
-                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
-                    lba: next as u64,
-                }));
-            }
-            let e = self.vol.entry_at(next as u64)?;
-            prev = next as u64;
-            next = e.hash_chain;
-        }
-        if next == 0 {
-            return Err(MutateError::NotInChain { dir, lba: old });
-        }
+        let prev = self
+            .locate_in_hash_chain(dir, slot, old)?
+            .ok_or(MutateError::NotInChain { dir, lba: old })?;
         if prev == 0 {
             let mut buf = self.get(dir)?;
             wr32(&mut buf, OFF_HASH_TABLE + slot * 4, new as u32);
@@ -1125,6 +1120,11 @@ impl<S: BlockMedium> Mutator<S> {
     /// target, or an earlier link) currently threads the chain through
     /// `old_link` via its own longword −10, and repoint that one longword
     /// at `new_link`.
+    ///
+    /// The walk is [`Mutator::locate_link_predecessor`], shared with
+    /// [`Mutator::unlink_from_link_chain`] — see that function's
+    /// documentation for why a redirect (this) needs no re-read of
+    /// anything the way a removal's successor promotion does.
     fn retarget_link_predecessor(
         &mut self,
         target: u64,
@@ -1132,30 +1132,10 @@ impl<S: BlockMedium> Mutator<S> {
         new_link: u64,
     ) -> Result<(), MutateError<Transport<S>>> {
         let bs = self.bs();
-        let block_count = self.vol.block_count();
-        let mut prev = target;
-        let mut steps = 0u64;
-        loop {
-            let mut buf = self.get(prev)?;
-            let next = be32(&buf, tail(bs, TL_NEXT_LINK));
-            if next == 0 {
-                return Err(MutateError::NotInLinkChain {
-                    lba: old_link,
-                    target,
-                });
-            }
-            if next as u64 == old_link {
-                wr32(&mut buf, tail(bs, TL_NEXT_LINK), new_link as u32);
-                return self.put(prev, &mut buf);
-            }
-            steps += 1;
-            if steps > block_count {
-                return Err(MutateError::Read(crate::read::Error::ChainTooLong {
-                    lba: next as u64,
-                }));
-            }
-            prev = next as u64;
-        }
+        let prev = self.locate_link_predecessor(target, old_link)?;
+        let mut buf = self.get(prev)?;
+        wr32(&mut buf, tail(bs, TL_NEXT_LINK), new_link as u32);
+        self.put(prev, &mut buf)
     }
 }
 
