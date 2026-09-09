@@ -1896,6 +1896,50 @@ re-run after each change.
 
 ## In scope, not scheduled
 
+- **Changing a volume's dostype in place, with data on disk** — three
+  of its four independent axes, not all four; raised in conversation
+  (2026-09-10). Dostype is one global fact (the boot block's/root's),
+  read once and applied to every block's layout, which is why the
+  axes' costs differ so sharply: the ones where a half-converted
+  volume still lands in a shape this crate already diagnoses and
+  fixes are cheap; the one where it doesn't is not worth building.
+
+  - **Intl (fold table)** — metadata only: every entry's hash slot
+    depends on the fold table, so flipping it means walking every
+    directory, rehashing, and re-splicing each entry via `Mutator`'s
+    existing relocate primitives. No file data moves. Interrupted
+    mid-walk, the result is exactly `Finding::WrongChainSlot` on the
+    not-yet-rehashed entries — already diagnosed, already the shape a
+    rehash-repair pass fixes, not a new failure mode.
+  - **Dircache** — metadata only, and the cheapest of the three:
+    `Mutator::refresh_dircache` already builds or frees one
+    directory's cache from its hash chains; converting the volume is
+    "walk every directory, call it." Dircache is already advisory and
+    `DircacheStale` already the recoverable finding for exactly this
+    interruption.
+  - **Long names** — header-layout only, no data blocks move, reusing
+    `build.rs`'s header assembly for the other layout. Upward (classic
+    → LNFS) is safe for every name. **Downward is lossy for any name
+    over 30 bytes, and per Simon's decision this is a refusal, not a
+    truncation**: converting away from long names while any name
+    exceeds the classic limit fails outright, listing every offending
+    path — the same instinct as this crate's long-name regression
+    test, applied to a new operation: a byte limit is something to
+    report against, never something to silently satisfy by cutting a
+    name down.
+  - **FFS/OFS — out of scope, on purpose, per Simon's decision.** Every
+    file's data blocks change shape (payload per block differs, so
+    chain length changes for nearly every file), and this is the one
+    axis with no safe intermediate state: the moment a block's
+    declared type disagrees with its actual layout, it reads as
+    garbage, not as a `repair()`-fixable finding the other three axes
+    degrade into. The only crash-safe way to do this axis is to write
+    every file's new-format data to freshly allocated blocks first and
+    flip pointers last — which is `convert`'s shape exactly, aimed at
+    the same volume's free space instead of a second one. Not cheaper
+    than `convert`; `convert` covers it once it exists, and this axis
+    gets no separate in-place path.
+
 - **CLI tools**, matching and eventually exceeding amitools' `xdftool`
   and `xdfscan` — the two GPL programs this crate has run as an oracle
   throughout, never copied from, so a from-scratch permissively-licensed
