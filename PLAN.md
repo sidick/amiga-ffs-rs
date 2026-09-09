@@ -1951,6 +1951,24 @@ re-run after each change.
   question raised in conversation (2026-09-09) to live once it is
   more than a curiosity.
 
+  Source and destination need not be the same medium, the same size,
+  or even the same partition table — `convert` only ever sees "a
+  place to read a tree from" and "a place to format and write one
+  into", so converting between two partitions on two different HDFs
+  is the same operation as converting within one file. `amiga-rdb`
+  already composes the *read* side of this: `PartitionSource::new`
+  wraps any `Partition` entry into its own windowed `BlockSource`,
+  hostile-`PART`-block-checked (a saturated `start_lba` refused by a
+  checked-add, a second bound against the parent's own block count).
+  **Gap**: `PartitionSource` is `BlockSource` only today, not also
+  `BlockSink` — writing a fresh volume *into* a partition on an
+  existing multi-partition HDF (the destination side) needs a
+  `PartitionSink`/`BlockSink` impl added there first. Until then,
+  `convert`'s destination is a whole raw image, no partition table.
+  The destination's own capacity (from its `Partition` entry or a
+  whole image's size) is checked the same way `format()`/`Populator`
+  already refuse an undersized target — cleanly, not by corrupting.
+
   **`xdfscan` equivalent** — batch `validate()` over a directory of
   images, one-line-per-image summaries (`ok`/`NOK`/`nofs`/`NDOS`),
   verbose per-finding output straight from `Report`'s typed `Finding`s
