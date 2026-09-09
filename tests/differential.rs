@@ -1636,7 +1636,12 @@ fn fstool_variant_label(variant: Variant) -> String {
     format!(
         "DOS\\{byte} ({}{}{})",
         if byte & 1 != 0 { "FFS" } else { "OFS" },
-        if byte & 2 != 0 { "+INTL" } else { "" },
+        // Intl is a property of the *variant*, not of bit 1 alone: every
+        // dircache flavour is international too (there is no non-intl
+        // dircache variant), which is exactly the bug fstool 0.4.27 fixed
+        // (KarpelesLab/fstool#42) — its own `info` now says `+INTL+DC`
+        // for `DOS\4`/`DOS\5`, matching `Variant::is_intl` here.
+        if variant.is_intl() { "+INTL" } else { "" },
         if byte & 4 != 0 { "+DC" } else { "" },
     )
 }
@@ -1941,7 +1946,7 @@ fn fstool_reads_every_variant_it_can_read_that_this_crate_wrote() {
 /// rather than an exact transcription of the garbage, because the garbage
 /// is not a contract.
 #[test]
-fn fstool_reads_a_long_name_as_a_truncated_one() {
+fn fstool_now_refuses_a_long_name_volume_outright() {
     let bin = fstool_oracle!();
     let scratch = Scratch::new("fstool-long");
     let long = "a-file-name-of-fifty-characters-for-the-lnfs-tests";
@@ -1958,23 +1963,24 @@ fn fstool_reads_a_long_name_as_a_truncated_one() {
         assert!(vol.lookup(root, long.as_bytes()).unwrap().is_some());
         assert!(vol.validate().is_clean());
 
-        // fstool opens it -- and calls it a dircache volume, because it
-        // has no long-name bit to decode.
-        let info = fs_text(&bin, &["info", path]);
+        // fstool used to open it and call it a dircache volume, since it
+        // had no long-name bit to decode -- the exact trap this crate
+        // exists to refuse (raised as the aside in KarpelesLab/fstool#43,
+        // "Affs::open accepts boot flags 6 and 7... refusing would be
+        // more honest than reading them at the wrong offsets"). Fixed in
+        // 0.4.27: it now refuses to open the volume at all.
+        let out = Command::new(&bin)
+            .args(["info", path])
+            .output()
+            .expect("fstool was found a moment ago");
         assert!(
-            info.contains(&format!(
-                "variant:           {}",
-                fstool_variant_label(variant)
-            )),
-            "{variant:?}:\n{info}"
+            !out.status.success(),
+            "fstool opened a long-name volume; the #43 aside regressed"
         );
-
-        // ...and cannot see the name.
-        let listing = fs_text(&bin, &["ls", path, "/"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !listing.contains(long),
-            "fstool 0.4.26 grew long-name support; this test is now the \
-             wrong shape:\n{listing}"
+            stderr.contains("long-filename") || stderr.contains("not supported"),
+            "fstool refused for an unexpected reason:\n{stderr}"
         );
     }
 }
@@ -2344,7 +2350,7 @@ fn fstool_reads_a_volume_this_crate_mutated() {
 /// support, the suite says so out loud instead of quietly gaining
 /// coverage nobody noticed.
 #[test]
-fn fstool_corrupts_a_dircache_volume_it_was_never_able_to_create() {
+fn fstool_now_correctly_mutates_a_dircache_volume_it_still_cannot_create() {
     let bin = fstool_oracle!();
     let scratch = Scratch::new("fstool-dc");
     let host = scratch.path("payload");
@@ -2357,50 +2363,32 @@ fn fstool_corrupts_a_dircache_volume_it_was_never_able_to_create() {
         let path = image.to_str().unwrap();
 
         // `\u{e9}clair`: an accented first byte, so the two fold tables
-        // disagree about it. It goes in without an error.
+        // used to disagree about it. Filed as KarpelesLab/fstool#42
+        // (wrong fold table on DOS\4/DOS\5) and #43 (dircache never
+        // maintained on write); both fixed in fstool 0.4.27. This test
+        // used to assert the two resulting corruptions; now it asserts
+        // they are gone, so a regression upstream is caught here too.
         fs_run(&bin, &["add", path, host.to_str().unwrap(), "/\u{e9}clair"]);
 
         let mut vol = Volume::open(ImageDisk::open(&image), None).expect("open");
         let root = vol.root_lba();
-        let report = vol.validate();
 
-        // The file is in the directory -- enumeration finds it...
         assert!(
             walk_latin1(&mut vol, root, "")
                 .iter()
                 .any(|(p, _)| p == "\u{e9}clair"),
             "{variant:?}: fstool did not add the file at all"
         );
-        // ...and lookup by name, which is what an AmigaDOS `Lock()` does,
-        // never will.
+        // Lookup by name -- what an AmigaDOS `Lock()` does -- now finds
+        // it too, under this volume's own (international) fold table.
         assert!(
-            vol.lookup(root, b"\xe9clair").unwrap().is_none(),
-            "{variant:?}: fstool 0.4.26 learned that DOS\\4 is international; \
-             update FSTOOL_CREATABLE and this test"
+            vol.lookup(root, b"\xe9clair").unwrap().is_some(),
+            "{variant:?}: fstool's fold-table fix (#42) regressed"
         );
 
-        let wrong_slot = report
-            .findings
-            .iter()
-            .any(|f| matches!(f, Finding::WrongChainSlot { dir, .. } if *dir == root));
-        let stale_cache = report.findings.iter().any(|f| {
-            matches!(
-                f,
-                Finding::DircacheStale {
-                    dir,
-                    detail: validate::DircacheDiscrepancy::Missing { .. },
-                    ..
-                } if *dir == root
-            )
-        });
-        assert!(wrong_slot, "{variant:?}: {:#?}", report.findings);
-        assert!(stale_cache, "{variant:?}: {:#?}", report.findings);
-        // Nothing *else* is wrong: the bitmap, the checksums, the parent
-        // pointers and the extension chains are all still right, which is
-        // what makes this two specific bugs rather than a broken writer.
-        assert_eq!(
-            report.findings.len(),
-            2,
+        let report = vol.validate();
+        assert!(
+            report.findings.is_empty(),
             "{variant:?}: {:#?}",
             report.findings
         );
