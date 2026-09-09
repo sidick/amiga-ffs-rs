@@ -1918,12 +1918,16 @@ re-run after each change.
   reverse walk — but through **`.uaem` sidecar files** (`Name.ext` +
   a `Name.ext.uaem` text file beside it), not `xdftool`'s own
   `.xdfmeta`: `.uaem` is the convention WinUAE, FS-UAE and Copperline's
-  directory-filesystem mounts already use for exactly this problem
-  (protection, comment, dates a host filesystem cannot hold), written
-  only when a file's attributes actually need it — no sidecar for an
-  ordinary file with default permissions — so a tree this crate
-  unpacks is mountable directly by any of those three, and a tree any
-  of them wrote is packable straight back by this crate. `repack` —
+  directory-filesystem mounts already use for exactly this problem —
+  Copperline's own doc names precisely what a host filesystem cannot
+  hold: "protection bits such as script/pure/archive, file comments,
+  and exact datestamps" (`docs/guide/configuration.md`), read when
+  present and written back when they change, hidden from guest
+  listings, delete-protection honoured — written only when a file's
+  attributes actually need one, no sidecar for an ordinary file with
+  default permissions, so a tree this crate unpacks is mountable
+  directly by any of the three, and a tree any of them wrote is
+  packable straight back by this crate. `repack` —
   `Mutator::compact` with a CLI wrapped around it — gets its own named
   `defrag` alias (`--dry-run` reporting what would move and the
   before/after run counts, since a full compact rewrites most of a
