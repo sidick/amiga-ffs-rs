@@ -1960,11 +1960,16 @@ re-run after each change.
   wraps any `Partition` entry into its own windowed `BlockSource`,
   hostile-`PART`-block-checked (a saturated `start_lba` refused by a
   checked-add, a second bound against the parent's own block count).
-  **Gap**: `PartitionSource` is `BlockSource` only today, not also
-  `BlockSink` — writing a fresh volume *into* a partition on an
-  existing multi-partition HDF (the destination side) needs a
-  `PartitionSink`/`BlockSink` impl added there first. Until then,
-  `convert`'s destination is a whole raw image, no partition table.
+  **Gap, confirmed against `amiga-rdb` 0.4.0 (2026-09-10) rather than
+  assumed**: `PartitionSource` is `BlockSource` only, and `PartitionSink`
+  is a named, unticked box in `amiga-rdb`'s own plan — deferred *on
+  purpose*: "it is an API with no caller, and building it now would be
+  guessing... revisit when a real consumer asks." `convert` is that
+  consumer. Until `PartitionSink` lands, `convert`'s destination is a
+  whole raw image, no partition table — and when it's time to build
+  `convert` for real, the right move is asking `amiga-rdb` for exactly
+  this (bounds-checked per-write, a flush, whatever a grow-into-free-
+  space story needs), not guessing at its shape from this side either.
   The destination's own capacity (from its `Partition` entry or a
   whole image's size) is checked the same way `format()`/`Populator`
   already refuse an undersized target — cleanly, not by corrupting.
