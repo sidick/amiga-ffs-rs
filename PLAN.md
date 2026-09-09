@@ -172,37 +172,12 @@ than `cargo test` can reach.
       - **No comments, no dircache, no block size but 512** (`BSIZE` is a
         compile-time constant), and no protection/owner/date knobs on
         `create`. `-O` takes exactly `fstype`, `intl` and `volume_label`.
-      What still remains, and why it is not done rather than merely not
-      done yet:
-
-      - **AROS `afs.handler` as an oracle.** The two subprocess legs now
-        catch the mistakes this crate and its own synthetic builder would
-        make together, and `fstool` supplies the readable second
-        implementation the plan wanted `affs-read` for — so `affs-read`
-        itself is no longer wanted and is dropped from this box.
-        `afs.handler` is still worth having and is still the only oracle
-        that is also a *real consumer*, running inside a guest against the
-        same images. It needs that guest, which is Copperline's seam and
-        not something `cargo test` can reach.
-      - **Block sizes other than 512.** xdftool's ADF and HDF images are
-        512-blocked and fstool's AFFS `BSIZE` is a constant; larger block
-        sizes live behind an RDB, which is `rdbtool`'s and amiga-rdb's
-        territory. Covered synthetically at 512/1024/4096 in
-        `tests/volumes.rs` meanwhile.
-      - **Comments.** xdftool's `comment` command raises a `TypeError`
-        before writing anything (amitools 0.7.x), and fstool has no
-        comment surface at all, so no oracle-written volume can carry
-        one. Covered synthetically in both layouts, `T_COMMENT` overflow
-        block included.
-      - **The amibake AROS `DOS\7` fixture** — a real-world image rather
-        than a generated one. Wanted; needs a fixture pipeline, not just
-        a test.
-
-      Two of the four oracles this box names are now landed and wired
-      into CI, which is the substance of it; the box stays unticked
-      because the remaining two are the two that cannot be reached from
-      `cargo test` — `afs.handler` needs a guest, and the amibake fixture
-      needs a pipeline. Neither is blocked on anything here.
+      Tracked as GitHub issue #2 — AROS `afs.handler` as a guest
+      oracle, and the amibake `DOS\7` fixture; neither is blocked on
+      anything here. Two of the four oracles this box originally
+      named are landed and wired into CI, which is the substance of
+      it; the box stays unticked for the two `cargo test` cannot
+      reach.
 - [x] **`guard_chain`'s visited set stopped being a `Vec`** (2026-09-09,
       found by independent review). `guard_chain` — every hash-chain,
       extension-chain, link-chain and dircache-chain walk in the crate
@@ -1896,157 +1871,23 @@ re-run after each change.
 
 ## In scope, not scheduled
 
-- **Changing a volume's dostype in place, with data on disk** — three
-  of its four independent axes, not all four; raised in conversation
-  (2026-09-10). Dostype is one global fact (the boot block's/root's),
-  read once and applied to every block's layout, which is why the
-  axes' costs differ so sharply: the ones where a half-converted
-  volume still lands in a shape this crate already diagnoses and
-  fixes are cheap; the one where it doesn't is not worth building.
-
-  - **Intl (fold table)** — metadata only: every entry's hash slot
-    depends on the fold table, so flipping it means walking every
-    directory, rehashing, and re-splicing each entry via `Mutator`'s
-    existing relocate primitives. No file data moves. Interrupted
-    mid-walk, the result is exactly `Finding::WrongChainSlot` on the
-    not-yet-rehashed entries — already diagnosed, already the shape a
-    rehash-repair pass fixes, not a new failure mode.
-  - **Dircache** — metadata only, and the cheapest of the three:
-    `Mutator::refresh_dircache` already builds or frees one
-    directory's cache from its hash chains; converting the volume is
-    "walk every directory, call it." Dircache is already advisory and
-    `DircacheStale` already the recoverable finding for exactly this
-    interruption.
-  - **Long names** — header-layout only, no data blocks move, reusing
-    `build.rs`'s header assembly for the other layout. Upward (classic
-    → LNFS) is safe for every name. **Downward is lossy for any name
-    over 30 bytes, and per Simon's decision this is a refusal, not a
-    truncation**: converting away from long names while any name
-    exceeds the classic limit fails outright, listing every offending
-    path — the same instinct as this crate's long-name regression
-    test, applied to a new operation: a byte limit is something to
-    report against, never something to silently satisfy by cutting a
-    name down.
-  - **FFS/OFS — out of scope, on purpose, per Simon's decision.** Every
-    file's data blocks change shape (payload per block differs, so
-    chain length changes for nearly every file), and this is the one
-    axis with no safe intermediate state: the moment a block's
-    declared type disagrees with its actual layout, it reads as
-    garbage, not as a `repair()`-fixable finding the other three axes
-    degrade into. The only crash-safe way to do this axis is to write
-    every file's new-format data to freshly allocated blocks first and
-    flip pointers last — which is `convert`'s shape exactly, aimed at
-    the same volume's free space instead of a second one. Not cheaper
-    than `convert`; `convert` covers it once it exists, and this axis
-    gets no separate in-place path.
+- **Changing a volume's dostype in place, with data on disk** —
+  tracked as GitHub issue #3. Three axes (intl, dircache, long-name),
+  not four: FFS/OFS is excluded, waiting on `convert` instead.
 
 - **CLI tools**, matching and eventually exceeding amitools' `xdftool`
-  and `xdfscan` — the two GPL programs this crate has run as an oracle
-  throughout, never copied from, so a from-scratch permissively-licensed
-  equivalent is a real gap in the ecosystem this crate already fills for
-  the library side. A `bin/` alongside the library, thin: every command
-  below already has a corresponding library call, so the CLI is
-  argument parsing and formatting, not new filesystem logic.
+  and `xdfscan` — tracked as GitHub issue #4. `xdftool`-equivalent
+  inspection/editing/pack/unpack (through `.uaem` sidecars, the
+  WinUAE/FS-UAE/Copperline convention) and repack/defrag,
+  `xdfscan`-equivalent batch validate with an optional `--repair`
+  this crate can offer that `xdfscan` cannot, and `convert` (new, no
+  `xdftool` equivalent — building a fresh volume at a different block
+  size, gated on a small `amiga-rdb` composition gap: `convert`'s
+  destination needs one type satisfying `BlockMedium`, and
+  `PartitionSource`/`PartitionSink` are two separate types today).
 
-  **`xdftool` equivalent** — inspection (`list` with `all`/`info`/detail,
-  `type`, `info`/statistics from `Bitmap`, `read` extracting a tree via
-  `Volume::read_file`/`read_dir`, `blkdev` geometry), editing (`create`
-  + `format` over every variant this crate already supports —
-  `xdftool` cannot touch `DOS\6`/`DOS\7` or `dircache` at creation, this
-  crate's `format()` already can; `boot show`/`read`/`write`/`clear` —
-  `install`, writing real boot code, is out of scope per the crate's
-  own non-goals, "bytes in, bytes out"; `makedir`/`write`/`delete`/
-  `protect`/`comment`/`time`/`relabel` over `Mutator`), and low-level
-  (`bitmap info`/`free`/`used`/`find` over `Bitmap`, `block dump` over
-  raw reads). `pack`/`unpack` map onto `populate_from_tree` and the
-  reverse walk — but through **`.uaem` sidecar files** (`Name.ext` +
-  a `Name.ext.uaem` text file beside it), not `xdftool`'s own
-  `.xdfmeta`: `.uaem` is the convention WinUAE, FS-UAE and Copperline's
-  directory-filesystem mounts already use for exactly this problem —
-  Copperline's own doc names precisely what a host filesystem cannot
-  hold: "protection bits such as script/pure/archive, file comments,
-  and exact datestamps" (`docs/guide/configuration.md`), read when
-  present and written back when they change, hidden from guest
-  listings, delete-protection honoured — written only when a file's
-  attributes actually need one, no sidecar for an ordinary file with
-  default permissions, so a tree this crate unpacks is mountable
-  directly by any of the three, and a tree any of them wrote is
-  packable straight back by this crate. `repack` —
-  `Mutator::compact` with a CLI wrapped around it — gets its own named
-  `defrag` alias (`--dry-run` reporting what would move and the
-  before/after run counts, since a full compact rewrites most of a
-  volume and callers deserve a preview before committing to one;
-  `--headers`/`--data-only` selecting `compact`'s two tiers) — and
-  unlike `xdftool`'s repack (which admits the same non-interruptible
-  move phase ReOrg's manual admits — see the layout survey) this
-  crate's already never produces worse than a leak.
-
-  **New**, with no `xdftool` equivalent: `convert` — build a fresh
-  volume at a different block size (or variant) from an existing one.
-  Not a resize; PLAN.md's own reasoning for why block size cannot
-  change in place (every derived layout constant — hash-table size,
-  data-pointer capacity, bitmap bits-per-page, OFS payload size — is a
-  function of it, so every block's shape changes, not just which
-  block number holds it) makes this the transcode `resize` explicitly
-  is not: open the source, `format()` the destination at the new
-  block size, walk the source tree, `Populator`/`Mutator`-create each
-  entry into the destination. A thin CLI command over library calls
-  this crate already has, and the natural place for the block-size
-  question raised in conversation (2026-09-09) to live once it is
-  more than a curiosity.
-
-  Source and destination need not be the same medium, the same size,
-  or even the same partition table — `convert` only ever sees "a
-  place to read a tree from" and "a place to format and write one
-  into", so converting between two partitions on two different HDFs
-  is the same operation as converting within one file. `amiga-rdb`
-  already composes the *read* side of this: `PartitionSource::new`
-  wraps any `Partition` entry into its own windowed `BlockSource`,
-  hostile-`PART`-block-checked (a saturated `start_lba` refused by a
-  checked-add, a second bound against the parent's own block count).
-  **Gap, confirmed against `amiga-rdb` 0.4.0 (2026-09-10) rather than
-  assumed**: `PartitionSource` is `BlockSource` only, and `PartitionSink`
-  is a named, unticked box in `amiga-rdb`'s own plan — deferred *on
-  purpose*: "it is an API with no caller, and building it now would be
-  guessing... revisit when a real consumer asks." `convert` is that
-  consumer. Until `PartitionSink` lands, `convert`'s destination is a
-  whole raw image, no partition table — and when it's time to build
-  `convert` for real, the right move is asking `amiga-rdb` for exactly
-  this (bounds-checked per-write, a flush, whatever a grow-into-free-
-  space story needs), not guessing at its shape from this side either.
-  The destination's own capacity (from its `Partition` entry or a
-  whole image's size) is checked the same way `format()`/`Populator`
-  already refuse an undersized target — cleanly, not by corrupting.
-
-  **`xdfscan` equivalent** — batch `validate()` over a directory of
-  images, one-line-per-image summaries (`ok`/`NOK`/`nofs`/`NDOS`),
-  verbose per-finding output straight from `Report`'s typed `Finding`s
-  (a strictly more informative verbose mode is free: `xdfscan` reports
-  block numbers and categories, this crate's findings already state
-  each one's *consequence* in `Display`), `-D`/`-H` media-type filters,
-  and — beyond what `xdfscan` offers — an optional `--repair` pass
-  using `Volume::repair()`, since this crate is the first of the two
-  that can fix what it finds rather than only report it.
-
-  Comparison suite: run both tools over the same fixture directory
-  (synthetic + xdftool-generated + fstool-generated) and diff the
-  reports — the differential discipline this crate already applies to
-  the library, extended to the CLI's own output.
-
-- **muFS**: the MultiUser filesystem is explicitly in scope for this
-  crate — it is not another family but FFS with the owner field and
-  extended permission bits actually used and enforced; same blocks,
-  same hashing, same chains. Independently confirmed by AROS's
-  `afs.handler`, which mounts exactly two dostype families: `DOS` and
-  `muFS`. Deferred, not excluded: no milestone
-  depends on it, and the metadata work above (owner longword and full
-  protection long read as first-class on *every* variant) means adding
-  it later is dostype acceptance plus a survey, not a rework. That
-  survey — which dostype values real muFS volumes carry (`muFS` =
-  0x6D754653 is documented; whether per-variant `muF\x` forms exist in
-  the wild) — happens when the add-on does. Enforcement semantics stay
-  with the consumer either way: the crate reports ownership, it doesn't
-  police it.
+- **muFS**: in scope, deferred — tracked as GitHub issue #5. Needs a
+  survey of real muFS volumes' dostype values before scheduling.
 
 ## Cross-cutting
 
@@ -2077,16 +1918,14 @@ re-run after each change.
       released), carrying all three milestones rather than the
       read-only surface this box originally anticipated. Version 0.1
       is the primitives section above; 0.2 is read, create and mutate.
-- [ ] `#![deny(missing_docs)]` and the API-surface pass that earns a
-      1.0. Every public item *is* documented — the crate would very
-      nearly pass the lint today — but turning it on is a promise
-      about the surface, and the surface is worth one deliberate read
-      first: `Populator` and `Mutator` grew from opposite ends and
-      overlap (`Metadata` vs `MetaUpdate`, two ways to create a file);
-      `Volume`'s inherent-impl surface is now spread over six modules;
-      and the error types have multiplied (`Error`, `FormatError`,
-      `AllocError`, `MutateError`, `PopulateError`) in ways that are
-      right per-operation but worth checking read as one crate.
+- [x] `#![deny(missing_docs)]` and the API-surface pass that earns a
+      1.0 — landed (commit `e278335`). The pass found no renames
+      needed: `Populator`/`Mutator` sharing verbs, `Metadata` vs
+      `MetaUpdate`, and the error-type-per-operation-family shape all
+      turned out to be contract, not accident, and are now stated once
+      in `lib.rs`'s "shape of the API" section. `deny(missing_docs)`
+      found exactly one gap (`BlockSource::Error`) across the whole
+      public surface.
 
 ## Non-goals
 
