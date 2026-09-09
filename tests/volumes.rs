@@ -25,6 +25,11 @@ pub enum MemError {
     /// The medium stopped accepting writes: what a crash looks like from
     /// inside the crate, injected by [`MemDisk::fail_after`].
     Crashed { lba: u64 },
+    /// One read of this block failed and will succeed if retried: a
+    /// flaky sector or a transient bus error, injected by
+    /// [`MemDisk::fail_read_once`]. Not proof of anything about the
+    /// block's own bytes.
+    Glitched { lba: u64 },
 }
 
 impl std::fmt::Display for MemError {
@@ -33,6 +38,7 @@ impl std::fmt::Display for MemError {
             Self::BadBufferLen { got, want } => write!(f, "buffer of {got} bytes, want {want}"),
             Self::OutOfRange { lba, blocks } => write!(f, "lba {lba} of {blocks}"),
             Self::Crashed { lba } => write!(f, "the medium died writing lba {lba}"),
+            Self::Glitched { lba } => write!(f, "a transient read failure on lba {lba}"),
         }
     }
 }
@@ -57,6 +63,12 @@ pub struct MemDisk {
     /// sequence, which is the only way to check a crash-ordering claim
     /// at every point rather than at one convenient one.
     fail_after: Option<usize>,
+    /// Fail the *next* read of this LBA once, then behave again -- a
+    /// flaky sector or a transient bus error, not a crash. What a
+    /// transport-level `Io` error looks like from inside the crate,
+    /// distinct from [`MemDisk::fail_after`], which models the medium
+    /// staying dead.
+    fail_read_once: Option<u64>,
 }
 
 impl BlockSource for MemDisk {
@@ -67,6 +79,10 @@ impl BlockSource for MemDisk {
     }
 
     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        if self.fail_read_once == Some(lba) {
+            self.fail_read_once = None;
+            return Err(MemError::Glitched { lba });
+        }
         if buf.len() != self.bs {
             return Err(MemError::BadBufferLen {
                 got: buf.len(),
@@ -137,6 +153,7 @@ impl MemDisk {
             writes: Vec::new(),
             reads: Vec::new(),
             fail_after: None,
+            fail_read_once: None,
         }
     }
 
@@ -149,6 +166,7 @@ impl MemDisk {
             writes: Vec::new(),
             reads: Vec::new(),
             fail_after: None,
+            fail_read_once: None,
         }
     }
 
@@ -191,6 +209,13 @@ impl MemDisk {
     /// Start refusing writes once `n` more have been accepted.
     pub fn fail_after(&mut self, n: usize) {
         self.fail_after = Some(self.writes.len() + n);
+    }
+
+    /// Fail the very next read of `lba` with [`MemError::Glitched`], then
+    /// go back to behaving normally. A flaky sector, not a crash: the
+    /// block's actual content is fine, and reading it again works.
+    pub fn fail_read_once(&mut self, lba: u64) {
+        self.fail_read_once = Some(lba);
     }
 
     /// The medium is fixed: stop refusing writes. What a crash-sweep test
@@ -736,6 +761,7 @@ impl Builder {
             writes: Vec::new(),
             reads: Vec::new(),
             fail_after: None,
+            fail_read_once: None,
         }
     }
 
@@ -746,6 +772,7 @@ impl Builder {
             writes: Vec::new(),
             reads: Vec::new(),
             fail_after: None,
+            fail_read_once: None,
         }
     }
 }
@@ -2274,7 +2301,11 @@ fn an_invalid_bitmap_flag_is_surfaced_rather_than_hidden() {
 }
 
 #[test]
-fn a_bitmap_page_with_a_bad_checksum_is_refused() {
+fn a_bitmap_page_with_a_bad_checksum_is_named_and_excluded() {
+    // A bad page does not abort the read: its own bits are unknown, but
+    // that is a fact about this one page, not the whole bitmap. Aborting
+    // here is exactly what used to take down `validate()`'s entire
+    // bitmap-analysis phase for every OTHER page too.
     let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Broken");
     let root = b.root_lba();
     b.add(root, b"File", b"", EntryKind::File, 0);
@@ -2284,10 +2315,13 @@ fn a_bitmap_page_with_a_bad_checksum_is_refused() {
     // bitmap block keeps its checksum rather than longword 5.
     b.poke(pages[0], 64, 0x1234_5678);
     let mut vol = Volume::open(b.finish(), None).unwrap();
-    assert!(matches!(
-        vol.read_bitmap(),
-        Err(Error::Checksum { lba }) if lba == pages[0]
-    ));
+    let bm = vol.read_bitmap().unwrap();
+    assert_eq!(bm.bad_pages(), &[pages[0]]);
+    // A single-page volume: every block it would have described --
+    // including the page's own LBA, allocated within the range it
+    // covers -- reads as "cannot assess", not as a wrong yes or no.
+    assert!(!bm.covers(pages[0]));
+    assert_eq!(bm.is_allocated(pages[0]), None);
 }
 
 #[test]
@@ -2424,6 +2458,74 @@ fn validate_reports_a_leaked_block_and_a_double_allocation_separately() {
     );
     assert_eq!(report.summary.reachable_but_free, 1);
     assert_eq!(report.summary.orphans, 0);
+}
+
+#[test]
+fn validate_bitmap_survives_one_bad_page() {
+    // A volume with two bitmap pages: one intact, one whose checksum is
+    // broken. The bug this guards against is `validate()` treating
+    // `read_bitmap()`'s single `Result` as all-or-nothing -- one bad page
+    // aborting the whole bitmap-analysis phase and silently skipping the
+    // orphan/reachable-but-free comparison (and the allocated/free
+    // summary) for every OTHER page too, intact or not.
+    let per_page = bitmap_bits_per_block(512);
+    // RESERVED (2) + a bit more than one page's worth of blocks, so
+    // `add_bitmap` needs exactly two pages.
+    let nblocks = 2 + per_page + 50;
+    let mut b = Builder::new(Variant::FfsIntl, 512, nblocks, b"TwoPages");
+    let root = b.root_lba();
+    // Allocated well inside page 0's range, since data blocks are handed
+    // out before the bitmap pages themselves.
+    let f = b.add_file(root, b"Payload", b"", &pattern(3000));
+    let pages = b.add_bitmap(true);
+    assert_eq!(pages.len(), 2, "test volume should need two bitmap pages");
+    let victim = f.data[2];
+    assert!(victim < pages[0], "victim should be covered by page 0");
+
+    let mut disk = b.finish();
+
+    // Free the victim's bit on the intact page, the same way the
+    // existing leak/double-allocation test does: it is reachable (a
+    // file's data block) but the bitmap will say free.
+    let bit = victim - 2;
+    let off = OFF_BITMAP_BITS + (bit / 32) as usize * 4;
+    let mut page0 = vec![0u8; 512];
+    disk.read_block(pages[0], &mut page0).unwrap();
+    let w = be32(&page0, off) | 1 << (bit % 32);
+    page0[off..off + 4].copy_from_slice(&w.to_be_bytes());
+    page0[0..4].copy_from_slice(&0u32.to_be_bytes());
+    let ck = checksum_compute(&page0, BITMAP_CHECKSUM_INDEX);
+    page0[0..4].copy_from_slice(&ck.to_be_bytes());
+    disk.poke_block(pages[0], &page0);
+
+    // Corrupt page 1's checksum -- one longword of bits, no recompute.
+    let mut page1 = vec![0u8; 512];
+    disk.read_block(pages[1], &mut page1).unwrap();
+    page1[OFF_BITMAP_BITS] ^= 0xFF;
+    disk.poke_block(pages[1], &page1);
+
+    let mut vol = Volume::open(disk, None).unwrap();
+    let report = vol.validate();
+
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::Checksum { lba } if *lba == pages[1])),
+        "expected the bad page itself to be reported: {:?}",
+        report.findings
+    );
+    // The dangerous finding, on the OTHER, intact page -- must not be
+    // skipped just because page 1 was unreadable.
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::ReachableButFree { lba } if *lba == victim)),
+        "one bad bitmap page must not suppress ReachableButFree on another: {:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.reachable_but_free, 1);
 }
 
 #[test]
@@ -2952,6 +3054,40 @@ fn format_refuses_what_it_cannot_write() {
         amiga_ffs::format(&mut odd, &opts).unwrap_err(),
         FormatError::BadBlockSize(256)
     ));
+}
+
+#[test]
+fn format_refuses_a_reserved_too_small_for_the_boot_area() {
+    // `reserved == 0` means the boot-area write loop (`for lba in
+    // 0..reserved`) writes nothing: the dostype never reaches block 0,
+    // so `Volume::open` cannot identify the volume at all, and block 0
+    // is simultaneously covered by the bitmap as an ordinary, allocatable
+    // free block -- a later allocation could hand it out and overwrite
+    // whatever a caller expected to find there. Only `reserved >=
+    // block_count` was refused before this test; `reserved == 0` (and,
+    // on a 512-byte-block volume, `reserved == 1`, which is not enough
+    // to hold the two-sector boot area either) must be refused too.
+    let mut disk = MemDisk::blank(512, 1760);
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Vol").reserved(0);
+    let err = amiga_ffs::format(&mut disk, &opts).unwrap_err();
+    assert!(
+        matches!(err, FormatError::ReservedTooSmall { reserved: 0, .. }),
+        "{err:?}"
+    );
+    // Nothing was written while refusing it.
+    assert!(disk.block(0).iter().all(|&b| b == 0));
+
+    // One block is still not enough at 512 bytes: the boot area is two
+    // 512-byte sectors regardless of the filesystem's own block size.
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Vol").reserved(1);
+    assert!(matches!(
+        amiga_ffs::format(&mut disk, &opts).unwrap_err(),
+        FormatError::ReservedTooSmall { reserved: 1, .. }
+    ));
+
+    // Two is exactly enough, and formats normally.
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Vol").reserved(2);
+    amiga_ffs::format(&mut disk, &opts).unwrap();
 }
 
 #[test]
@@ -4270,6 +4406,77 @@ fn allocate_run_reserves_one_contiguous_extent() {
 }
 
 #[test]
+fn allocate_run_finds_a_run_that_straddles_the_hints_own_split_point() {
+    // `allocate_run_from` scans forward from the hint to the end of the
+    // covered range, then wraps and scans from the start up to the
+    // hint -- two independent, disjoint scans. The bug: that split is
+    // drawn at the hint's own bit position, which is not a boundary the
+    // bitmap has any reason to respect. A single, genuinely contiguous
+    // free run that happens to have the hint land in its *middle* gets
+    // cut into two pieces by the two scans, and neither piece alone may
+    // be as long as the whole -- so an exact-length match that exists
+    // is missed, and the "longest run" fallback under-reports.
+    let nblocks = 2_000u64;
+    let mut vol = allocatable(Variant::FfsIntl, 512, nblocks);
+    let mut alloc = Allocator::load(&mut vol).unwrap();
+    let reserved = alloc.first_block();
+
+    // Allocate every block, then free one contiguous 60-block run in
+    // the middle of the volume and nothing else -- so the only free
+    // extent anywhere is that one run, and its true length is
+    // unambiguous.
+    loop {
+        match alloc.allocate() {
+            Ok(_) => {}
+            Err(AllocError::VolumeFull { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let run_start_bit = 970u64;
+    let run_len = 60u64;
+    for bit in run_start_bit..run_start_bit + run_len {
+        alloc.free(reserved + bit).unwrap();
+    }
+    assert_eq!(alloc.blocks_free(), run_len, "test setup: one free run");
+
+    // The hint lands squarely in the middle of that run -- bit 1000, 30
+    // blocks in from either end -- so neither the "from..covered" half
+    // nor the "0..from" half of the old two-piece scan sees more than
+    // 30 free blocks on its own, even though 60 contiguous blocks are
+    // actually free right there.
+    let hint_bit = 1000u64;
+    assert!(
+        (run_start_bit..run_start_bit + run_len).contains(&hint_bit),
+        "test setup: the hint must fall inside the free run"
+    );
+    let hint_lba = reserved + hint_bit;
+
+    let want = 50u64;
+    assert!(
+        want > (hint_bit - run_start_bit).max(run_start_bit + run_len - hint_bit),
+        "test setup: `want` must exceed either half alone, or this proves nothing"
+    );
+    let got = alloc
+        .allocate_run(
+            want,
+            Intent::DataFor {
+                header_lba: hint_lba,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        got.len(),
+        want as usize,
+        "a {run_len}-block contiguous run exists and covers the request; splitting the \
+         scan at the hint must not hide it: {:?}",
+        got.iter().map(|a| a.block()).collect::<Vec<_>>()
+    );
+    for w in got.windows(2) {
+        assert_eq!(w[1].block(), w[0].block() + 1);
+    }
+}
+
+#[test]
 fn allocate_run_degrades_gracefully_when_no_run_is_that_long() {
     // A volume punched into small, evenly spaced holes: no contiguous
     // run anywhere near as long as a caller is about to ask for, which
@@ -4798,7 +5005,10 @@ fn repair_rewrites_a_bitmap_page_whose_checksum_is_gone() {
     buf[16] ^= 0xFF;
     disk.poke_block(page, &buf);
     let mut vol = Volume::open_with(disk, None, 1760, 2).unwrap();
-    assert!(vol.read_bitmap().is_err(), "the page no longer sums");
+    // The page no longer sums, but `read_bitmap` no longer aborts for it:
+    // the page is named and its range excluded, not treated as proof the
+    // whole bitmap is unreadable.
+    assert_eq!(vol.read_bitmap().unwrap().bad_pages(), &[page]);
 
     let done = vol.repair(&RepairOptions::new()).unwrap();
     assert!(
@@ -4900,6 +5110,73 @@ fn severing_is_opt_in_and_cuts_only_what_will_not_read() {
     let root = vol.root_lba();
     assert!(vol.lookup(root, b"Doomed").unwrap().is_none());
     assert_tree_intact(&mut vol);
+}
+
+#[test]
+fn sever_does_not_cut_on_a_transient_io_error() {
+    // A real three-entry hash chain, the same way
+    // `hash_collisions_walk_the_chain` builds one. The middle link's
+    // block is perfectly good; the disk glitches reading it exactly
+    // once. `Error::Io` is not proof about the block's own bytes -- only
+    // that this one read attempt failed -- so `sever` must not treat it
+    // as license to cut the chain and leak the tail behind it.
+    let slots = hash_table_size(512);
+    let mut buckets: std::collections::HashMap<u32, Vec<Vec<u8>>> = Default::default();
+    let mut colliding = None;
+    for i in 0..5000u32 {
+        let name = format!("flaky{i}").into_bytes();
+        let h = name_hash(&name, Variant::Ffs.fold(), slots);
+        let e = buckets.entry(h).or_default();
+        e.push(name);
+        if e.len() == 3 {
+            colliding = Some(e.clone());
+            break;
+        }
+    }
+    let group = colliding.expect("three names must collide within 5000");
+
+    let mut b = Builder::new(Variant::Ffs, 512, 512, b"Flaky");
+    let root = b.root_lba();
+    for n in &group {
+        b.add(root, n, b"", EntryKind::File, 0);
+    }
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    let mid = vol.lookup(root, &group[1]).unwrap().expect("chained").lba;
+    let tail_lba = vol.lookup(root, &group[2]).unwrap().expect("chained").lba;
+
+    let before = allocated_set(&mut vol);
+    let mut disk = vol.into_inner();
+    disk.fail_read_once(mid);
+    let mut vol = Volume::open_with(disk, None, 512, 2).unwrap();
+
+    let done = vol.repair(&RepairOptions::new().sever(true)).unwrap();
+    assert_eq!(done.severed, 0, "an Io error is not proof of corruption");
+    assert!(
+        done.actions
+            .iter()
+            .any(|a| matches!(a, Action::Unverified { lba } if *lba == mid)),
+        "{:?}",
+        done.actions
+    );
+    assert!(
+        !done
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::ChainTruncated { .. })),
+        "nothing should have been cut: {:?}",
+        done.actions
+    );
+
+    // The glitch was one-shot: the chain is intact on disk, and the
+    // repair's own walk (which reads every block again) finds the tail
+    // exactly where it always was.
+    let report = vol.validate();
+    assert!(report.is_clean(), "{:?}", report.findings);
+    let after = allocated_set(&mut vol);
+    assert_eq!(before, after);
+    assert!(vol.lookup(root, &group[2]).unwrap().is_some());
+    let _ = tail_lba;
 }
 
 #[test]

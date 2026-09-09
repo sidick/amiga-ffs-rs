@@ -681,10 +681,14 @@ impl<E> Allocator<E> {
     ///
     /// **Fallback semantics, precisely:** this scans for a run of exactly
     /// `n` free blocks the same way [`Allocator::allocate_near`] scans for
-    /// one (forward from the hint, wrapping once). If a run that long
-    /// exists, all `n` blocks are marked allocated and returned. If none
-    /// does, the *longest* free run anywhere on the volume is marked and
-    /// returned instead — fewer than `n` blocks, but still one contiguous
+    /// one (forward from the hint, wrapping once). The hint only orders
+    /// *preference*, never where a run is measured from: a free run that
+    /// happens to have the hint fall in its middle is still one run, its
+    /// whole length counted, not two shorter ones split at the hint. If a
+    /// run that long exists, all `n` blocks are marked allocated and
+    /// returned. If none does, the *longest* free run anywhere on the
+    /// volume is marked and returned instead — fewer than `n` blocks, but
+    /// still one contiguous
     /// run, never a scatter of leftovers from several holes. The only
     /// error is [`AllocError::VolumeFull`], and only when there is no free
     /// block at all; `n == 0` returns an empty run without touching the
@@ -725,31 +729,48 @@ impl<E> Allocator<E> {
             None => self.cursor.min(covered),
         };
 
-        let exact = self
-            .find_run(from, covered, n)
-            .or_else(|| self.find_run(0, from, n));
+        // Every maximal free run in the whole covered range, found in
+        // one unbroken pass. Scanning `from..covered` and `0..from` as
+        // two separate calls (this used to) draws a boundary at `from`
+        // that the bitmap itself has no reason to respect: a genuinely
+        // contiguous free run that happens to have the hint land in its
+        // *middle* is cut into two shorter pieces by the two scans, and
+        // an exact-length match that plainly exists in the unbroken run
+        // can be missed because neither piece alone is long enough —
+        // and the "longest run" fallback under-reports for the same
+        // reason.
+        let runs: Vec<(u64, u64)> = self.runs(0, covered).collect();
+
+        // Distance forward from `from`, wrapping once at `covered` —
+        // the same preference order the two-piece scan used to give
+        // for free, restated so it survives not splitting the scan.
+        let rank = |start: u64| {
+            if start >= from {
+                start - from
+            } else {
+                covered - from + start
+            }
+        };
+
+        let exact = runs
+            .iter()
+            .copied()
+            .filter(|&(_, len)| len >= n)
+            .min_by_key(|&(start, _)| rank(start));
 
         let (start, len) = match exact {
             // A run of at least `n` exists: take exactly `n` blocks of
             // it, not the whole (possibly longer) run it was found in.
             Some((start, _)) => (start, n),
-            // None does: the longest run in either half, checking both
-            // rather than stopping at the first that has anything, so
-            // "longest" is not just "first found while wrapping."
-            None => {
-                let after = self.longest_run(from, covered, 1);
-                let before = self.longest_run(0, from, 1);
-                match (after, before) {
-                    (Some(a), Some(b)) if b.1 > a.1 => b,
-                    (Some(a), _) => a,
-                    (None, Some(b)) => b,
-                    (None, None) => {
-                        return Err(AllocError::VolumeFull {
-                            block_count: self.block_count,
-                        })
-                    }
+            // None does: the single longest run anywhere in the volume.
+            None => match runs.into_iter().max_by_key(|&(_, len)| len) {
+                Some(r) => r,
+                None => {
+                    return Err(AllocError::VolumeFull {
+                        block_count: self.block_count,
+                    })
                 }
-            }
+            },
         };
 
         let mut out = Vec::with_capacity(len as usize);
@@ -765,21 +786,6 @@ impl<E> Allocator<E> {
         }
         self.cursor = start + len;
         Ok(out)
-    }
-
-    /// The first run of at least `want` consecutive free bits in
-    /// `from..to`, or `None` if no run that long exists there.
-    fn find_run(&self, from: u64, to: u64, want: u64) -> Option<(u64, u64)> {
-        self.runs(from, to).find(|&(_, len)| len >= want)
-    }
-
-    /// The single longest run of free bits in `from..to`, at least
-    /// `want` long, or `None` if the range has no free bit at all (or
-    /// none as long as `want`).
-    fn longest_run(&self, from: u64, to: u64, want: u64) -> Option<(u64, u64)> {
-        self.runs(from, to)
-            .filter(|&(_, len)| len >= want)
-            .max_by_key(|&(_, len)| len)
     }
 
     /// Every maximal run of free bits in `from..to`, as `(start, len)`,

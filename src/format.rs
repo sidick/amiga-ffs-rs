@@ -122,6 +122,24 @@ pub enum FormatError<E> {
         /// Blocks in the volume.
         block_count: u64,
     },
+    /// `reserved` is too small to hold this block size's boot area
+    /// ([`BOOT_AREA_LEN`] bytes).
+    ///
+    /// `reserved == 0` is the sharpest shape of this: the boot-area write
+    /// loop is `for lba in 0..reserved`, so it writes *nothing* — the
+    /// dostype never reaches block 0, `Volume::open` cannot identify the
+    /// volume it just wrote, and block 0 is simultaneously covered by
+    /// the bitmap as an ordinary allocatable block, so a later
+    /// allocation can hand it out and overwrite whatever a caller
+    /// expected to find there. A `reserved` that covers only part of the
+    /// boot area (one block at 512 bytes, where the area is two sectors)
+    /// has the same problem with the second sector.
+    ReservedTooSmall {
+        /// What the caller asked for.
+        reserved: u64,
+        /// The fewest blocks this block size's boot area needs.
+        min_reserved: u64,
+    },
     /// The volume has no room for the metadata an empty filesystem needs:
     /// a root block, at least one bitmap page, and on `DOS\4`/`DOS\5` a
     /// dircache block.
@@ -188,6 +206,13 @@ impl<E: fmt::Display> fmt::Display for FormatError<E> {
             } => write!(
                 f,
                 "{reserved} reserved blocks leaves nothing of a {block_count}-block volume"
+            ),
+            Self::ReservedTooSmall {
+                reserved,
+                min_reserved,
+            } => write!(
+                f,
+                "{reserved} reserved blocks cannot hold the boot area; {min_reserved} are needed"
             ),
             Self::VolumeTooSmall {
                 block_count,
@@ -377,6 +402,19 @@ pub fn format<S: BlockSink>(
     check_name(name)?;
     if block_count > u64::from(u32::MAX) {
         return Err(FormatError::VolumeTooLarge { block_count });
+    }
+    // The boot area is two 512-byte sectors' worth of bytes,
+    // [`BOOT_AREA_LEN`], regardless of the filesystem's own block size;
+    // `reserved` blocks have to be enough to hold all of it, or the
+    // dostype (and the boot-area write below, `for lba in 0..reserved`)
+    // never reaches the disk at all when `reserved == 0`, and reaches it
+    // only partly otherwise.
+    let min_reserved = div_ceil(BOOT_AREA_LEN as u64, bs as u64);
+    if reserved < min_reserved {
+        return Err(FormatError::ReservedTooSmall {
+            reserved,
+            min_reserved,
+        });
     }
     if reserved >= block_count {
         return Err(FormatError::BadReserved {

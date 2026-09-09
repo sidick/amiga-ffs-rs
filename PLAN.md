@@ -215,6 +215,43 @@ than `cargo test` can reach.
       cross-directory one and each hash slot's own per-chain one).
       Landed alongside the milestone-3 `Mutator::volume()` fix above,
       from the same review pass.
+- [x] **`validate()`'s bitmap phase stopped aborting on one bad page**
+      (2026-09-09, found by independent review). `Volume::read_bitmap`
+      read every bitmap page in one loop and returned a single `Result`
+      for the whole bitmap; one page failing its checksum made the whole
+      call `Err`, and `validate_bitmap` responded to that `Err` by
+      recording one `Finding::Checksum` and returning — skipping
+      coverage marking, `BitmapIncomplete`, and the entire
+      orphan/reachable-but-free comparison for *every other page too*,
+      intact or not, on the whole volume. Confirmed with a failing test
+      (`validate_bitmap_survives_one_bad_page`): a two-bitmap-page volume
+      with page 1's checksum flipped and a genuine `ReachableButFree`
+      block sitting on the still-intact page 0 — before the fix,
+      `validate()` reported only the `Checksum` finding on page 1 and
+      said nothing about the dangerous double-allocation risk on page 0,
+      exactly the failure mode this module's own doc comment says the
+      rest of the validator never has ("a directory whose third hash
+      chain is corrupt still yields the other seventy-one" — the bitmap
+      phase alone did not live up to it). Fixed in `Bitmap` rather than
+      `validate()`, judged the smaller and more honest fix: `read_bitmap`
+      now treats a page's checksum failure as a fact about *that page
+      only* — it records the page's LBA in the new `Bitmap::bad_pages`,
+      leaves a same-length placeholder of zero words so every later
+      page's block-to-word indexing stays correct, and keeps reading.
+      `Bitmap::covers` (and everything built on it — `is_free`,
+      `covered`, `covered_count`, `allocated_count`, `free_count`)
+      excludes a bad page's block range, answering "cannot assess"
+      rather than a wrong yes or no for those blocks specifically, and
+      `validate_bitmap` now pushes one `Finding::Checksum` per bad page
+      and runs the normal comparison over everything else regardless. An
+      `Io` error reading a page (a transport failure, not a checksum
+      mismatch) is unchanged and still aborts the whole read — narrower
+      in scope than the per-page checksum case, and not part of what
+      this review item asked for. Two existing tests asserted the old
+      all-or-nothing contract directly
+      (`a_bitmap_page_with_a_bad_checksum_is_refused`,
+      `repair_rewrites_a_bitmap_page_whose_checksum_is_gone`) and were
+      updated to the new one rather than left pinning the bug.
 
 ## Milestone 2 — create
 
@@ -254,6 +291,28 @@ it under a real Kickstart 3.1.
       `DOS\1` and a `DOS\3` ADF this crate formatted, and the two
       implementations' fresh images agree longword for longword bar the
       dates and the root's longword −4.
+      **2026-09-09, as-built — a separate independent-review pass, this
+      one over `format()`.** Only `reserved >= block_count` was refused; `reserved ==
+      0` formatted without complaint. The boot-area write is `for lba in
+      0..reserved`, so `reserved == 0` writes *nothing* there — the
+      dostype never reaches block 0, meaning `Volume::open` cannot
+      identify the volume this call just claimed to have formatted — and
+      block 0 is simultaneously covered by the bitmap as an ordinary
+      free block, so a later allocation can hand it out and a caller
+      writes over whatever it expected to find there. `reserved == 1` on
+      a 512-byte-block volume has the same problem in miniature: the
+      boot area is [`BOOT_AREA_LEN`] (1024 bytes, two 512-byte sectors)
+      regardless of the filesystem's own block size, and one block is
+      only half of it. Fixed with a new refusal,
+      `FormatError::ReservedTooSmall { reserved, min_reserved }`, checked
+      before the existing `BadReserved` (which only ever catches
+      `reserved` too *large*): `min_reserved` is
+      `div_ceil(BOOT_AREA_LEN, block_size)`, the same arithmetic
+      `format()`'s own boot-area write already depends on, so the check
+      and the write it protects cannot drift apart. Tested
+      (`format_refuses_a_reserved_too_small_for_the_boot_area`):
+      `reserved: 0` and `reserved: 1` both refused at 512 bytes,
+      `reserved: 2` (`DEFAULT_RESERVED`) still formats normally.
 - [x] **Populate from tree**: `Populator` in `src/populate.rs`, and
       `populate_from_tree()` on top of it under `std`. Files, directories,
       protection/comment/date/owner, both name layouts (with the
@@ -850,6 +909,36 @@ observe.
       this crate repaired. A prerequisite for resize, which must rebuild
       the bitmap rather than hand FFS an invalid flag the way AmiPart
       does.
+
+      **2026-09-09, as-built — the same later independent-review pass as
+      above, this time in `sever`.** This module's own documentation says
+      severing may
+      cut only "what the ordinary reader has *proved* it cannot follow"
+      — but the code routed every refusal `entry_at`/`comment` could
+      return through `.ok()`, so `Error::Io` (a transport-level read
+      failure: a flaky sector, a transient bus error) was treated as the
+      same proof as `Error::Checksum` or `Error::NotHeader` (the reader
+      having actually looked at the block's bytes and found them wrong).
+      An `Io` error proves nothing about the block's content — only that
+      this one attempt to read it failed — so severing on it cuts a
+      chain, or clears a comment pointer, that may be perfectly intact.
+      Confirmed with a failing test
+      (`sever_does_not_cut_on_a_transient_io_error`, using a new
+      `MemDisk::fail_read_once` that fails exactly one read of a chosen
+      block and then behaves normally, the read-side counterpart to the
+      existing `fail_after` write-crash injector): a genuine three-entry
+      hash chain, its middle link's block perfectly good, one glitched
+      read of it — before the fix, `repair(&RepairOptions{sever: true,
+      ..})` truncated the chain there and leaked the tail behind it, for
+      a block with nothing wrong with it. Fixed by distinguishing
+      `Error::Io` from every other refusal at both sever sites (the
+      chain walk and the comment-pointer check): an `Io` error now cuts
+      nothing, pushes a new `Action::Unverified { lba }` instead of
+      `ChainTruncated`/`CommentPointerCleared`, and the walk moves on
+      leaving the pointer exactly as it was — matching this module's own
+      stated rule rather than a superset of it. Every other error
+      (`Checksum`, `NotHeader`, `UnknownSecondaryType`, and the existing
+      cycle/out-of-range checks) still severs exactly as before.
 - [x] **`unlink`/`release`: the create-then-unlink split** (2026-09-08,
       after M3 itself was landed — a FUSE-adapter requirement surfaced
       while designing that consumer, not something the original wave
@@ -1391,6 +1480,45 @@ property of every image shipped, not a tuning detail.
   (`tier2_relocating_a_link_targets_header_repoints_every_link`) — the
   behaviour the `entry.real_entry == 0` branch already got right, pinned
   alongside the fix rather than left implicit.
+
+  **2026-09-09, as-built — a separate independent-review pass, this one
+  over `allocate_run`.** `allocate_run_from`'s exact-match search split
+  the covered range into two disjoint scans — `from..covered` then
+  `0..from`, where `from` is the hint's own bit position — and the
+  "longest run" fallback did the same split. Neither piece is a real
+  boundary in the bitmap; it is only where the scan happens to prefer to
+  start. A single, genuinely contiguous free run that has the hint land
+  in its *middle* was therefore measured as two shorter runs, one per
+  side of the split, and an exact-length match that plainly exists in
+  the unbroken run could be missed because neither half alone reached
+  `n` — and the longest-run fallback under-reported for the same reason.
+  Confirmed with a failing test
+  (`allocate_run_finds_a_run_that_straddles_the_hints_own_split_point`):
+  a volume with every block allocated except one genuine 60-block run,
+  hinted dead in the middle of it (30 blocks either side), asking for 50
+  — before the fix, `allocate_run(50, ...)` returned only 30 blocks, the
+  length of whichever half the split happened to leave larger, despite
+  60 contiguous free blocks actually being there. **Reachable in
+  practice, not just a theoretical external-caller edge**: every
+  `Intent` hint (`DataFor`'s header LBA, `HeaderIn`'s directory LBA,
+  `MetadataNearRoot`'s root LBA) is a real, ordinary block number that
+  can legitimately land inside a large free extent — a deleted big file
+  leaving a large hole, and the next write's hint happening to fall
+  inside it, is a completely unremarkable sequence of events, not
+  something only a hostile caller could construct. Fixed by measuring
+  every maximal free run over the *whole* covered range in one
+  unbroken pass (`self.runs(0, covered)`, already the primitive both
+  the old `find_run` and `longest_run` helpers — now removed, their one
+  caller inlined — were built on) and choosing among the results by a
+  `rank` function restating the same preference order the two-piece
+  split used to give for free (distance forward from the hint,
+  wrapping once at `covered`, so a run at or after the hint always
+  outranks one before it) — without ever cutting a run's *measured
+  length* at that boundary. The exact-match search takes the
+  lowest-rank run of length at least `n`; the fallback takes the single
+  longest run found, full stop. `allocate_run_reserves_one_contiguous_extent`
+  and `allocate_run_degrades_gracefully_when_no_run_is_that_long`,
+  already covering the non-straddling cases, still pass unchanged.
 
   **Wave 3 landed**: passive reorganisation — `Mutator`'s own day-to-day
   writes now place blocks by `Intent` instead of by the bare hint they

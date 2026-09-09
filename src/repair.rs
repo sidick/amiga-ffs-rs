@@ -57,6 +57,14 @@
 //! parses and merely disagrees with its parent is not, and is left alone
 //! for a human. Nothing is severed that would drop a readable entry.
 //!
+//! [`Error::Io`] is not proof of anything about
+//! a block's own bytes — only that this one attempt to read it failed. A
+//! flaky sector or a transient bus error looks, from `.ok()`, identical
+//! to a checksum that is actually wrong, and treating the two the same
+//! would sever a live chain because a read glitched once. So an `Io`
+//! error cuts nothing: it produces [`Action::Unverified`] and the walk
+//! moves on, leaving the pointer exactly as it was for a later attempt.
+//!
 //! # Order of writes
 //!
 //! `bitmap_flag = 0` first, then the pages, then the extension blocks,
@@ -172,6 +180,18 @@ pub enum Action {
         /// The pointer that was there.
         was: u32,
     },
+    /// A chain link, or an entry's overflow comment, that could not be
+    /// read because of a transport failure rather than a structural
+    /// refusal.
+    ///
+    /// [`Error::Io`] proves nothing about the
+    /// block's own bytes -- only that this one read attempt failed -- so
+    /// nothing is cut and nothing is cleared. The block is left exactly
+    /// as it was, unlike every other member of this enum.
+    Unverified {
+        /// The block that would not read.
+        lba: u64,
+    },
 }
 
 impl fmt::Display for Action {
@@ -210,6 +230,11 @@ impl fmt::Display for Action {
             Self::CommentPointerCleared { lba, was } => write!(
                 f,
                 "block {lba}: comment pointer to block {was} zeroed; the block is not its comment"
+            ),
+            Self::Unverified { lba } => write!(
+                f,
+                "block {lba} could not be read (transport failure); left exactly as it was, \
+                 not proof of corruption"
             ),
         }
     }
@@ -563,15 +588,36 @@ impl<S: BlockMedium> Volume<S> {
                 let mut chain: BTreeSet<u64> = BTreeSet::new();
                 while next != 0 {
                     let lba = next as u64;
-                    let broken = chain.contains(&lba) || lba >= self.block_count();
-                    let entry = if broken {
-                        None
-                    } else {
-                        self.entry_at(lba).ok()
-                    };
-                    let entry = match entry {
-                        Some(e) => e,
-                        None => {
+                    // A cycle or an out-of-range pointer is proof on its
+                    // own -- no read needed to know this link cannot be
+                    // followed.
+                    if chain.contains(&lba) || lba >= self.block_count() {
+                        self.cut(dir, slot as u32, prev)?;
+                        rep.severed += 1;
+                        rep.push(Action::ChainTruncated {
+                            dir,
+                            slot: slot as u32,
+                            after: prev,
+                            dropped: lba,
+                        });
+                        break;
+                    }
+                    // `Error::Io` is not proof about this block's own
+                    // bytes, only that this attempt to read it failed --
+                    // a flaky sector or a transient bus error says
+                    // nothing about whether the chain is intact. Every
+                    // other error here (`Checksum`, `NotHeader`,
+                    // `UnknownSecondaryType`, ...) is the reader having
+                    // actually looked at the block's content and found
+                    // it wrong, which is what this module's own
+                    // documentation means by "proved it cannot follow".
+                    let entry = match self.entry_at(lba) {
+                        Ok(e) => e,
+                        Err(Error::Io(_)) => {
+                            rep.push(Action::Unverified { lba });
+                            break;
+                        }
+                        Err(_) => {
                             self.cut(dir, slot as u32, prev)?;
                             rep.severed += 1;
                             rep.push(Action::ChainTruncated {
@@ -585,15 +631,25 @@ impl<S: BlockMedium> Volume<S> {
                     };
                     chain.insert(lba);
 
-                    if entry.comment_block != 0 && self.comment(&entry).is_err() {
-                        let mut buf = self.get_block(lba)?;
-                        wr32(&mut buf, tail(bs, TL_COMMENT_BLOCK), 0);
-                        self.put_block(lba, &mut buf)?;
-                        rep.severed += 1;
-                        rep.push(Action::CommentPointerCleared {
-                            lba,
-                            was: entry.comment_block,
-                        });
+                    if entry.comment_block != 0 {
+                        match self.comment(&entry) {
+                            Ok(_) => {}
+                            Err(Error::Io(_)) => {
+                                rep.push(Action::Unverified {
+                                    lba: entry.comment_block as u64,
+                                });
+                            }
+                            Err(_) => {
+                                let mut buf = self.get_block(lba)?;
+                                wr32(&mut buf, tail(bs, TL_COMMENT_BLOCK), 0);
+                                self.put_block(lba, &mut buf)?;
+                                rep.severed += 1;
+                                rep.push(Action::CommentPointerCleared {
+                                    lba,
+                                    was: entry.comment_block,
+                                });
+                            }
+                        }
                     }
                     if entry.kind.is_directory() && visited.insert(entry.lba) {
                         queue.push(entry.lba);

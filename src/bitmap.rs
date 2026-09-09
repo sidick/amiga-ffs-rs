@@ -72,6 +72,20 @@ pub struct Bitmap {
     bits: Vec<u32>,
     pages: Vec<u64>,
     ext_blocks: Vec<u64>,
+    /// Pages whose checksum failed, in page order: their LBA, kept for
+    /// reporting.
+    ///
+    /// `bits` still has a placeholder word range for each — all zero, so
+    /// they read as "allocated" and an allocator built on this bitmap
+    /// never hands one out — but nothing here treats that placeholder as
+    /// a fact about the disk. [`Bitmap::covers`] excludes their block
+    /// range, so every accessor built on it (`is_free`, `covered`,
+    /// `covered_count`, `allocated_count`, `free_count`) answers "cannot
+    /// assess" for those blocks rather than a wrong yes or no.
+    bad_pages: Vec<u64>,
+    /// The block ranges [`Bitmap::bad_pages`] covers, kept apart from the
+    /// LBA list because membership is checked by block number.
+    bad_ranges: Vec<core::ops::Range<u64>>,
 }
 
 impl Bitmap {
@@ -103,6 +117,18 @@ impl Bitmap {
     pub fn covers(&self, lba: u64) -> bool {
         (self.reserved..self.block_count).contains(&lba)
             && (lba - self.reserved) / 32 < self.bits.len() as u64
+            && !self.bad_ranges.iter().any(|r| r.contains(&lba))
+    }
+
+    /// The bitmap pages whose checksum did not sum: their own block, not
+    /// a block they describe.
+    ///
+    /// The blocks each one *would* have described are not "free" or
+    /// "allocated" — [`Bitmap::covers`] says so for every one of them —
+    /// they are simply not answerable, same as a block past the end of a
+    /// short bitmap.
+    pub fn bad_pages(&self) -> &[u64] {
+        &self.bad_pages
     }
 
     /// Is `lba` marked free? `None` for a block the bitmap does not cover.
@@ -152,6 +178,14 @@ impl Bitmap {
 
     /// How many blocks are marked free.
     pub fn free_count(&self) -> u64 {
+        // A bad page breaks the "covered range is a contiguous prefix"
+        // assumption the word-popcount fast path relies on, so a volume
+        // with one falls back to counting through `covers` -- rare
+        // enough (a validator's own recovery path) that the fast path
+        // stays fast for every volume that never hits it.
+        if !self.bad_ranges.is_empty() {
+            return self.free().count() as u64;
+        }
         let covered = self.covered_count();
         let mut n = 0u64;
         for (i, w) in self.bits.iter().enumerate() {
@@ -173,10 +207,22 @@ impl Bitmap {
     }
 
     /// How many blocks the bitmap has bits for.
+    ///
+    /// A bad page's block range does not count as covered: its bits are
+    /// unknown, not free or allocated, so a validator relying on this to
+    /// know what fraction of the volume it could actually assess must not
+    /// be told a broken page's blocks were checked.
     pub fn covered_count(&self) -> u64 {
-        self.block_count
+        let base = self
+            .block_count
             .saturating_sub(self.reserved)
-            .min(self.bits.len() as u64 * 32)
+            .min(self.bits.len() as u64 * 32);
+        let bad: u64 = self
+            .bad_ranges
+            .iter()
+            .map(|r| r.end.saturating_sub(r.start))
+            .sum();
+        base.saturating_sub(bad)
     }
 
     /// Does the bitmap have enough pages to cover the whole volume? A
@@ -219,9 +265,13 @@ impl<S: BlockSource> Volume<S> {
     ///
     /// A zero page pointer ends the list — the format packs them from the
     /// front — so a volume needing fewer than 25 pages simply stops. Each
-    /// page's checksum is verified at [`BITMAP_CHECKSUM_INDEX`], and a
-    /// page whose checksum fails is an [`Error::Checksum`]: bits that do
-    /// not sum are not bits to allocate from.
+    /// page's checksum is verified at [`BITMAP_CHECKSUM_INDEX`]; a page
+    /// whose checksum fails does **not** abort the read. Its own LBA goes
+    /// into [`Bitmap::bad_pages`] and its block range is excluded from
+    /// [`Bitmap::covers`] — bits that do not sum are not bits to allocate
+    /// from, but they are also not a reason to stop reading every other
+    /// page's bits. Only a failure reading the page at all (a transport
+    /// error, not a checksum mismatch) is still an `Err` here.
     ///
     /// An invalid `bitmap_flag` is **not** an error here. The bits are
     /// read and returned with [`Bitmap::valid`] false, because the state
@@ -275,6 +325,8 @@ impl<S: BlockSource> Volume<S> {
         let need = block_count.saturating_sub(reserved);
         let mut bits: Vec<u32> =
             Vec::with_capacity((pages.len() * words_per_page).min((need / 32 + 1) as usize));
+        let mut bad_pages: Vec<u64> = Vec::new();
+        let mut bad_ranges: Vec<core::ops::Range<u64>> = Vec::new();
         for (i, &page) in pages.iter().enumerate() {
             // Stop reading pages the volume has no blocks for, however
             // many the root lists: a bitmap longer than the volume is a
@@ -284,7 +336,24 @@ impl<S: BlockSource> Volume<S> {
             }
             self.read_raw(page)?;
             if !checksum_ok(&self.buf) {
-                return Err(Error::Checksum { lba: page });
+                // A checksum failure is proof about *this page only*: the
+                // rest of the bitmap, and the whole reachability walk
+                // this feeds into, is not less true for it. Record the
+                // page and its block range as unreadable and keep going
+                // -- an aborted read here used to take down the entire
+                // bitmap-analysis phase of `validate()`, silently
+                // skipping orphan/reachable-but-free detection for every
+                // OTHER page, intact or not.
+                let start = reserved + i as u64 * per_page;
+                let end = (start + per_page).min(block_count);
+                bad_pages.push(page);
+                bad_ranges.push(start..end);
+                // Placeholder words, so later pages' block-to-word
+                // indexing stays correct. `Bitmap::covers` excludes this
+                // page's range, so these zeros are never read as "this
+                // block is allocated" -- only as words to skip past.
+                bits.extend(core::iter::repeat(0u32).take(words_per_page));
+                continue;
             }
             for w in 0..words_per_page {
                 bits.push(be32(&self.buf, OFF_BITMAP_BITS + w * 4));
@@ -298,6 +367,8 @@ impl<S: BlockSource> Volume<S> {
             bits,
             pages,
             ext_blocks,
+            bad_pages,
+            bad_ranges,
         })
     }
 }

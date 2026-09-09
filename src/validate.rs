@@ -670,6 +670,13 @@ impl<S: BlockSource> Volume<S> {
                 report.summary.bitmap_blocks += 1;
             }
         }
+        // A page's own checksum failing is a fact about that page alone:
+        // its block range is unknown (`Bitmap::covers` already excludes
+        // it from every comparison below), but every other page's bits
+        // are still compared against the walk normally.
+        for &lba in bitmap.bad_pages() {
+            report.push(Finding::Checksum { lba });
+        }
         report.summary.allocated = bitmap.allocated_count();
         report.summary.free = bitmap.free_count();
 
