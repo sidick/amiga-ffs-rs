@@ -1914,12 +1914,38 @@ re-run after each change.
   own non-goals, "bytes in, bytes out"; `makedir`/`write`/`delete`/
   `protect`/`comment`/`time`/`relabel` over `Mutator`), and low-level
   (`bitmap info`/`free`/`used`/`find` over `Bitmap`, `block dump` over
-  raw reads). `pack`/`unpack`/`repack` map onto `populate_from_tree`,
-  the reverse walk, and `Mutator::compact` respectively — `repack` is
-  this crate's compactor with a CLI wrapped around it, and unlike
-  `xdftool`'s (which admits the same non-interruptible move phase
-  ReOrg's manual admits — see the layout survey) this crate's already
-  never produces worse than a leak.
+  raw reads). `pack`/`unpack` map onto `populate_from_tree` and the
+  reverse walk — but through **`.uaem` sidecar files** (`Name.ext` +
+  a `Name.ext.uaem` text file beside it), not `xdftool`'s own
+  `.xdfmeta`: `.uaem` is the convention WinUAE, FS-UAE and Copperline's
+  directory-filesystem mounts already use for exactly this problem
+  (protection, comment, dates a host filesystem cannot hold), written
+  only when a file's attributes actually need it — no sidecar for an
+  ordinary file with default permissions — so a tree this crate
+  unpacks is mountable directly by any of those three, and a tree any
+  of them wrote is packable straight back by this crate. `repack` —
+  `Mutator::compact` with a CLI wrapped around it — gets its own named
+  `defrag` alias (`--dry-run` reporting what would move and the
+  before/after run counts, since a full compact rewrites most of a
+  volume and callers deserve a preview before committing to one;
+  `--headers`/`--data-only` selecting `compact`'s two tiers) — and
+  unlike `xdftool`'s repack (which admits the same non-interruptible
+  move phase ReOrg's manual admits — see the layout survey) this
+  crate's already never produces worse than a leak.
+
+  **New**, with no `xdftool` equivalent: `convert` — build a fresh
+  volume at a different block size (or variant) from an existing one.
+  Not a resize; PLAN.md's own reasoning for why block size cannot
+  change in place (every derived layout constant — hash-table size,
+  data-pointer capacity, bitmap bits-per-page, OFS payload size — is a
+  function of it, so every block's shape changes, not just which
+  block number holds it) makes this the transcode `resize` explicitly
+  is not: open the source, `format()` the destination at the new
+  block size, walk the source tree, `Populator`/`Mutator`-create each
+  entry into the destination. A thin CLI command over library calls
+  this crate already has, and the natural place for the block-size
+  question raised in conversation (2026-09-09) to live once it is
+  more than a curiosity.
 
   **`xdfscan` equivalent** — batch `validate()` over a directory of
   images, one-line-per-image summaries (`ok`/`NOK`/`nofs`/`NDOS`),
