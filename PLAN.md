@@ -190,6 +190,31 @@ than `cargo test` can reach.
       because the remaining two are the two that cannot be reached from
       `cargo test` — `afs.handler` needs a guest, and the amibake fixture
       needs a pipeline. Neither is blocked on anything here.
+- [x] **`guard_chain`'s visited set stopped being a `Vec`** (2026-09-09,
+      found by independent review). `guard_chain` — every hash-chain,
+      extension-chain, link-chain and dircache-chain walk in the crate
+      routes through it — tracked "already seen this block" with
+      `Vec<u64>::contains`, an O(so-far) scan on every step, so a chain
+      of `n` distinct, valid, correctly-checksummed blocks (never
+      tripping `ChainCycle`, so the length bound was the only thing
+      stopping it) walked in O(n^2). `tests/hostile.rs` already had two
+      `#[ignore]`d timing tests pinning this from an earlier review pass
+      (26ms at n=2000 vs 242ms at n=8000, a 9.2x ratio for a 4x input);
+      they're un-ignored now, with their assertions inverted to check
+      growth *stays* close to linear instead of demonstrating that it
+      wasn't. `guard_chain` now tracks `visited` in a `BTreeSet<u64>`
+      (`alloc::collections`, no new dependency — this crate already pulls
+      `BTreeMap` from the same module in `compact.rs`), turning each
+      check O(log n) and the walk O(n log n); post-fix the same two
+      chain lengths ratio 4.2x in a debug build (0.47ms/1.51ms, 3.2x, in
+      release). Three other chain walks had quietly reimplemented the
+      same `Vec`-and-`.contains()` shape inline instead of calling
+      `guard_chain` and got the same fix: `compact::survey`'s
+      directory-visited set, `mutate::refuse_own_subtree`'s
+      parent-chain walk, and `repair::sever`'s two visited sets (the
+      cross-directory one and each hash slot's own per-chain one).
+      Landed alongside the milestone-3 `Mutator::volume()` fix above,
+      from the same review pass.
 
 ## Milestone 2 — create
 
@@ -950,6 +975,36 @@ observe.
       `delete`'s only alternative shape was baking synchronous freeing in
       deep enough that adding this later would have meant relitigating
       the write-order rules rather than factoring them.
+- [x] **`Mutator::volume()` stopped handing out `&mut Volume<S>`**
+      (2026-09-09, found by independent review). `Volume` has inherent
+      `resize()` and `repair()`, both `&mut self`, both writing the
+      on-disk bitmap directly — and `Mutator::volume()` handed back a
+      plain `&mut Volume<S>`, so nothing stopped
+      `mutator.volume().resize(n)` or `.repair(&opts)` compiling and
+      running mid-session. `Mutator` caches an `Allocator` loaded once at
+      `open()`; `resize`/`repair` rewriting the bitmap underneath it has
+      no way to tell that cache it is now stale, so the session's next
+      allocation would work from the wrong picture of the disk, and its
+      own flush (every operation's last step) would write that stale
+      picture back over whatever `resize`/`repair` had just written —
+      capable of re-marking a still-reachable block free, the one state
+      (`Finding::ReachableButFree`) this whole module exists to prevent.
+      Every call site in this repo (grepped across `src/`, `tests/`,
+      `examples/`) only ever used `.volume()` for reads — `lookup`,
+      `read_dir`, `entry_at`, `read_file`, `read_file_with`, `read_range`,
+      `file_chain`, `lookup_path`, `validate`, `read_softlink`,
+      `resolve_link`, `comment`, `read_bitmap`, `read_dircache`,
+      `root_lba`, `root`, `block_size`, `block_count`, `variant`,
+      `max_name_len`, and `source_mut` (twice, both only to reach a test
+      double's own instrumentation) — never `resize` or `repair`, so the
+      fix could narrow the accessor instead of working around the
+      problem. `Mutator::volume()` now returns `MutatorVolume<'_, S>`, a
+      thin forwarding view exposing exactly that read-only surface and
+      nothing else; every existing call site still compiled once
+      unqualified `let vol = m.volume();` bindings picked up the `mut`
+      an owned view (rather than a borrowed one) needs. Landed alongside
+      the milestone-1 `guard_chain` fix below since both came out of the
+      same review pass; not a semver break, since 0.3.0 has not shipped.
 
 ## Milestone 4 — resize
 
@@ -1072,6 +1127,82 @@ observe.
       silently skipped; and a property test driving `resize` interleaved
       with `Mutator` operations (only pure resize sequences are
       seeded-random-tested today).
+
+      **2026-09-09, as-built — two bugs found by independent review,
+      both fixed:**
+
+      - **`resize()` could corrupt its own newly-written root.**
+        `free_bit_on_disk`'s job is patching a freed block's bit directly
+        into whichever *old* bitmap page the pre-resize bitmap says covers
+        it — necessary, per this entry's own "what the plan did not
+        anticipate" note above, because `repair`'s one-direction rule
+        would otherwise keep the old root and excess bitmap pages as
+        permanent leaks. The bug: that lookup trusts the *old* bitmap's
+        idea of where its pages are, with no check for whether this same
+        `resize` call has since **repurposed** that LBA for something
+        else — the new root, or a relocated dircache block. On a stock
+        1760-block DD floppy, growing to 1761 blocks moves the root from
+        880 to 881, which is exactly where the old bitmap's one page
+        lived; `root_safe` correctly allows the new root to land there
+        (`repair()` rebuilds that page from the reachability walk
+        regardless), but `free_bit_on_disk`, run afterward to free the
+        *old* root's bit, still resolved page index 0 to LBA 881 — now the
+        freshly written root — read it back as if it were a bitmap page,
+        OR'd a bit into what it thought was a bitmap word, and stamped a
+        bitmap-style checksum (longword 0) over the root's own `OFF_TYPE`
+        field. Reproduced first as a failing test
+        (`growing_a_floppy_by_one_block_does_not_corrupt_the_new_root`):
+        `resize(1761)` returned
+        `Alloc(Read(NotHeader { lba: 881, found: 4294950914 }))`, the
+        negated-sum checksum sitting where `T_HEADER` should be. Fix:
+        `free_bit_on_disk` now takes the same `claimed: &[u64]` set
+        `resize` already tracks (the new root plus every dircache block's
+        final LBA) and skips any page whose LBA is in it, on the same
+        reasoning the function already documented for a page past
+        `new_block_count` — a page that has been repurposed by this same
+        call has nothing here worth patching either, because `repair`'s
+        walk rebuilds it wholesale regardless of what is sitting in the
+        stale page reference. Confirmed general rather than
+        floppy-specific: a second test
+        (`growing_a_1024_byte_ffs_volume_by_one_block_does_not_corrupt_the_new_root`)
+        reproduces the identical collision on a 1024-byte-block `Ffs`
+        volume, because the root-adjacent bitmap-page placement is this
+        crate's own formatter's layout choice (see this module's "Where
+        everything goes" documentation), not an artefact of one geometry
+        — a scan across variants, block sizes and volume sizes turned up
+        the same shape wherever a grow shifts the midpoint by exactly the
+        page's offset from the root, on every block size and FFS/OFS
+        variant tried.
+      - **The boot-block checksum was not recomputed after a resize.**
+        `resize()` patches the boot block's advisory root-LBA longword
+        but, before this fix, never touched the checksum that longword
+        sits inside of. `format.rs`'s own documentation states plainly why
+        a zero checksum there is deliberate (it is what makes a `Format`-
+        produced boot block *non-bootable*, and a checksum that balances
+        over 1012 zero bytes of "code" is strictly worse than one that
+        fails) — but a boot block a caller made bootable
+        (`FormatOptions::boot_checksum: true`, or a real `Install`) has a
+        checksum that balances over the *old* root pointer, and silently
+        stopped balancing the moment `resize` patched the pointer without
+        touching the checksum, turning a bootable image non-bootable with
+        no error anywhere. Fix: after patching the pointer, `resize` now
+        gathers the full 1024-byte boot area (`format.rs`'s own
+        `BOOT_AREA_LEN` — two blocks at 512-byte block sizes, one at 1 KB
+        and up, the same span `format()` itself lays down), checks whether
+        the checksum balanced *before* the edit by reusing
+        `bootblock_checksum` itself rather than re-deriving the
+        end-around-carry sum, and — only if it did — recomputes and
+        rewrites it after. An unbalanced checksum (the ordinary, non-
+        bootable case) is left exactly as it was, matching `format.rs`'s
+        own stated reasoning rather than inventing a checksum where there
+        was never a valid one. Tested both directions:
+        `resize_recomputes_a_valid_boot_checksum_after_moving_the_root`
+        (formats with `boot_checksum: true`, resizes across a 512-byte
+        block boundary so the boot area spans both reserved blocks, and
+        checks the checksum still balances over the new pointer) and
+        `resize_does_not_invent_a_boot_checksum_on_an_ordinary_volume`
+        (an ordinary volume's checksum longword stays zero through a
+        resize that still updates the pointer).
 
 ## Milestone 5 — block layout policy and compaction
 
@@ -1221,6 +1352,45 @@ property of every image shipped, not a tuning detail.
   extended with compaction interleaved among its mutations. Both are
   gaps worth closing before this lands as anything more than "landed and
   working," not oversights papered over.
+
+  **2026-09-09, as-built — a third bug found by independent review, in
+  tier 2's hard-link handling.** `relocate_header_core`'s re-pointing
+  list above says plainly what has to change when an entry moves: "hard-
+  link `real_entry` in every link naming a moved target, and the one
+  predecessor pointer in a moved link's own chain" — two different
+  directions for two different cases. The bug was collapsing them onto
+  one condition. The code called `retarget_link_chain` (walk from
+  `entry.next_link`, stamp every block's `real_entry` at the mover's new
+  address) whenever `entry.next_link != 0` — true both when the entry
+  being relocated is the chain's *target* (`next_link` is the chain's
+  head, and the walk is exactly right) and when it is itself a *link*
+  with others chained after it (`next_link` names the *next link*, per
+  `read.rs`'s own documentation of the field — a fact about that link's
+  position, unrelated to where this one now lives). Relocating a mid-
+  chain link therefore walked into the unrelated link after it and
+  overwrote that link's `real_entry` with the *mover's* new address,
+  breaking `resolve_link` for every link past the one that moved.
+  `retarget_link_predecessor` (the correct fix for that direction —
+  find whoever's `next_link` names the mover, the same predecessor-
+  search shape the hash-chain and directory-chain re-pointing in this
+  same function already use) was already being called too, just never
+  exclusively: both ran whenever the moved entry happened to have a
+  nonzero `next_link` and also be a link itself. Fix: the two paths are
+  now mutually exclusive on `entry.real_entry == 0` (exactly the target
+  case, per `parse_entry`'s own field-zeroing rule — `real_entry` is
+  nonzero only on `LinkFile`/`LinkDir`) rather than `entry.next_link !=
+  0` alone. Tested with a first-fails-then-fixed pair: a file `T` with
+  hard links chained `T -> L1 -> L2 -> L3`, relocating the mid-chain
+  `L1`, and asserting every one of `resolve_link(L1/L2/L3)` still
+  resolves to `T`, `T`'s own `next_link` finds `L1` at its new address,
+  and `L1`'s own `next_link` and `L2`'s `real_entry` are byte-for-byte
+  untouched
+  (`tier2_relocating_a_link_in_a_chain_does_not_repoint_the_links_after_it`);
+  and the companion direction, relocating the chain's target `T` itself,
+  confirming every link's `real_entry` moves to `T`'s new address
+  (`tier2_relocating_a_link_targets_header_repoints_every_link`) — the
+  behaviour the `entry.real_entry == 0` branch already got right, pinned
+  alongside the fix rather than left implicit.
 
   **Wave 3 landed**: passive reorganisation — `Mutator`'s own day-to-day
   writes now place blocks by `Intent` instead of by the bare hint they

@@ -348,6 +348,7 @@
 //! differential comparison, or a test asserting an exact LBA as a proxy
 //! for something the test actually cares about.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -358,12 +359,17 @@ use crate::build::{
     needs_comment_block, write_date, write_entry_header, write_name_and_comment, CacheFacts,
     EntryFields,
 };
+use crate::dircache::Dircache;
+use crate::file::FileChain;
 use crate::format::{check_name_bytes, div_ceil, wr32, wr_date, NameProblem};
 use crate::layout::*;
 use crate::populate::Metadata;
-use crate::read::{DateStamp, Entry, EntryKind, Volume};
+use crate::read::{DateStamp, Entry, EntryKind, Error, RootBlock, Volume};
+use crate::validate::Report;
 use crate::{be32, checksum_ok, hash_table_size, name_hash};
-use crate::{BlockMedium, Transport, MAX_NAME_CLASSIC, MAX_NAME_LONG};
+use crate::{
+    Bitmap, BlockMedium, BlockSource, Transport, Variant, MAX_NAME_CLASSIC, MAX_NAME_LONG,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -770,8 +776,20 @@ impl<S: BlockMedium> Mutator<S> {
     }
 
     /// The volume, for reading: lookups, listings, file contents.
-    pub fn volume(&mut self) -> &mut Volume<S> {
-        &mut self.vol
+    ///
+    /// Not `&mut Volume<S>`. [`Volume::resize`](crate::Volume::resize) and
+    /// [`Volume::repair`](crate::Volume::repair) are `&mut self` methods
+    /// that rewrite the on-disk bitmap directly, and this session's own
+    /// [`Allocator`] has no way to learn its cached bitmap went stale if
+    /// either ran underneath it through this accessor — the next
+    /// operation would allocate against the wrong picture of the disk,
+    /// and this session's own flush (every operation's last step) would
+    /// then write that stale picture back over whatever `resize`/`repair`
+    /// just wrote, capable of re-marking a still-reachable block free.
+    /// [`MutatorVolume`] forwards every read this crate's own callers
+    /// use and nothing that can invalidate the allocator's cache.
+    pub fn volume(&mut self) -> MutatorVolume<'_, S> {
+        MutatorVolume(&mut self.vol)
     }
 
     /// The allocator, for its accounting.
@@ -2130,7 +2148,10 @@ impl<S: BlockMedium> Mutator<S> {
         let root = self.vol.root_lba();
         let block_count = self.vol.block_count();
         let mut here = new_parent;
-        let mut visited: Vec<u64> = Vec::new();
+        // A `BTreeSet`, not a `Vec`: same O(n^2)-scan shape `guard_chain`
+        // had (see `read.rs`'s doc comment on it), on a walk that can run
+        // as deep as the volume's block count.
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         loop {
             if here == entry.lba {
                 return Err(MutateError::IntoOwnSubtree {
@@ -2146,7 +2167,7 @@ impl<S: BlockMedium> Mutator<S> {
                     lba: here,
                 }));
             }
-            visited.push(here);
+            visited.insert(here);
             here = self.vol.entry_at(here)?.parent as u64;
         }
     }
@@ -2415,6 +2436,143 @@ impl<S: BlockMedium> Mutator<S> {
             .mark_bitmap_valid(&mut self.vol.src, root, variant)?;
         self.vol.reload_root()?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MutatorVolume: the read-only view Mutator::volume() hands out
+// ---------------------------------------------------------------------------
+
+/// A read-only view of the volume a [`Mutator`] session owns, returned by
+/// [`Mutator::volume`].
+///
+/// Deliberately not `&mut Volume<S>`: see [`Mutator::volume`]'s doc
+/// comment for why `resize`/`repair` reaching this session's [`Volume`]
+/// would leave its [`Allocator`] holding a stale bitmap. Every method
+/// here is a one-line forward to the identically-named [`Volume`] method
+/// — this type adds no behaviour, only a narrower signature.
+pub struct MutatorVolume<'a, S: BlockSource>(&'a mut Volume<S>);
+
+impl<'a, S: BlockSource> MutatorVolume<'a, S> {
+    /// Forwards to [`Volume::lookup`].
+    pub fn lookup(&mut self, dir_lba: u64, name: &[u8]) -> Result<Option<Entry>, Error<S::Error>> {
+        self.0.lookup(dir_lba, name)
+    }
+
+    /// Forwards to [`Volume::read_dir`].
+    pub fn read_dir(&mut self, dir_lba: u64) -> Result<Vec<Entry>, Error<S::Error>> {
+        self.0.read_dir(dir_lba)
+    }
+
+    /// Forwards to [`Volume::lookup_path`].
+    pub fn lookup_path(
+        &mut self,
+        dir_lba: u64,
+        path: &[u8],
+    ) -> Result<Option<Entry>, Error<S::Error>> {
+        self.0.lookup_path(dir_lba, path)
+    }
+
+    /// Forwards to [`Volume::entry_at`].
+    pub fn entry_at(&mut self, lba: u64) -> Result<Entry, Error<S::Error>> {
+        self.0.entry_at(lba)
+    }
+
+    /// Forwards to [`Volume::read_file`].
+    pub fn read_file(&mut self, header_lba: u64) -> Result<Vec<u8>, Error<S::Error>> {
+        self.0.read_file(header_lba)
+    }
+
+    /// Forwards to [`Volume::read_file_with`].
+    pub fn read_file_with<F>(&mut self, header_lba: u64, chunk: F) -> Result<u64, Error<S::Error>>
+    where
+        F: FnMut(&[u8]),
+    {
+        self.0.read_file_with(header_lba, chunk)
+    }
+
+    /// Forwards to [`Volume::file_chain`].
+    pub fn file_chain(&mut self, header_lba: u64) -> Result<FileChain, Error<S::Error>> {
+        self.0.file_chain(header_lba)
+    }
+
+    /// Forwards to [`Volume::read_range`].
+    pub fn read_range(
+        &mut self,
+        chain: &FileChain,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, Error<S::Error>> {
+        self.0.read_range(chain, offset, buf)
+    }
+
+    /// Forwards to [`Volume::read_softlink`].
+    pub fn read_softlink(&mut self, lba: u64) -> Result<Vec<u8>, Error<S::Error>> {
+        self.0.read_softlink(lba)
+    }
+
+    /// Forwards to [`Volume::resolve_link`].
+    pub fn resolve_link(&mut self, entry: &Entry) -> Result<Entry, Error<S::Error>> {
+        self.0.resolve_link(entry)
+    }
+
+    /// Forwards to [`Volume::comment`].
+    pub fn comment(&mut self, entry: &Entry) -> Result<Vec<u8>, Error<S::Error>> {
+        self.0.comment(entry)
+    }
+
+    /// Forwards to [`Volume::read_bitmap`].
+    pub fn read_bitmap(&mut self) -> Result<Bitmap, Error<S::Error>> {
+        self.0.read_bitmap()
+    }
+
+    /// Forwards to [`Volume::read_dircache`].
+    pub fn read_dircache(&mut self, dir_lba: u64) -> Result<Dircache, Error<S::Error>> {
+        self.0.read_dircache(dir_lba)
+    }
+
+    /// Forwards to [`Volume::validate`].
+    pub fn validate(&mut self) -> Report<S::Error> {
+        self.0.validate()
+    }
+
+    /// Forwards to [`Volume::root`].
+    pub fn root(&self) -> &RootBlock {
+        self.0.root()
+    }
+
+    /// Forwards to [`Volume::root_lba`].
+    pub fn root_lba(&self) -> u64 {
+        self.0.root_lba()
+    }
+
+    /// Forwards to [`Volume::block_size`].
+    pub fn block_size(&self) -> usize {
+        self.0.block_size()
+    }
+
+    /// Forwards to [`Volume::block_count`].
+    pub fn block_count(&self) -> u64 {
+        self.0.block_count()
+    }
+
+    /// Forwards to [`Volume::variant`].
+    pub fn variant(&self) -> Variant {
+        self.0.variant()
+    }
+
+    /// Forwards to [`Volume::max_name_len`].
+    pub fn max_name_len(&self) -> usize {
+        self.0.max_name_len()
+    }
+
+    /// Forwards to [`Volume::source_mut`]. The same escape hatch
+    /// [`Volume::source_mut`] documents — raw block access was already
+    /// an accepted risk before this type existed and is unchanged by it;
+    /// what this type withholds is specifically `resize`/`repair`, which
+    /// rewrite the bitmap without telling this session's allocator.
+    pub fn source_mut(&mut self) -> &mut S {
+        self.0.source_mut()
     }
 }
 

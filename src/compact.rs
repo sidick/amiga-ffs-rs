@@ -152,7 +152,7 @@
 //! default. Callers that want full metadata clustering opt in explicitly,
 //! or call [`Mutator::relocate_header`] directly, entry by entry.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -980,7 +980,7 @@ impl<S: BlockMedium> Mutator<S> {
         let mut children_reparented = 0u64;
         if entry.kind == EntryKind::Directory {
             let table = self.vol.hash_table(new_lba)?;
-            let mut visited: Vec<u64> = Vec::new();
+            let mut visited: BTreeSet<u64> = BTreeSet::new();
             for &head in &table {
                 let mut next = head;
                 while next != 0 {
@@ -996,10 +996,27 @@ impl<S: BlockMedium> Mutator<S> {
             }
         }
         let mut links_repointed = 0u64;
-        if entry.next_link != 0 {
-            links_repointed += self.retarget_link_chain(entry.next_link as u64, new_lba)?;
-        }
-        if entry.real_entry != 0 {
+        // `entry.next_link` means two different things depending on what
+        // moved, per `read.rs`'s own documentation of the field: on the
+        // *target* of a link chain it is the chain's head, and every link
+        // reached from it must have its `real_entry` repointed at this
+        // entry's new address. On a *link itself* it is instead the next
+        // link after this one in the chain to the (unmoved, unrelated)
+        // target -- a fact about that next link's position, not about
+        // where this entry lives, so this entry moving must never touch
+        // it. `entry.real_entry == 0` is exactly the target case (see
+        // `parse_entry`: only a link block ever has a nonzero
+        // `real_entry`), so it is the right guard here, not
+        // `entry.next_link != 0` alone.
+        if entry.real_entry == 0 {
+            if entry.next_link != 0 {
+                links_repointed += self.retarget_link_chain(entry.next_link as u64, new_lba)?;
+            }
+        } else {
+            // The moved entry is itself a link: only its predecessor in
+            // the chain (the target, or an earlier link) names it and
+            // needs fixing up -- never `entry.next_link`, which names the
+            // *next* link and does not care where this one now lives.
             self.retarget_link_predecessor(entry.real_entry as u64, old_lba, new_lba)?;
             links_repointed += 1;
         }
@@ -1194,14 +1211,19 @@ impl<S: BlockMedium> Mutator<S> {
         let mut headers = BTreeMap::new();
         let mut owner_of = BTreeMap::new();
         let mut stack = vec![root];
-        let mut visited: Vec<u64> = Vec::new();
+        // A `BTreeSet`, not a `Vec`: a directory tree with many
+        // directories would otherwise make this an O(n^2) scan the same
+        // way `guard_chain`'s `Vec` did (see `read.rs`'s doc comment on
+        // it) — one `.contains` per popped directory, each one scanning
+        // everything seen so far.
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         let block_count = self.vol.block_count();
 
         while let Some(dir) = stack.pop() {
             if visited.contains(&dir) {
                 continue;
             }
-            visited.push(dir);
+            visited.insert(dir);
             if visited.len() as u64 > block_count {
                 break; // a cycle a damaged volume already has; not this
                        // walk's job to diagnose further than stopping.

@@ -49,6 +49,7 @@
 //! are still marked untrustworthy, because an allocator must not use
 //! them.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -250,7 +251,7 @@ impl<S: BlockSource> Volume<S> {
             0
         };
         let per_ext = bitmap_ext_pointers(bs);
-        let mut visited: Vec<u64> = Vec::new();
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         while next != 0 {
             let lba = next as u64;
             self.guard_chain(&mut visited, lba)?;

@@ -200,7 +200,7 @@ pub use compact::{
 pub use dircache::{Dircache, DircacheRecord};
 pub use file::FileChain;
 pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN};
-pub use mutate::{MetaUpdate, MutateError, Mutator};
+pub use mutate::{MetaUpdate, MutateError, Mutator, MutatorVolume};
 pub use populate::{Metadata, PopulateError, Populator};
 pub use repair::{Action, RepairOptions, RepairReport};
 pub use resize::{ResizeError, ResizeReport};

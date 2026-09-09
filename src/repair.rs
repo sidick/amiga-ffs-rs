@@ -65,6 +65,7 @@
 //! mid-update" — which is the state it was already in if it needed
 //! repairing, and an honest one if it did not.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -541,7 +542,12 @@ impl<S: BlockMedium> Volume<S> {
         let bs = self.block_size();
         let slots = crate::hash_table_size(bs) as usize;
         let mut queue = vec![self.root_lba()];
-        let mut visited: Vec<u64> = vec![self.root_lba()];
+        // `BTreeSet`s, not `Vec`s: both `visited` (every directory found
+        // so far) and each slot's own `chain` can be as long as a
+        // hostile volume likes, and a `Vec::contains` scan per step is
+        // the same O(n^2) shape `guard_chain` had — see `read.rs`'s doc
+        // comment on it.
+        let mut visited: BTreeSet<u64> = BTreeSet::from([self.root_lba()]);
 
         while let Some(dir) = queue.pop() {
             let table = match self.hash_table(dir) {
@@ -554,7 +560,7 @@ impl<S: BlockMedium> Volume<S> {
             for (slot, head) in table.iter().enumerate().take(slots) {
                 let mut prev: u64 = 0;
                 let mut next = *head;
-                let mut chain: Vec<u64> = Vec::new();
+                let mut chain: BTreeSet<u64> = BTreeSet::new();
                 while next != 0 {
                     let lba = next as u64;
                     let broken = chain.contains(&lba) || lba >= self.block_count();
@@ -577,7 +583,7 @@ impl<S: BlockMedium> Volume<S> {
                             break;
                         }
                     };
-                    chain.push(lba);
+                    chain.insert(lba);
 
                     if entry.comment_block != 0 && self.comment(&entry).is_err() {
                         let mut buf = self.get_block(lba)?;
@@ -589,8 +595,7 @@ impl<S: BlockMedium> Volume<S> {
                             was: entry.comment_block,
                         });
                     }
-                    if entry.kind.is_directory() && !visited.contains(&entry.lba) {
-                        visited.push(entry.lba);
+                    if entry.kind.is_directory() && visited.insert(entry.lba) {
                         queue.push(entry.lba);
                     }
                     prev = lba;

@@ -144,6 +144,7 @@
 //!   considers part of the volume (however briefly) outside what the
 //!   medium reports, which is the same hazard from the other direction.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -151,11 +152,13 @@ use core::fmt;
 use crate::allocator::AllocError;
 use crate::bitmap::Bitmap;
 use crate::build::finish_checksum;
-use crate::format::{div_ceil, wr32, OFF_BOOT_ROOT};
+use crate::format::{div_ceil, wr32, BOOT_AREA_LEN, OFF_BOOT_ROOT};
 use crate::layout::*;
 use crate::read::{Error as ReadError, Volume};
 use crate::repair::{RepairOptions, RepairReport};
-use crate::{be32, checksum_compute, checksum_ok, BlockMedium, BlockSource, Transport};
+use crate::{
+    be32, bootblock_checksum, checksum_compute, checksum_ok, BlockMedium, BlockSource, Transport,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -657,7 +660,7 @@ impl<S: BlockMedium> Volume<S> {
             // names. A deeper entry's parent is its own directory, not
             // the root, and is untouched.
             let table = self.root().hash_table.clone();
-            let mut visited: Vec<u64> = Vec::new();
+            let mut visited: BTreeSet<u64> = BTreeSet::new();
             for &head in &table {
                 let mut next = head;
                 while next != 0 {
@@ -716,11 +719,45 @@ impl<S: BlockMedium> Volume<S> {
         }
 
         // Advisory, and cheap: the boot block's root pointer. Nothing in
-        // this crate's own mount path reads it back.
-        self.read_raw(0)?;
-        let mut boot = self.buf.clone();
-        wr32(&mut boot, OFF_BOOT_ROOT, new_root_lba as u32);
-        write_raw(self, 0, write_bound, &boot)?;
+        // this crate's own mount path reads it back -- but a boot block a
+        // caller made *bootable* (`FormatOptions::boot_checksum`, or a
+        // real `Install`) carries a checksum over exactly this longword,
+        // and leaving that checksum untouched after patching the pointer
+        // it covers would silently turn a bootable image non-bootable.
+        // The boot *area* `bootblock_checksum` covers is 1024 bytes --
+        // two sectors, `format.rs`'s own `BOOT_AREA_LEN` -- which spans
+        // blocks 0 and 1 at 512-byte blocks and lives inside block 0
+        // alone at 1 KB and up; gathered and rewritten a block at a time
+        // for the same reason `format()` lays it down that way.
+        let boot_blocks = div_ceil(BOOT_AREA_LEN as u64, bs as u64).min(reserved) as usize;
+        let mut boot_area = vec![0u8; boot_blocks * bs];
+        for i in 0..boot_blocks {
+            self.read_raw(i as u64)?;
+            boot_area[i * bs..(i + 1) * bs].copy_from_slice(&self.buf);
+        }
+        let area_len = BOOT_AREA_LEN.min(boot_area.len());
+        // Whether the checksum already balanced *before* this edit --
+        // reusing `bootblock_checksum` itself rather than re-deriving the
+        // end-around-carry sum, per this module's own "cite, don't
+        // duplicate" habit. A freshly formatted, ordinary (non-bootable)
+        // volume leaves this field zero, which does not balance; per
+        // `format.rs`'s own stated reasoning for why that zero is
+        // deliberate, an unbalanced checksum is left exactly as it was
+        // rather than having one invented for it here.
+        let was_valid = be32(&boot_area, 4) == bootblock_checksum(&boot_area[..area_len]);
+        wr32(&mut boot_area, OFF_BOOT_ROOT, new_root_lba as u32);
+        if was_valid {
+            let ck = bootblock_checksum(&boot_area[..area_len]);
+            wr32(&mut boot_area, 4, ck);
+        }
+        for i in 0..boot_blocks {
+            write_raw(
+                self,
+                i as u64,
+                write_bound,
+                &boot_area[i * bs..(i + 1) * bs],
+            )?;
+        }
 
         // Everything this operation knows for certain is now free: the
         // old root (once nothing points at it any more) and any bitmap
@@ -757,7 +794,7 @@ impl<S: BlockMedium> Volume<S> {
         }
         let mut blocks_freed = 0u64;
         for lba in to_free {
-            if free_bit_on_disk(self, &old_bitmap, reserved, bs, lba, write_bound)? {
+            if free_bit_on_disk(self, &old_bitmap, reserved, bs, lba, write_bound, &claimed)? {
                 blocks_freed += 1;
             }
         }
@@ -894,6 +931,20 @@ fn pick_free(bitmap: &Bitmap, claimed: &[u64], new_block_count: u64) -> Option<u
 /// page wholesale from the walk (its pointer fails the same range check),
 /// and a page about to be discarded and rebuilt has nothing here worth
 /// patching.
+///
+/// Also a no-op when `page_lba` is in `claimed` — this same resize call
+/// has already written something else there (the new root, or a
+/// relocated dircache block) before this pass runs. The *old* bitmap's
+/// page/word math still points at that LBA because the old bitmap is a
+/// snapshot from before any of this call's writes, but the block itself
+/// has been repurposed and no longer holds a bitmap page at all; patching
+/// a bit into it would OR garbage into whatever is now there (in the
+/// reported case, stamping a bitmap-style checksum over the freshly
+/// written root's `OFF_TYPE` field) rather than freeing anything.
+/// Skipping it costs nothing bitmap-shaped either way: exactly like a
+/// page past `new_block_count`, [`Volume::repair`]'s walk rebuilds this
+/// page from scratch, so there is nothing here worth patching once the
+/// page reference is stale for *this* reason instead of that one.
 fn free_bit_on_disk<S: BlockMedium>(
     vol: &mut Volume<S>,
     old_bitmap: &Bitmap,
@@ -901,6 +952,7 @@ fn free_bit_on_disk<S: BlockMedium>(
     bs: usize,
     lba: u64,
     write_bound: u64,
+    claimed: &[u64],
 ) -> Result<bool, ResizeError<Transport<S>>> {
     if lba < reserved {
         return Ok(false);
@@ -913,6 +965,9 @@ fn free_bit_on_disk<S: BlockMedium>(
         None => return Ok(false),
     };
     if page_lba >= vol.block_count() {
+        return Ok(false);
+    }
+    if claimed.contains(&page_lba) {
         return Ok(false);
     }
     let bit_in_page = bit_in_volume % per_page;

@@ -57,6 +57,7 @@
 //! block's runs out in 11.7 million), and the padding is what makes the
 //! record offsets 24, 54, 82 come out of names of 4, 2 and 6 characters.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::layout::*;
@@ -178,7 +179,7 @@ impl<S: BlockSource> Volume<S> {
             ..Default::default()
         };
         let mut next = self.dircache_head(dir_lba)?;
-        let mut visited: Vec<u64> = Vec::new();
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         while next != 0 {
             let lba = next as u64;
             self.guard_chain(&mut visited, lba)?;

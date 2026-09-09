@@ -9,6 +9,7 @@
 //! take, and a reader that loops forever on one is worse than a reader
 //! that says so.
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -1017,7 +1018,7 @@ impl<S: crate::BlockSource> Volume<S> {
         let slot = name_hash(name, fold, hash_table_size(self.block_size)) as usize;
         let table = self.hash_table(dir_lba)?;
         let mut next = table[slot];
-        let mut visited: Vec<u64> = Vec::new();
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         while next != 0 {
             let lba = next as u64;
             self.guard_chain(&mut visited, lba)?;
@@ -1042,7 +1043,7 @@ impl<S: crate::BlockSource> Volume<S> {
         // One visited set across every chain in the directory: a block
         // reachable from two slots is corruption too, and would
         // otherwise be listed twice.
-        let mut visited: Vec<u64> = Vec::new();
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
         for slot in table {
             let mut next = slot;
             while next != 0 {
@@ -1091,9 +1092,17 @@ impl<S: crate::BlockSource> Volume<S> {
     /// a damaged volume actually produces, and the length bound keeps
     /// that set from growing without limit on a volume whose blocks all
     /// point somewhere new.
+    ///
+    /// `visited` is a [`BTreeSet`], not a `Vec`: a `Vec` makes every call
+    /// here an O(so-far) scan, so a long, perfectly valid, non-cyclic
+    /// chain of `n` blocks (a hostile image's cheapest way to slow this
+    /// crate down, since it never has to trip `ChainCycle` to do it)
+    /// walks in O(n^2). A `BTreeSet` makes each call O(log n), the whole
+    /// walk O(n log n), without depending on a hasher this `no_std`
+    /// crate would have to bring in itself.
     pub(crate) fn guard_chain(
         &self,
-        visited: &mut Vec<u64>,
+        visited: &mut BTreeSet<u64>,
         lba: u64,
     ) -> Result<(), Error<S::Error>> {
         if visited.contains(&lba) {
@@ -1102,7 +1111,7 @@ impl<S: crate::BlockSource> Volume<S> {
         if visited.len() as u64 >= self.block_count {
             return Err(Error::ChainTooLong { lba });
         }
-        visited.push(lba);
+        visited.insert(lba);
         Ok(())
     }
 }

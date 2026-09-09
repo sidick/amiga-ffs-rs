@@ -53,6 +53,7 @@
 //! chain is collected once, and is immutable data a concurrent consumer can
 //! hold outside its `Volume` lock.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::layout::*;
@@ -113,7 +114,7 @@ impl<S: BlockSource> Volume<S> {
 
         // The header counts as visited: an extension block pointing back
         // at it is a cycle like any other.
-        let mut visited = alloc::vec![header_lba];
+        let mut visited = BTreeSet::from([header_lba]);
         while next != 0 {
             let lba = next as u64;
             self.guard_chain(&mut visited, lba)?;
@@ -399,7 +400,7 @@ impl<S: BlockSource> Volume<S> {
     /// crate's job.
     pub fn resolve_link(&mut self, entry: &Entry) -> Result<Entry, Error<S::Error>> {
         let mut here = entry.clone();
-        let mut visited = alloc::vec![here.lba];
+        let mut visited = BTreeSet::from([here.lba]);
         loop {
             match here.kind {
                 EntryKind::File | EntryKind::Directory => return Ok(here),

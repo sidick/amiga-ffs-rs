@@ -3863,9 +3863,88 @@ fn poke_bitmap_bit(disk: &mut MemDisk, pages: &[u64], reserved: u64, lba: u64, f
     disk.poke_block(page, &buf);
 }
 
+/// The handful of reads these fixtures need, common to a plain
+/// [`Volume`] and to a [`Mutator`]'s [`MutatorVolume`] view of one —
+/// so a fixture that walks and asserts on a volume can be handed either
+/// without caring which. `MutatorVolume` forwards each one to the
+/// identically-named [`Volume`] method; this trait exists only so these
+/// test fixtures can be generic over that choice, not as anything the
+/// crate itself needs.
+trait VolReadOps {
+    fn root_lba(&self) -> u64;
+    fn block_size(&self) -> usize;
+    fn lookup(&mut self, dir_lba: u64, name: &[u8]) -> Result<Option<Entry>, Error<MemError>>;
+    fn read_dir(&mut self, dir_lba: u64) -> Result<Vec<Entry>, Error<MemError>>;
+    fn read_file(&mut self, header_lba: u64) -> Result<Vec<u8>, Error<MemError>>;
+    fn comment(&mut self, entry: &Entry) -> Result<Vec<u8>, Error<MemError>>;
+    fn validate(&mut self) -> Report<MemError>;
+    fn file_chain(&mut self, header_lba: u64) -> Result<FileChain, Error<MemError>>;
+    fn read_bitmap(&mut self) -> Result<Bitmap, Error<MemError>>;
+}
+
+impl VolReadOps for Volume<MemDisk> {
+    fn root_lba(&self) -> u64 {
+        Volume::root_lba(self)
+    }
+    fn block_size(&self) -> usize {
+        Volume::block_size(self)
+    }
+    fn lookup(&mut self, dir_lba: u64, name: &[u8]) -> Result<Option<Entry>, Error<MemError>> {
+        Volume::lookup(self, dir_lba, name)
+    }
+    fn read_dir(&mut self, dir_lba: u64) -> Result<Vec<Entry>, Error<MemError>> {
+        Volume::read_dir(self, dir_lba)
+    }
+    fn read_file(&mut self, header_lba: u64) -> Result<Vec<u8>, Error<MemError>> {
+        Volume::read_file(self, header_lba)
+    }
+    fn comment(&mut self, entry: &Entry) -> Result<Vec<u8>, Error<MemError>> {
+        Volume::comment(self, entry)
+    }
+    fn validate(&mut self) -> Report<MemError> {
+        Volume::validate(self)
+    }
+    fn file_chain(&mut self, header_lba: u64) -> Result<FileChain, Error<MemError>> {
+        Volume::file_chain(self, header_lba)
+    }
+    fn read_bitmap(&mut self) -> Result<Bitmap, Error<MemError>> {
+        Volume::read_bitmap(self)
+    }
+}
+
+impl VolReadOps for MutatorVolume<'_, MemDisk> {
+    fn root_lba(&self) -> u64 {
+        MutatorVolume::root_lba(self)
+    }
+    fn block_size(&self) -> usize {
+        MutatorVolume::block_size(self)
+    }
+    fn lookup(&mut self, dir_lba: u64, name: &[u8]) -> Result<Option<Entry>, Error<MemError>> {
+        MutatorVolume::lookup(self, dir_lba, name)
+    }
+    fn read_dir(&mut self, dir_lba: u64) -> Result<Vec<Entry>, Error<MemError>> {
+        MutatorVolume::read_dir(self, dir_lba)
+    }
+    fn read_file(&mut self, header_lba: u64) -> Result<Vec<u8>, Error<MemError>> {
+        MutatorVolume::read_file(self, header_lba)
+    }
+    fn comment(&mut self, entry: &Entry) -> Result<Vec<u8>, Error<MemError>> {
+        MutatorVolume::comment(self, entry)
+    }
+    fn validate(&mut self) -> Report<MemError> {
+        MutatorVolume::validate(self)
+    }
+    fn file_chain(&mut self, header_lba: u64) -> Result<FileChain, Error<MemError>> {
+        MutatorVolume::file_chain(self, header_lba)
+    }
+    fn read_bitmap(&mut self) -> Result<Bitmap, Error<MemError>> {
+        MutatorVolume::read_bitmap(self)
+    }
+}
+
 /// Every block the bitmap marks allocated, as a set — for the two
 /// directional invariants, which are statements about sets.
-fn allocated_set(vol: &mut Volume<MemDisk>) -> std::collections::HashSet<u64> {
+fn allocated_set(vol: &mut impl VolReadOps) -> std::collections::HashSet<u64> {
     vol.read_bitmap().unwrap().allocated().collect()
 }
 
@@ -4548,7 +4627,7 @@ fn assert_repair_invariants(
 }
 
 /// Every file of [`allocatable`]'s tree, read back byte for byte.
-fn assert_tree_intact(vol: &mut Volume<MemDisk>) {
+fn assert_tree_intact(vol: &mut impl VolReadOps) {
     let root = vol.root_lba();
     let payload = vol.lookup(root, b"Payload").unwrap().expect("Payload");
     assert_eq!(vol.read_file(payload.lba).unwrap(), pattern(9000));
@@ -4914,7 +4993,7 @@ fn mutating(vol: Volume<MemDisk>, f: impl FnOnce(&mut Mutator<MemDisk>)) -> Volu
 
 /// Fail loudly with the findings spelled out: a bare `assert!(clean)` on a
 /// validator whose whole point is typed findings tells you nothing.
-fn assert_clean(vol: &mut Volume<MemDisk>, what: &str) {
+fn assert_clean(vol: &mut impl VolReadOps, what: &str) {
     let report = vol.validate();
     assert!(
         report.is_clean(),
@@ -5653,7 +5732,7 @@ fn a_random_interleave_mixes_unlink_and_deferred_release_with_a_model() {
                 }
 
                 let what = format!("{variant:?} @{bs} batch {batch}");
-                verify_model(m.volume(), &model, &what);
+                verify_model(&mut m.volume(), &model, &what);
 
                 // Every pending entry is unreachable from the tree but
                 // still reads its content by the LBA it was handed.
@@ -6362,7 +6441,7 @@ fn mutation_name(rng: &mut Rng, max: usize) -> Vec<u8> {
 
 /// Read the volume back and compare it, entry by entry and byte by byte,
 /// to the model.
-fn verify_model(vol: &mut Volume<MemDisk>, model: &Model, what: &str) {
+fn verify_model(vol: &mut impl VolReadOps, model: &Model, what: &str) {
     for (&dir, entries) in &model.dirs {
         let listed = vol.read_dir(dir).expect("read_dir");
         assert_eq!(
@@ -6586,8 +6665,8 @@ fn a_random_interleave_of_mutations_agrees_with_a_model() {
                 }
 
                 let what = format!("{variant:?} @{bs} batch {batch}");
-                verify_model(m.volume(), &model, &what);
-                assert_clean(m.volume(), &what);
+                verify_model(&mut m.volume(), &model, &what);
+                assert_clean(&mut m.volume(), &what);
             }
 
             // Every operation was exercised, on every variant: a seed
@@ -6862,7 +6941,7 @@ fn writable(variant: Variant, bs: usize, nblocks: u64, initial: &[u8]) -> Volume
 /// Read the file back whole and compare it to the model, then check the
 /// volume is still one: clean, with reachable and allocated agreeing, and
 /// the tree that was already there untouched.
-fn assert_file_model(vol: &mut Volume<MemDisk>, want: &[u8], what: &str) {
+fn assert_file_model(vol: &mut impl VolReadOps, want: &[u8], what: &str) {
     let root = vol.root_lba();
     let e = vol.lookup(root, b"Doc").unwrap().expect("Doc");
     assert_eq!(e.byte_size as usize, want.len(), "{what}: byte_size");
@@ -6960,7 +7039,7 @@ fn write_append_and_truncate_track_a_model_file_on_every_shape_of_volume() {
                 Op::Truncate(5 * p),
             ] {
                 let what = run(&mut m, &mut model, op);
-                assert_file_model(m.volume(), &model, &what);
+                assert_file_model(&mut m.volume(), &model, &what);
             }
 
             vol = m.into_volume();
@@ -7249,7 +7328,7 @@ fn a_random_interleave_of_writes_agrees_with_a_model_file() {
                 }
 
                 let what = format!("{variant:?} @{bs} step {step}");
-                let vol = m.volume();
+                let mut vol = m.volume();
                 let doc = vol.lookup(root, b"Doc").unwrap().unwrap();
                 assert_eq!(doc.byte_size as usize, model.len(), "{what}: byte_size");
                 assert_eq!(vol.read_file(doc.lba).unwrap(), model, "{what}");
@@ -7265,7 +7344,7 @@ fn a_random_interleave_of_writes_agrees_with_a_model_file() {
                     let want = &model[off as usize..(off as usize + len).min(model.len())];
                     assert_eq!(&buf[..got], want, "{what}: ranged read at {off}");
                 }
-                assert_clean(vol, &what);
+                assert_clean(&mut vol, &what);
             }
 
             for (i, n) in counts.iter().enumerate() {
@@ -7344,6 +7423,45 @@ fn assert_bitmap_and_lnfs_fields_agree(vol: &mut Volume<MemDisk>, what: &str) {
             "{what}: FileSystemType"
         );
     }
+}
+
+/// Reviewer-flagged trace: growing a stock 1760-block DD floppy by a
+/// single block moves the root from 880 to 881 -- which is exactly
+/// where the *old* bitmap's one page lived. `root_safe` permits landing
+/// there (`repair()` rebuilds that page from the walk regardless), but
+/// the pass that frees the *old* root's bit afterward looks up
+/// `old_bitmap.pages()[0]`, which is still 881: if that lookup lands on
+/// the block the new root was just written to, this test will show a
+/// corrupted root rather than a clean resize.
+#[test]
+fn growing_a_floppy_by_one_block_does_not_corrupt_the_new_root() {
+    let disk = MemDisk::filled(512, 1760, 0xA5);
+    let opts = FormatOptions::new(Variant::Ffs, 1760, b"Grow1");
+    let pop = Populator::new(disk, &opts).expect("populate");
+    let disk = pop.finish().expect("finish");
+    let mut vol = Volume::open_with(disk, Some(Variant::Ffs), 1760, 2).expect("open");
+    assert_eq!(vol.root_lba(), 880);
+
+    vol.source_mut().grow(1761);
+    let report = vol.resize(1761).expect("resize to 1761");
+    eprintln!("resize report: {report:?}");
+    assert_eq!(
+        report.new_root_lba, 881,
+        "the scenario requires this exact collision"
+    );
+
+    // Re-derive everything from the disk bytes alone, the way a fresh
+    // mount would, rather than trusting the in-memory Volume this
+    // resize() call already mutated.
+    let disk = vol.into_inner();
+    let mut fresh = Volume::open_with(disk, Some(Variant::Ffs), 1761, 2)
+        .expect("volume must still open after resize");
+    let rep = fresh.validate();
+    assert!(
+        rep.findings.is_empty(),
+        "volume should validate clean after a plain grow: {:?}",
+        rep.findings
+    );
 }
 
 /// Grow and shrink back, every variant, every block size: the round trip
@@ -7894,7 +8012,7 @@ fn resize_refuses_a_root_target_occupied_by_real_data() {
 /// `T_LIST` extension block spliced in at its natural fetch position —
 /// the same metric `a_large_files_read_path_is_one_ascending_run_
 /// straight_out_of_populate` already established as the honest one.
-fn file_run_count(vol: &mut Volume<MemDisk>, header_lba: u64) -> usize {
+fn file_run_count(vol: &mut impl VolReadOps, header_lba: u64) -> usize {
     let chain = vol.file_chain(header_lba).unwrap();
     let seq = read_path_sequence(&chain, vol.block_size());
     count_runs(&seq)
@@ -8135,6 +8253,100 @@ fn tier2_relocates_a_directory_reparenting_its_children() {
     assert_eq!(vol.read_file(a.lba).unwrap(), b"one");
     assert_eq!(vol.read_file(b.lba).unwrap(), b"two");
     assert_clean(&mut vol, "after a tier-2 directory relocation");
+}
+
+/// Reviewer-flagged trace: relocating a hard link that has *other* links
+/// chained after it must never touch those other links. `T` (a file) has
+/// three hard links chained `T -> L1 -> L2 -> L3` (the builder inserts at
+/// the head, so `L3`, `L2`, `L1` are built in that order to land the
+/// chain this way round). Relocating `L1` must repoint only whoever names
+/// `L1` -- `T`'s own `next_link` -- and must leave `L1`'s own `next_link`
+/// (still `L2`, unaffected by `L1` moving) and `L2`'s `real_entry` (still
+/// `T`, never `L1`) untouched. Before the fix, `relocate_header_core`
+/// walked from `L1.next_link` (i.e. `L2`) and stamped `L1`'s *new* address
+/// into `L2.real_entry`, breaking `resolve_link(L2)` and `resolve_link(L3)`.
+#[test]
+fn tier2_relocating_a_link_in_a_chain_does_not_repoint_the_links_after_it() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 400, b"Chain3");
+    let root = b.root_lba();
+    let f = b.add_file(root, b"Original", b"", b"hello");
+    let l3 = b.add_hard_link(root, b"L3", EntryKind::LinkFile, f.header);
+    let l2 = b.add_hard_link(root, b"L2", EntryKind::LinkFile, f.header);
+    let l1 = b.add_hard_link(root, b"L1", EntryKind::LinkFile, f.header);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+    // Confirm the chain landed T -> L1 -> L2 -> L3 before touching anything.
+    assert_eq!(vol.entry_at(f.header).unwrap().next_link as u64, l1);
+    assert_eq!(vol.entry_at(l1).unwrap().next_link as u64, l2);
+    assert_eq!(vol.entry_at(l2).unwrap().next_link as u64, l3);
+    assert_eq!(vol.entry_at(l3).unwrap().next_link, 0);
+    let l1_next_before = vol.entry_at(l1).unwrap().next_link;
+    let l2_real_before = vol.entry_at(l2).unwrap().real_entry;
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.relocate_header(l1).unwrap();
+    let new_l1 = report.new_lba;
+    assert_ne!(new_l1, l1);
+    let mut vol = m.into_volume();
+
+    // T's own next_link must find L1 at its new location.
+    let t = vol.entry_at(f.header).unwrap();
+    assert_eq!(t.next_link as u64, new_l1);
+
+    // L1's own next_link (naming L2) is a fact about L2's position in the
+    // chain, not about L1's own address -- unaffected by the move.
+    let moved_l1 = vol.entry_at(new_l1).unwrap();
+    assert_eq!(moved_l1.next_link, l1_next_before);
+    assert_eq!(moved_l1.real_entry as u64, f.header);
+
+    // L2 (and everything after it) must be completely untouched: its
+    // real_entry still names T (never L1, old or new address), and its
+    // own next_link (naming L3) is unchanged.
+    let l2_entry = vol.entry_at(l2).unwrap();
+    assert_eq!(l2_entry.real_entry, l2_real_before);
+    assert_eq!(l2_entry.real_entry as u64, f.header);
+    assert_eq!(l2_entry.next_link as u64, l3);
+
+    // Every link still resolves to the same target, at its own moved-or-
+    // not location.
+    assert_eq!(vol.resolve_link(&moved_l1).unwrap().lba, f.header);
+    assert_eq!(vol.resolve_link(&l2_entry).unwrap().lba, f.header);
+    let l3_entry = vol.entry_at(l3).unwrap();
+    assert_eq!(vol.resolve_link(&l3_entry).unwrap().lba, f.header);
+
+    assert_clean(&mut vol, "after relocating a mid-chain hard link");
+}
+
+/// The other direction: relocating the link chain's *target* must repoint
+/// every link's `real_entry` at the target's new address -- the behavior
+/// `relocate_header_core`'s `entry.real_entry == 0` branch already
+/// implements correctly (it is the file/directory being moved, not a
+/// link), pinned here alongside the link-relocation fix above so the two
+/// directions of this same code path are both covered.
+#[test]
+fn tier2_relocating_a_link_targets_header_repoints_every_link() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 400, b"ChainTarget");
+    let root = b.root_lba();
+    let f = b.add_file(root, b"Original", b"", b"hello");
+    let l3 = b.add_hard_link(root, b"L3", EntryKind::LinkFile, f.header);
+    let l2 = b.add_hard_link(root, b"L2", EntryKind::LinkFile, f.header);
+    let l1 = b.add_hard_link(root, b"L1", EntryKind::LinkFile, f.header);
+    b.add_bitmap(true);
+    let vol = Volume::open(b.finish(), None).unwrap();
+
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.relocate_header(f.header).unwrap();
+    let new_target = report.new_lba;
+    assert_ne!(new_target, f.header);
+    assert_eq!(report.links_repointed, 3);
+    let mut vol = m.into_volume();
+
+    for link in [l1, l2, l3] {
+        let e = vol.entry_at(link).unwrap();
+        assert_eq!(e.real_entry as u64, new_target, "link {link} not repointed");
+        assert_eq!(vol.resolve_link(&e).unwrap().lba, new_target);
+    }
+    assert_clean(&mut vol, "after relocating a link chain's target");
 }
 
 #[test]
@@ -8598,7 +8810,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
         );
     }
     m.defragment_file(payload_lba).expect("defragment_file");
-    assert_clean(m.volume(), &what("post tier-1"));
+    assert_clean(&mut m.volume(), &what("post tier-1"));
     assert_eq!(
         m.volume().read_file(payload_lba).unwrap(),
         fx.payload,
@@ -8610,7 +8822,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
     let report = m
         .relocate_header(payload_lba)
         .expect("relocate_header (file)");
-    assert_clean(m.volume(), &what("post tier-2 file"));
+    assert_clean(&mut m.volume(), &what("post tier-2 file"));
     let payload_lba = report.new_lba;
     assert_eq!(
         m.volume().lookup(fx.root, b"Payload").unwrap().unwrap().lba,
@@ -8634,7 +8846,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
         "{}",
         what("Devs has one child")
     );
-    assert_clean(m.volume(), &what("post tier-2 dir"));
+    assert_clean(&mut m.volume(), &what("post tier-2 dir"));
     let devs = report.new_lba;
     let inner = m.volume().lookup(devs, b"Inner").unwrap().unwrap();
     assert_eq!(inner.parent as u64, devs, "{}", what("Inner reparented"));
@@ -8673,7 +8885,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
         let report = m
             .relocate_header(entry.lba)
             .expect("relocate_header (long name)");
-        assert_clean(m.volume(), &what("post tier-2 long-name header move"));
+        assert_clean(&mut m.volume(), &what("post tier-2 long-name header move"));
         let entry = m.volume().lookup(fx.root, name).unwrap().unwrap();
         assert_eq!(entry.lba, report.new_lba);
         assert_ne!(
@@ -8696,7 +8908,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
         let cb = entry.comment_block as u64;
         m.make_room(cb..cb + 1)
             .expect("make_room over the comment block");
-        assert_clean(m.volume(), &what("post make_room over comment block"));
+        assert_clean(&mut m.volume(), &what("post make_room over comment block"));
         let entry = m.volume().lookup(fx.root, name).unwrap().unwrap();
         assert_ne!(entry.comment_block, 0);
         assert_eq!(
@@ -8721,7 +8933,7 @@ fn run_compaction_matrix(variant: Variant, bs: usize) {
         "{}",
         what("make_room found something to move")
     );
-    assert_clean(m.volume(), &what("post make_room"));
+    assert_clean(&mut m.volume(), &what("post make_room"));
     assert_eq!(
         m.volume().read_file(payload_lba).unwrap(),
         fx.payload,
@@ -8780,7 +8992,7 @@ fn compaction_matrix_covers_every_variant_and_block_size() {
 /// rename, create or delete); LBAs are exactly what compaction changes.
 /// This is the read side of [`resync_model`]'s path-based matching.
 fn collect_disk_paths(
-    vol: &mut Volume<MemDisk>,
+    vol: &mut impl VolReadOps,
     dir: u64,
     prefix: &[Vec<u8>],
     out: &mut Vec<(Vec<Vec<u8>>, u64)>,
@@ -8825,7 +9037,7 @@ fn collect_model_paths(
 /// vice versa) panics loudly: that is exactly the "compaction lost or
 /// invented an entry" bug this test exists to catch, and a silent partial
 /// resync would hide it instead.
-fn resync_model(vol: &mut Volume<MemDisk>, model: &mut Model) {
+fn resync_model(vol: &mut impl VolReadOps, model: &mut Model) {
     let mut disk_paths = Vec::new();
     collect_disk_paths(vol, model.root, &[], &mut disk_paths);
     let mut model_paths = Vec::new();
@@ -9058,29 +9270,29 @@ fn a_random_interleave_of_mutations_and_compaction_agrees_with_a_model() {
                             let (dir, key) = all[rng.below(all.len())].clone();
                             let lba = model.dirs[&dir][&key].lba;
                             m.relocate_header(lba).expect("relocate_header");
-                            resync_model(m.volume(), &mut model);
+                            resync_model(&mut m.volume(), &mut model);
                             counts[6] += 1;
                         }
                         // make_room over a small range around a
                         // currently-occupied block -- an unreported set
                         // of relocations, per its own contract.
                         _ => {
-                            let used = allocated_set(m.volume());
+                            let used = allocated_set(&mut m.volume());
                             if used.is_empty() {
                                 continue;
                             }
                             let pick = *used.iter().nth(rng.below(used.len())).unwrap();
                             let len = 1 + rng.below(3) as u64;
                             let _ = m.make_room(pick..pick + len);
-                            resync_model(m.volume(), &mut model);
+                            resync_model(&mut m.volume(), &mut model);
                             counts[7] += 1;
                         }
                     }
                 }
 
                 let what = format!("{variant:?} @{bs} batch {batch} (with compaction)");
-                verify_model(m.volume(), &model, &what);
-                assert_clean(m.volume(), &what);
+                verify_model(&mut m.volume(), &model, &what);
+                assert_clean(&mut m.volume(), &what);
             }
 
             for (i, n) in counts.iter().enumerate() {
@@ -9204,7 +9416,7 @@ fn a_small_append_stays_adjacent_to_the_files_last_block() {
         .create_file(root, b"Doc", &amiga_ffs::Metadata::new(), &pattern(20_000))
         .unwrap();
     assert_eq!(
-        file_run_count(m.volume(), header),
+        file_run_count(&mut m.volume(), header),
         1,
         "test setup: the file must start as one run"
     );
@@ -9247,4 +9459,160 @@ fn layout_policy_off_reproduces_the_pre_wave_3_placement() {
     let mut vol = m.into_volume();
     assert_eq!(vol.read_file(header).unwrap(), content);
     assert_clean(&mut vol, "after a policy-off overwrite");
+}
+
+/// The same collision as
+/// `growing_a_floppy_by_one_block_does_not_corrupt_the_new_root`, but on a
+/// 1024-byte-block, non-floppy `Ffs` volume, to confirm the bug (and the
+/// fix) are about the *adjacency* of the root and its one bitmap page —
+/// which this crate's own formatter produces on every block size and
+/// variant, not something peculiar to a 512-byte DD floppy — rather than
+/// anything specific to that geometry. `Populator` lays the root's single
+/// bitmap page immediately after the root, so any grow-by-one that shifts
+/// the midpoint by exactly one block reproduces it; 2000 1024-byte blocks
+/// growing to 2001 does, with root 1000 -> 1001 landing on the old page at
+/// 1001, exactly as the floppy case lands root 880 -> 881 on page 881.
+#[test]
+fn growing_a_1024_byte_ffs_volume_by_one_block_does_not_corrupt_the_new_root() {
+    let nblocks = 2000u64;
+    let disk = MemDisk::filled(1024, nblocks, 0xA5);
+    let opts = FormatOptions::new(Variant::Ffs, nblocks, b"Grow1k");
+    let pop = Populator::new(disk, &opts).expect("populate");
+    let disk = pop.finish().expect("finish");
+    let mut vol = Volume::open_with(disk, Some(Variant::Ffs), nblocks, 2).expect("open");
+    assert_eq!(vol.root_lba(), 1000);
+
+    vol.source_mut().grow(nblocks + 1);
+    let report = vol.resize(nblocks + 1).expect("resize to 2001");
+    assert_eq!(
+        report.new_root_lba, 1001,
+        "the scenario requires this exact collision"
+    );
+
+    let disk = vol.into_inner();
+    let mut fresh = Volume::open_with(disk, Some(Variant::Ffs), nblocks + 1, 2)
+        .expect("volume must still open after resize");
+    let rep = fresh.validate();
+    assert!(
+        rep.findings.is_empty(),
+        "volume should validate clean after a plain grow: {:?}",
+        rep.findings
+    );
+}
+
+/// Reviewer-flagged bug: `resize()` patches the boot block's advisory
+/// root-LBA longword (`OFF_BOOT_ROOT`) but, before this fix, never
+/// touched the boot-area checksum that longword sits inside of. A boot
+/// block a caller made bootable (`FormatOptions::boot_checksum`, or a
+/// real `Install`) therefore came out of a resize with a pointer that no
+/// longer matched its own checksum -- silently turning a bootable image
+/// non-bootable. This formats with `boot_checksum: true`, confirms the
+/// checksum balances before touching anything, resizes, and confirms it
+/// still balances (over the *new* root pointer) afterward. 512-byte
+/// blocks so the boot area's two sectors span both reserved blocks
+/// (`format.rs`'s own `BOOT_AREA_LEN` layout), which is the more exacting
+/// of the two shapes this fix has to handle.
+/// Boot block longword 2 -- the root's LBA. Not part of the crate's
+/// public API (`format.rs`'s own `OFF_BOOT_ROOT` is `pub(crate)`), so
+/// duplicated here rather than exposed just for a test to name it.
+const TEST_OFF_BOOT_ROOT: usize = 8;
+
+#[test]
+fn resize_recomputes_a_valid_boot_checksum_after_moving_the_root() {
+    let nblocks = 1760u64;
+    let disk = MemDisk::filled(512, nblocks, 0);
+    let mut opts = FormatOptions::new(Variant::Ffs, nblocks, b"Bootable");
+    opts.boot_checksum = true;
+    let pop = Populator::new(disk, &opts).expect("populate");
+    let disk = pop.finish().expect("finish");
+
+    let read_boot_area = |disk: &mut MemDisk| -> Vec<u8> {
+        let mut area = vec![0u8; 1024];
+        let mut b0 = vec![0u8; 512];
+        let mut b1 = vec![0u8; 512];
+        disk.read_block(0, &mut b0).unwrap();
+        disk.read_block(1, &mut b1).unwrap();
+        area[..512].copy_from_slice(&b0);
+        area[512..].copy_from_slice(&b1);
+        area
+    };
+
+    let mut disk = disk;
+    let before = read_boot_area(&mut disk);
+    assert_eq!(
+        be32(&before, 4),
+        bootblock_checksum(&before),
+        "test setup: format() with boot_checksum: true must produce a balancing checksum"
+    );
+    assert_eq!(be32(&before, TEST_OFF_BOOT_ROOT), 880);
+
+    let mut vol = Volume::open_with(disk, Some(Variant::Ffs), nblocks, 2).expect("open");
+    vol.source_mut().grow(nblocks + 50);
+    let report = vol.resize(nblocks + 50).expect("resize");
+    assert_ne!(
+        report.new_root_lba, 880,
+        "the scenario needs the root to actually move"
+    );
+
+    let mut disk = vol.into_inner();
+    let after = read_boot_area(&mut disk);
+    assert_eq!(
+        be32(&after, TEST_OFF_BOOT_ROOT),
+        report.new_root_lba as u32,
+        "the root pointer must be updated"
+    );
+    assert_eq!(
+        be32(&after, 4),
+        bootblock_checksum(&after),
+        "the checksum must still balance over the new root pointer after resize"
+    );
+    assert_ne!(
+        be32(&before, 4),
+        be32(&after, 4),
+        "the checksum must actually have been recomputed, not left stale"
+    );
+}
+
+/// The other half of the same fix: an ordinary, non-bootable volume
+/// (`FormatOptions`'s own default, `boot_checksum: false`) leaves the
+/// checksum field at zero both before and after a resize -- `resize()`
+/// must not invent a checksum where `format()` deliberately left none,
+/// per `format.rs`'s own stated reasoning for why that zero is
+/// deliberate (a boot block that checksums correctly and contains no
+/// code is one the ROM would accept and jump into).
+#[test]
+fn resize_does_not_invent_a_boot_checksum_on_an_ordinary_volume() {
+    let nblocks = 1760u64;
+    let disk = MemDisk::filled(512, nblocks, 0);
+    let opts = FormatOptions::new(Variant::Ffs, nblocks, b"Plain");
+    let pop = Populator::new(disk, &opts).expect("populate");
+    let disk = pop.finish().expect("finish");
+
+    let mut disk = disk;
+    let mut boot0 = vec![0u8; 512];
+    disk.read_block(0, &mut boot0).unwrap();
+    assert_eq!(
+        be32(&boot0, 4),
+        0,
+        "test setup: an ordinary format leaves the checksum zero"
+    );
+
+    let mut vol = Volume::open_with(disk, Some(Variant::Ffs), nblocks, 2).expect("open");
+    vol.source_mut().grow(nblocks + 50);
+    let report = vol.resize(nblocks + 50).expect("resize");
+    assert_ne!(report.new_root_lba, 880);
+
+    let mut disk = vol.into_inner();
+    let mut boot0 = vec![0u8; 512];
+    disk.read_block(0, &mut boot0).unwrap();
+    assert_eq!(
+        be32(&boot0, TEST_OFF_BOOT_ROOT),
+        report.new_root_lba as u32,
+        "the root pointer must still be updated"
+    );
+    assert_eq!(
+        be32(&boot0, 4),
+        0,
+        "no checksum should be invented for a boot area that never had a valid one"
+    );
 }
