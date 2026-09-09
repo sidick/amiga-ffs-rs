@@ -1,11 +1,11 @@
 [package]
 name = "amiga-ffs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # Matches amiga-rdb's floor; raising it is a semver-visible decision.
 rust-version = "1.63"
 license = "MIT OR Apache-2.0"
-description = "Amiga Fast File System (OFS/FFS, all DOS\\0-DOS\\7 variants including long filenames): read, validate, repair, format, populate, and mutate volumes"
+description = "Amiga Fast File System (OFS/FFS, all DOS\\0-DOS\\7 variants including long filenames): read, validate, repair, format, populate, mutate, resize, and defragment volumes"
 repository = "https://github.com/sidick/amiga-ffs-rs"
 keywords = ["amiga", "ffs", "ofs", "filesystem", "retrocomputing"]
 categories = ["filesystem", "no-std", "parser-implementations"]
