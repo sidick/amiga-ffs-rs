@@ -1896,6 +1896,46 @@ re-run after each change.
 
 ## In scope, not scheduled
 
+- **CLI tools**, matching and eventually exceeding amitools' `xdftool`
+  and `xdfscan` — the two GPL programs this crate has run as an oracle
+  throughout, never copied from, so a from-scratch permissively-licensed
+  equivalent is a real gap in the ecosystem this crate already fills for
+  the library side. A `bin/` alongside the library, thin: every command
+  below already has a corresponding library call, so the CLI is
+  argument parsing and formatting, not new filesystem logic.
+
+  **`xdftool` equivalent** — inspection (`list` with `all`/`info`/detail,
+  `type`, `info`/statistics from `Bitmap`, `read` extracting a tree via
+  `Volume::read_file`/`read_dir`, `blkdev` geometry), editing (`create`
+  + `format` over every variant this crate already supports —
+  `xdftool` cannot touch `DOS\6`/`DOS\7` or `dircache` at creation, this
+  crate's `format()` already can; `boot show`/`read`/`write`/`clear` —
+  `install`, writing real boot code, is out of scope per the crate's
+  own non-goals, "bytes in, bytes out"; `makedir`/`write`/`delete`/
+  `protect`/`comment`/`time`/`relabel` over `Mutator`), and low-level
+  (`bitmap info`/`free`/`used`/`find` over `Bitmap`, `block dump` over
+  raw reads). `pack`/`unpack`/`repack` map onto `populate_from_tree`,
+  the reverse walk, and `Mutator::compact` respectively — `repack` is
+  this crate's compactor with a CLI wrapped around it, and unlike
+  `xdftool`'s (which admits the same non-interruptible move phase
+  ReOrg's manual admits — see the layout survey) this crate's already
+  never produces worse than a leak.
+
+  **`xdfscan` equivalent** — batch `validate()` over a directory of
+  images, one-line-per-image summaries (`ok`/`NOK`/`nofs`/`NDOS`),
+  verbose per-finding output straight from `Report`'s typed `Finding`s
+  (a strictly more informative verbose mode is free: `xdfscan` reports
+  block numbers and categories, this crate's findings already state
+  each one's *consequence* in `Display`), `-D`/`-H` media-type filters,
+  and — beyond what `xdfscan` offers — an optional `--repair` pass
+  using `Volume::repair()`, since this crate is the first of the two
+  that can fix what it finds rather than only report it.
+
+  Comparison suite: run both tools over the same fixture directory
+  (synthetic + xdftool-generated + fstool-generated) and diff the
+  reports — the differential discipline this crate already applies to
+  the library, extended to the CLI's own output.
+
 - **muFS**: the MultiUser filesystem is explicitly in scope for this
   crate — it is not another family but FFS with the owner field and
   extended permission bits actually used and enforced; same blocks,
