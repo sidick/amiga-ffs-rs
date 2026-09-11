@@ -694,6 +694,34 @@ observe.
       and where the same operation sequence run through both
       implementations produces the same tree, the same file bytes and the
       same used-block count.
+
+      **2026-09-11, as-built — a speculative allocation could fail an
+      operation that needed no space at all, found by independent
+      review.** `refresh_dircache`'s "light-touch directory pull" (the
+      `if self.layout_policy` block a few paragraphs above, trying to
+      relocate a *kept* dircache block nearer to its directory) called
+      `Allocator::allocate_for` behind `?`. That call is purely
+      optimistic — a refusal was already handled correctly one line
+      later, by declining the candidate and moving on, the same as
+      "nothing nearer was found" — but `?` still propagated a *different*
+      failure, most plausibly `AllocError::VolumeFull`, straight out of
+      the whole operation. Since `refresh_dircache` runs on every
+      `unlink`, `delete`, `rename` and `set_metadata` (not only `create_*`,
+      which legitimately needs space), the effect was that deleting an
+      entry from a directory with a two-page-or-larger dircache on a
+      volume with zero free blocks failed with `VolumeFull` — even though
+      the delete needed no new space and would have freed some. Fixed by
+      matching on the trial allocation's `Result` instead of using `?`:
+      any error there is now treated exactly like "no improvement found"
+      (`continue` to the next candidate), and only the genuinely-needed
+      allocations later in the same function (the `fresh` loop, for a
+      dircache that grew) still propagate a real `VolumeFull`. Regression:
+      `deleting_from_a_full_volume_does_not_spuriously_fail_with_volumefull`
+      (`tests/volumes.rs`) — a `DOS\4` volume with 25 files directly in the
+      root (forcing a two-page root dircache), filled solid by creating
+      files until the allocator has genuinely nothing left, then a
+      `delete` of one of the original 25 confirmed to fail before this fix
+      and succeed after it, with the volume validating clean afterwards.
 - [x] **File write/append/truncate**: FFS chains and OFS headers both.
       `Mutator::write_file`, `Mutator::append` and `Mutator::truncate` in
       `src/mutate.rs`, over one private `edit_file` — three ways of
@@ -1543,6 +1571,21 @@ property of every image shipped, not a tuning detail.
   behaviour the `entry.real_entry == 0` branch already got right, pinned
   alongside the fix rather than left implicit.
 
+  **2026-09-11, as-built — a redundant O(n) scan in the same function's
+  extension-pointer rebuild, turning it O(n²) on OFS, found by
+  independent review.** `relocate_header_core`'s loop rebuilding an
+  extension block's data-pointer table reads `old_d = ch.blocks[first +
+  i]` and then, on OFS (where the fresh data-block copies are not at the
+  same LBAs as the old ones, unlike FFS), searched `ch.blocks` all over
+  again with `.position()` to find `old_d`'s index — a value that is, by
+  construction, always `first + i`, the index it was just read from one
+  line above. The search could only ever land back where it started;
+  simplified to `first + i` directly, which is provably equivalent
+  rather than a behaviour change, so no new test — the existing OFS
+  compaction/defrag suite (`compaction_matrix_covers_every_variant_and_
+  block_size` and the tier-2 OFS tests above) covers the code path
+  unchanged and still passes.
+
   **2026-09-09, as-built — a separate independent-review pass, this one
   over `allocate_run`.** `allocate_run_from`'s exact-match search split
   the covered range into two disjoint scans — `from..covered` then
@@ -1581,6 +1624,71 @@ property of every image shipped, not a tuning detail.
   longest run found, full stop. `allocate_run_reserves_one_contiguous_extent`
   and `allocate_run_degrades_gracefully_when_no_run_is_that_long`,
   already covering the non-straddling cases, still pass unchanged.
+
+  **2026-09-11, as-built — `make_room`'s one silent no-op, found by
+  independent review.** `make_room`'s eviction loop has a branch for a
+  block in range that is allocated, not root furniture, and has no
+  header and no `Survey::owner_of` entry — deliberately, for the root's
+  own dircache chain (`Survey`'s own doc comment excludes it: relocating
+  that chain is `resize`'s job, not a survey-driven relocation's) as well
+  as for a genuine orphan. That branch just `break`s, leaving
+  `report.blocks_evacuated` however it already stood and returning `Ok`
+  — success, even though this call evacuated nothing for the one block
+  that mattered. `Volume::resize_evacuating` only checked `.is_err()` on
+  the result, so hitting this branch on the exact block a
+  `RootTargetOccupied` collision named meant it retried `vol.resize(...)`
+  against a collision guaranteed to still be there, reaching the
+  identical refusal a second time for nothing. Fixed by giving
+  `MakeRoomReport` a new field, `not_evacuated: Vec<u64>` — every
+  allocated block still in the requested range when the call returns,
+  which is empty on an ordinary success and non-empty exactly when this
+  branch (or the loop's own runaway-guard) fired — and having
+  `resize_evacuating` check whether the one block it asked to clear is
+  still in that list, returning `EvacuationFailed` immediately instead of
+  retrying when it is. Regression:
+  `resize_evacuating_reports_a_collision_with_the_roots_own_dircache_chain_distinctly`
+  (`tests/volumes.rs`) — a volume built directly with the low-level
+  `Builder` (so the dircache chain's exact block address is known rather
+  than assumed) with a one-block root dircache chain, grown to a size
+  whose new root lands exactly on that block: `make_room` alone is shown
+  to report `not_evacuated == [dc]` with zero blocks evacuated, and
+  `resize_evacuating` end to end is shown to return `EvacuationFailed`
+  rather than a second identical `RootTargetOccupied` reached by a wasted
+  retry, with the volume left at its original size and root position
+  either way.
+
+  **2026-09-11, as-built — a documentation gap in `resize_evacuating`'s
+  safety claim, found by independent review alongside the item above.**
+  `resize_evacuating`'s own doc comment claimed its ordinary refusal path
+  is "unconditionally safe (nothing is written before it fires)". That
+  is true whenever `bitmap_flag` already reads `-1` on entry — the
+  ordinary case — but not when a caller hands `resize_evacuating` a
+  volume already left with `bitmap_flag != -1` by some earlier,
+  unrelated interrupted operation: `resize()` itself repairs the bitmap
+  first in that case (see its own doc comment, and the module's
+  "Retrying" section), which is real writes to the medium, *before* its
+  `RootTargetOccupied` check ever runs. Checked whether this is reachable
+  through `resize_evacuating`'s own call pattern rather than assumed:
+  it is not self-inflicted — a `Mutator` session's `bitmap_flag` stays
+  `-1` throughout (PLAN.md's own M3 allocator entry: "nothing in this
+  module ever lets the bitmap say 'free' about a block something
+  reaches, so the flag stays −1 throughout"), so the second, post-
+  `make_room` call `resize_evacuating` makes to `resize()` always finds
+  `bitmap_flag == -1` regardless of what the first call found — but it
+  *is* reachable at the outer boundary, from a volume `resize_evacuating`
+  did not itself leave mid-update.
+  Chose the doc fix over reordering the check: moving `RootTargetOccupied`
+  ahead of the repair-first branch would make it read an unrepaired
+  bitmap, and an unrepaired bitmap's "allocated" bits cannot be trusted
+  to answer "is the target really occupied" correctly in the first place
+  — the check needs exactly the write it would otherwise be moved ahead
+  of. Not itself a correctness or data-integrity bug (`repair()` only
+  ever rebuilds bitmap bookkeeping from a reachability walk — idempotent,
+  and never a write either refusal needs undone), so the fix is
+  documentation only, on both `Volume::resize` (its "Refuses (without
+  writing anything) if" list gained the same caveat) and
+  `Volume::resize_evacuating` — no test added, because nothing here
+  changes behaviour to pin.
 
   **Wave 3 landed**: passive reorganisation — `Mutator`'s own day-to-day
   writes now place blocks by `Intent` instead of by the bare hint they

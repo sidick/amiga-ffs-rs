@@ -2290,9 +2290,23 @@ impl<S: BlockMedium> Mutator<S> {
             let root_lba = self.vol.root_lba();
             let kept = old.len().min(pages.len());
             for (i, &current) in blocks.iter().enumerate().take(kept).skip(1) {
-                let candidate = self
+                // Purely optimistic: a refusal here (most commonly
+                // `AllocError::VolumeFull`, on a volume with no free
+                // blocks left) means only that no candidate is available
+                // to try, exactly like "nothing nearer was found" below.
+                // It must not fail the whole operation -- unlink, delete,
+                // rename and set_metadata all reach this on every call and
+                // none of them need new space, so propagating the
+                // allocator's refusal with `?` would spuriously fail a
+                // delete on a full volume, the one operation that could
+                // otherwise free it.
+                let candidate = match self
                     .alloc
-                    .allocate_for(Intent::MetadataNearRoot { root_lba })?;
+                    .allocate_for(Intent::MetadataNearRoot { root_lba })
+                {
+                    Ok(candidate) => candidate,
+                    Err(_) => continue,
+                };
                 let current_dist = (current as i64 - dir as i64).unsigned_abs();
                 let candidate_dist = (candidate.block() as i64 - dir as i64).unsigned_abs();
                 if candidate_dist < current_dist {

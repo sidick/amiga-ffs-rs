@@ -6713,6 +6713,81 @@ fn an_interrupted_mutation_leaks_and_never_double_allocates() {
     }
 }
 
+/// Regression for the independent review's finding: `refresh_dircache`'s
+/// "light-touch directory pull" (this module's "Block layout policy"
+/// section, item 3) is a purely optimistic trial — it tries to relocate a
+/// *kept* dircache block nearer to its directory, and simply frees the
+/// candidate again when that turns out not to help. Because the trial
+/// allocation used `?`, `AllocError::VolumeFull` from that speculative
+/// attempt used to propagate out of `unlink`/`delete`/`rename`/
+/// `set_metadata` even though none of those operations need any new space
+/// at all: on a volume with zero free blocks, deleting an entry from a
+/// directory whose dircache spans two or more pages (enough entries that
+/// the pull loop's `.skip(1)` still has a candidate to try) failed with
+/// `VolumeFull`, stranding the volume unable to free itself by ordinary
+/// deletion.
+#[test]
+fn deleting_from_a_full_volume_does_not_spuriously_fail_with_volumefull() {
+    let variant = Variant::FfsIntlDircache;
+    let bs = 512usize;
+    let nblocks = 400u64;
+
+    // Enough entries that the root's dircache needs two pages (25 short
+    // names comfortably clears the ~17-per-page capacity at this block
+    // size), so the pull loop below has a second, kept block to try
+    // relocating.
+    let mut vol = populated(variant, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        for i in 0..25 {
+            pop.create_file(
+                root,
+                format!("F{i}").as_bytes(),
+                &amiga_ffs::Metadata::new(),
+                b"",
+            )
+            .unwrap();
+        }
+    });
+    assert_clean(&mut vol, "freshly populated");
+    let root = vol.root_lba();
+
+    let mut vol = mutating(vol, |m| {
+        // Fill the volume solid. `VolumeFull` is returned only when the
+        // bitmap scan finds no free block anywhere (its own documented
+        // contract), so whichever allocation trips it -- the file's own,
+        // or the dircache pull's speculative one -- the volume genuinely
+        // has zero free blocks once this loop stops.
+        let mut i = 0;
+        loop {
+            match m.create_file(
+                root,
+                format!("G{i}").as_bytes(),
+                &amiga_ffs::Metadata::new(),
+                b"",
+            ) {
+                Ok(_) => {}
+                Err(MutateError::Alloc(AllocError::VolumeFull { .. })) => break,
+                Err(e) => panic!("unexpected error while filling the volume: {e}"),
+            }
+            i += 1;
+            assert!(i < 100_000, "never hit VolumeFull filling the volume");
+        }
+
+        // The delete itself needs no new space -- it only frees blocks --
+        // so it must succeed on a full volume. Before the fix, the
+        // dircache's speculative relocation trial for the directory's
+        // second (kept) cache block propagated the allocator's
+        // `VolumeFull` and failed this outright.
+        m.delete(root, b"F0").expect(
+            "deleting from a full volume must not fail with VolumeFull: an \
+             optimistic dircache-block relocation trial must not be able to \
+             fail an operation that needs no new space",
+        );
+    });
+
+    assert_clean(&mut vol, "after deleting from a full volume");
+}
+
 // ---------------------------------------------------------------------------
 // Mutation against a model
 // ---------------------------------------------------------------------------
@@ -8776,6 +8851,88 @@ fn resize_evacuating_closes_the_root_target_occupied_gap() {
     let big = vol.lookup(root, b"Big").unwrap().unwrap();
     assert_eq!(vol.read_file(big.lba).unwrap(), pattern(600_000));
     assert_clean(&mut vol, "after resize_evacuating");
+}
+
+/// Regression for the independent review's finding: when `RootTargetOccupied`
+/// names a block belonging to the root directory's *own* dircache chain,
+/// `make_room` cannot evacuate it -- `Survey::owner_of` deliberately does
+/// not own the root's own dircache chain, since relocating that is
+/// `resize`'s own job (this module's "Block layout policy" documentation)
+/// -- so it used to fall into the "no owner found" branch, `break`, and
+/// return `Ok` having evacuated nothing. `resize_evacuating` checked only
+/// `is_err()`, so it silently retried `resize`, which refused with the
+/// identical `RootTargetOccupied` a second time. This pins both halves of
+/// the fix: `make_room` now reports the block it could not clear in
+/// `MakeRoomReport::not_evacuated`, and `resize_evacuating` surfaces that
+/// as `EvacuationFailed` instead of wasting a retry.
+#[test]
+fn resize_evacuating_reports_a_collision_with_the_roots_own_dircache_chain_distinctly() {
+    let bs = 512usize;
+    let old_n = 2000u64;
+    let variant = Variant::FfsIntlDircache;
+
+    // Built directly with `Builder` rather than `Populator`, so the
+    // dircache chain's block address is exactly known: `Builder` hands out
+    // LBAs sequentially from `root_lba + 1`, so one file header (consuming
+    // `root_lba + 1`) followed by a one-block dircache chain (consuming
+    // `root_lba + 2`) puts the whole chain at a predictable, single block.
+    let mut b = Builder::new(variant, bs, old_n, b"Collide");
+    let root = b.root_lba();
+    b.add(root, b"F", b"", EntryKind::File, 0);
+    let records = b.dircache_records(root);
+    let dc_blocks = b.add_dircache(root, &records);
+    assert_eq!(
+        dc_blocks.len(),
+        1,
+        "test setup: expected the root's dircache to fit in one block"
+    );
+    let dc = dc_blocks[0];
+    b.add_bitmap(true);
+    let disk = b.finish();
+    let mut vol = Volume::open_with(disk, None, old_n, 2).unwrap();
+
+    // A grow whose new root lands exactly on that one dircache block --
+    // searched for directly, rather than assumed from arithmetic, so the
+    // test's own claim about where `canonical_root_lba` lands is checked
+    // the same way the code under test computes it.
+    let grown = (old_n + 2..old_n + 40)
+        .find(|&n| canonical_root_lba(n, 2) == Some(dc))
+        .expect("test setup: no grow target lands the new root on the dircache block");
+    vol.source_mut().grow(grown);
+
+    let err = vol.resize(grown).unwrap_err();
+    match err {
+        ResizeError::RootTargetOccupied { lba } => assert_eq!(lba, dc),
+        other => panic!("test setup: expected RootTargetOccupied, got {other}"),
+    }
+
+    // `make_room` alone: it must report the collision it could not clear,
+    // not silently succeed having evacuated nothing.
+    let mut m = Mutator::open(vol).unwrap();
+    let report = m.make_room(dc..dc + 1).unwrap();
+    assert_eq!(report.blocks_evacuated, 0);
+    assert_eq!(
+        report.not_evacuated,
+        vec![dc],
+        "make_room must name the block it could not evacuate"
+    );
+    let vol = m.into_volume();
+
+    // And `resize_evacuating`, end to end: distinct `EvacuationFailed`,
+    // not a second identical `RootTargetOccupied` reached by a wasted
+    // retry, and the volume left exactly as the plain refusal would.
+    let (mut vol, result) = vol.resize_evacuating(grown);
+    match result {
+        Err(ResizeError::EvacuationFailed { lba }) => assert_eq!(lba, dc),
+        other => panic!("expected EvacuationFailed, got {other:?}"),
+    }
+    assert_eq!(
+        vol.block_count(),
+        old_n,
+        "a failed evacuation must not have resized the volume"
+    );
+    assert_eq!(vol.root_lba(), root);
+    assert_clean(&mut vol, "after a failed evacuation");
 }
 
 #[test]

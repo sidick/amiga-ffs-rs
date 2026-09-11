@@ -291,6 +291,22 @@ pub struct MakeRoomReport {
     /// Allocated blocks that were in the range before this call and are
     /// not, one way or another, after it.
     pub blocks_evacuated: u64,
+    /// Allocated blocks still in `range` when this returned, because the
+    /// survey found no owner for them — deliberately, for the root's own
+    /// dircache chain (`Survey`'s own doc comment: excluded from its
+    /// `owner_of` reach on purpose, since relocating it is
+    /// [`crate::resize`]'s job, not this one's), or incidentally, for a
+    /// genuine orphan a `repair` has not reclaimed yet. Empty on an
+    /// ordinary success.
+    ///
+    /// This exists so a caller can tell "evacuated everything the range
+    /// asked for" apart from "stopped early, having made zero progress on
+    /// a block it cannot move" — both return `Ok`, since neither is this
+    /// function's own error to raise, but only the second leaves something
+    /// here. [`Volume::resize_evacuating`](crate::Volume::resize_evacuating)
+    /// checks this rather than only `is_err()`, so it does not blindly
+    /// retry a resize that is guaranteed to hit the same collision again.
+    pub not_evacuated: Vec<u64>,
 }
 
 /// One relocation, for [`Mutator::compact`]'s progress callback.
@@ -875,8 +891,13 @@ impl<S: BlockMedium> Mutator<S> {
                         if ffs {
                             old_d as u32
                         } else {
-                            let idx = ch.blocks.iter().position(|&b| b as u64 == old_d).unwrap();
-                            new_data[idx] as u32
+                            // `first + i` is exactly the index `old_d` was
+                            // just read from above -- a search for it is
+                            // always going to land back here, so this is
+                            // the index directly rather than an O(n) scan
+                            // repeated once per pointer (an O(n^2) rebuild
+                            // for a file with many data/extension blocks).
+                            new_data[first + i] as u32
                         }
                     })
                     .collect();
@@ -1304,10 +1325,11 @@ impl<S: BlockMedium> Mutator<S> {
             }
         }
 
-        let after = range
+        let after: Vec<u64> = range
             .filter(|&lba| self.alloc.is_allocated(lba) == Some(true))
-            .count() as u64;
-        report.blocks_evacuated = before.saturating_sub(after);
+            .collect();
+        report.blocks_evacuated = before.saturating_sub(after.len() as u64);
+        report.not_evacuated = after;
         Ok(report)
     }
 }

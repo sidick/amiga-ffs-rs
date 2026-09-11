@@ -468,7 +468,7 @@ impl<S: BlockMedium> Volume<S> {
     /// is what" above for the RDB ordering rule the caller must follow in
     /// each direction.
     ///
-    /// Refuses (without writing anything) if:
+    /// Refuses if:
     /// - there is no room for a root at the new size
     ///   ([`ResizeError::NoRoot`]),
     /// - `new_block_count` will not fit in a 32-bit block pointer
@@ -480,6 +480,19 @@ impl<S: BlockMedium> Volume<S> {
     /// - shrinking would cut off something that is not movable metadata
     ///   ([`ResizeError::UserDataPastCut`]) — see [`Volume::minimum_size`]
     ///   to check ahead of time.
+    ///
+    /// All five refuse without writing anything **when `bitmap_flag`
+    /// already reads `-1` on entry** — the ordinary case, since nothing
+    /// but an interrupted earlier operation leaves it any other way. When
+    /// it does not (a volume handed in mid-update, from a crash this call
+    /// did not cause), this repairs the bitmap first — seen below, and
+    /// necessarily *before* any of the five checks above, since
+    /// `RootTargetOccupied` and `UserDataPastCut` both have to read the
+    /// bitmap to answer their own question and an unrepaired one cannot be
+    /// trusted to answer it correctly. That repair only ever rebuilds
+    /// bitmap bookkeeping from a reachability walk (see [`Volume::repair`]
+    /// and `crate::repair`'s own documentation) — idempotent, and never a
+    /// change any of these five refusals need to be undone.
     ///
     /// The bitmap rebuild this ends with ([`Volume::repair`]) can also
     /// refuse — [`ResizeError::Alloc`] — most plausibly with
@@ -845,11 +858,35 @@ impl<S: BlockMedium> Volume<S> {
     ///
     /// Only ever touches the disk beyond what [`Volume::resize`] already
     /// would when `RootTargetOccupied` is the *first* refusal
-    /// encountered: the ordinary refusal path here is unconditionally
-    /// safe (nothing is written before it fires), so evacuating is always
-    /// attempted against an otherwise-untouched volume, and
-    /// [`ResizeError::EvacuationFailed`] leaves the volume exactly as
-    /// `Volume::resize` alone would have.
+    /// encountered: the ordinary refusal path here is safe in the same
+    /// sense [`Volume::resize`]'s own documentation states it — nothing is
+    /// written before it fires **for a volume whose `bitmap_flag` already
+    /// reads `-1` on entry**. The one exception is inherited, not
+    /// introduced: a volume handed to this method with `bitmap_flag != -1`
+    /// already (left that way by some earlier, unrelated interrupted
+    /// operation, never by this method itself — see below) makes
+    /// `Volume::resize`'s repair-first branch run before its
+    /// `RootTargetOccupied` check even looks at the bitmap. That is still
+    /// safe to evacuate against, and still leaves `EvacuationFailed`
+    /// meaning what it says: [`Volume::repair`] only ever rebuilds the
+    /// bitmap from a reachability walk (see `crate::repair`'s own
+    /// documentation) — it relocates nothing and frees nothing anything
+    /// still reaches — and it is the bitmap *this* check has to trust to
+    /// answer "is the target really occupied" correctly in the first
+    /// place, so reordering the two would trade a harmless extra write for
+    /// an untrustworthy answer. `resize_evacuating` itself never creates
+    /// this precondition for its own retry: a `Mutator` session's
+    /// `bitmap_flag` stays `-1` throughout (this crate's M3 allocator
+    /// design — see PLAN.md — never lets the bitmap say "free" about a
+    /// block something still reaches, so there is nothing to leave
+    /// invalid), so the second, post-`make_room` call this method makes
+    /// always finds `bitmap_flag == -1` regardless of what the first call
+    /// found.
+    ///
+    /// Whichever branch fired, [`ResizeError::EvacuationFailed`] leaves the
+    /// volume with the same block count and root position `Volume::resize`
+    /// alone would have — the repair, when it ran, changed only bitmap
+    /// bookkeeping already known correct, never the tree.
     pub fn resize_evacuating(
         mut self,
         new_block_count: u64,
@@ -873,9 +910,24 @@ impl<S: BlockMedium> Volume<S> {
                  bitmap (block {lba} occupied the new root's target)"
             )
         });
-        if m.make_room(lba..lba + 1).is_err() {
-            let vol = m.into_volume();
-            return (vol, Err(ResizeError::EvacuationFailed { lba }));
+        // `make_room` can return `Ok` having evacuated nothing at all: the
+        // one block this call actually needs cleared may be the root's own
+        // dircache chain, which `Survey` deliberately does not own (see
+        // `MakeRoomReport::not_evacuated`'s doc comment) -- relocating that
+        // is `resize`'s own job, not `make_room`'s. Checking `is_err()`
+        // alone would miss that and retry `resize` below against a
+        // collision that cannot have changed, wasting a whole shrink/grow
+        // attempt to reach the same refusal a second time.
+        match m.make_room(lba..lba + 1) {
+            Ok(report) if report.not_evacuated.contains(&lba) => {
+                let vol = m.into_volume();
+                return (vol, Err(ResizeError::EvacuationFailed { lba }));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let vol = m.into_volume();
+                return (vol, Err(ResizeError::EvacuationFailed { lba }));
+            }
         }
         let mut vol = m.into_volume();
         let result = vol.resize(new_block_count);
