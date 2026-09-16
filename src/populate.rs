@@ -310,6 +310,30 @@ pub enum PopulateError<E> {
         /// The path.
         path: std::path::PathBuf,
     },
+    /// A soft link's path is longer than the block can hold. The field is
+    /// NUL-terminated, so the usable capacity is one byte less than
+    /// [`softlink_path_capacity`] reports.
+    SoftlinkPathTooLong {
+        /// The length offered.
+        len: usize,
+        /// The longest path this block size can store.
+        max: usize,
+    },
+    /// A soft link's path contains a NUL byte, which would truncate the
+    /// NUL-terminated on-disk field rather than store what was given.
+    SoftlinkPathInvalidByte {
+        /// Where the NUL byte was.
+        index: usize,
+    },
+    /// [`Populator::create_hardlink`]'s target is not a plain file or
+    /// directory header — see [`crate::MutateError::LinkTargetKind`] for
+    /// the same refusal on the mutation side, and why.
+    LinkTargetKind {
+        /// The block offered as a target.
+        lba: u64,
+        /// Its secondary type.
+        found: i32,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for PopulateError<E> {
@@ -366,6 +390,21 @@ impl<E: fmt::Display> fmt::Display for PopulateError<E> {
             Self::HostUnsupported { path } => {
                 write!(f, "{}: not a regular file or directory", path.display())
             }
+            Self::SoftlinkPathTooLong { len, max } => write!(
+                f,
+                "soft link path of {len} bytes exceeds this block size's {max}"
+            ),
+            Self::SoftlinkPathInvalidByte { index } => {
+                write!(
+                    f,
+                    "a NUL byte at index {index} would truncate the soft link path"
+                )
+            }
+            Self::LinkTargetKind { lba, found } => write!(
+                f,
+                "block {lba} (secondary type {found}) is not a file or directory, so it cannot be \
+                 a hard link's target"
+            ),
         }
     }
 }
@@ -869,6 +908,100 @@ impl<S: BlockMedium> Populator<S> {
         }
 
         self.emit(&prep, EntryKind::File, total as u32, &mut hdr)
+    }
+
+    // -- links ---------------------------------------------------------------
+
+    /// Create a soft link in `parent` that stores `target_path` verbatim.
+    ///
+    /// See [`crate::Mutator::create_softlink`] for the on-disk shape; this
+    /// is the same block, built by the same `prepare`/`emit` pair every
+    /// other creation in this module uses.
+    ///
+    /// # What it refuses
+    ///
+    /// A path too long for this block size's soft-link field
+    /// ([`PopulateError::SoftlinkPathTooLong`]) and a path containing a
+    /// NUL byte ([`PopulateError::SoftlinkPathInvalidByte`]).
+    pub fn create_softlink(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+        target_path: &[u8],
+    ) -> Result<u64, PopulateError<Transport<S>>> {
+        let bs = self.block_size;
+        let cap = softlink_path_capacity(bs);
+        if target_path.len() >= cap {
+            return Err(PopulateError::SoftlinkPathTooLong {
+                len: target_path.len(),
+                max: cap - 1,
+            });
+        }
+        if let Some(index) = target_path.iter().position(|&b| b == 0) {
+            return Err(PopulateError::SoftlinkPathInvalidByte { index });
+        }
+
+        let prep = self.prepare(parent, name, meta)?;
+        let mut hdr = vec![0u8; bs];
+        hdr[OFF_SOFTLINK_PATH..OFF_SOFTLINK_PATH + target_path.len()].copy_from_slice(target_path);
+
+        self.emit(&prep, EntryKind::SoftLink, 0, &mut hdr)
+    }
+
+    /// Create a hard link in `parent` naming the file or directory header
+    /// this populator already wrote at `target`.
+    ///
+    /// See [`crate::Mutator::create_hardlink`] for the refusals and the
+    /// on-disk shape, identical here minus the allocator: `target`'s
+    /// header is read back and patched in place to point its `next_link`
+    /// at the new link, exactly the way this module already reads a
+    /// directory's own header back to grow its dircache chain
+    /// (`dircache_append`) — its one existing precedent for revisiting a
+    /// block after it was first written.
+    ///
+    /// # What it refuses
+    ///
+    /// A `target` that is not already a plain file or directory header —
+    /// another hard link, a soft link, or anything that does not parse as
+    /// an entry header at all — with [`PopulateError::LinkTargetKind`].
+    pub fn create_hardlink(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+        target: u64,
+    ) -> Result<u64, PopulateError<Transport<S>>> {
+        let bs = self.block_size;
+        self.read_checked(target)?;
+        let st = be32(&self.buf, tail(bs, TL_SECONDARY_TYPE)) as i32;
+        let kind = (be32(&self.buf, OFF_TYPE) == T_HEADER)
+            .then(|| EntryKind::from_secondary_type(st))
+            .flatten();
+        let (link_kind, byte_size) = match kind {
+            Some(EntryKind::File) => (EntryKind::LinkFile, be32(&self.buf, tail(bs, TL_BYTE_SIZE))),
+            Some(EntryKind::Directory) => (EntryKind::LinkDir, 0),
+            _ => {
+                return Err(PopulateError::LinkTargetKind {
+                    lba: target,
+                    found: st,
+                })
+            }
+        };
+        let old_head = be32(&self.buf, tail(bs, TL_NEXT_LINK));
+
+        let prep = self.prepare(parent, name, meta)?;
+        let mut hdr = vec![0u8; bs];
+        wr32(&mut hdr, tail(bs, TL_REAL_ENTRY), target as u32);
+        wr32(&mut hdr, tail(bs, TL_NEXT_LINK), old_head);
+
+        let lba = self.emit(&prep, link_kind, byte_size, &mut hdr)?;
+
+        self.read_checked(target)?;
+        wr32(&mut self.buf, tail(bs, TL_NEXT_LINK), lba as u32);
+        self.put_checked(target)?;
+
+        Ok(lba)
     }
 
     // -- the machinery -----------------------------------------------------
