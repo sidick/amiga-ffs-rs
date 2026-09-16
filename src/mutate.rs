@@ -361,11 +361,12 @@ use crate::build::{
 };
 use crate::dircache::Dircache;
 use crate::file::FileChain;
-use crate::format::{check_name_bytes, div_ceil, wr32, wr_date, NameProblem};
+use crate::format::{check_name_bytes, div_ceil, wr32, wr_bcpl, wr_date, NameProblem};
 use crate::layout::*;
 use crate::populate::Metadata;
 use crate::read::{DateStamp, Entry, EntryKind, Error, RootBlock, Volume};
 use crate::validate::Report;
+use crate::MAX_NAME_CLASSIC;
 use crate::{be32, checksum_ok, hash_table_size, name_hash};
 use crate::{Bitmap, BlockMedium, BlockSource, Transport, Variant};
 
@@ -1794,6 +1795,56 @@ impl<S: BlockMedium> Mutator<S> {
             self.alloc.free(drop_block as u64)?;
         }
         self.refresh_dircache(entry.parent as u64)?;
+        self.flush()?;
+        self.stamp_blocks_used()?;
+        Ok(())
+    }
+
+    /// Rename the volume itself.
+    ///
+    /// [`Mutator::set_metadata`] refuses the root
+    /// ([`MutateError::IsRoot`]) because the root has none of the four
+    /// fields it changes — no protection, no comment, no owner, and its
+    /// "name" is not a directory entry's name field at all. It is the
+    /// BCPL string at longword −20 ([`crate::layout::TL_ROOT_NAME`]),
+    /// 30 bytes on *every* variant including the long-name ones — the
+    /// root's name field never moved to the merged 112-byte layout, the
+    /// same fact [`crate::format::format`] relies on — so this checks the
+    /// name against [`MAX_NAME_CLASSIC`] rather than
+    /// [`Mutator::max_name_len`], which would wrongly allow up to 107
+    /// bytes on `DOS\6`/`DOS\7`.
+    ///
+    /// One write: the field is cleared first (so a shorter new name
+    /// leaves no old bytes past its length byte, the same reason
+    /// `write_name_and_comment` clears before writing), the new name
+    /// is written in, the root's `disk_altered` is stamped from this
+    /// session's clock if it has one, and the checksum is recomputed —
+    /// all in the one buffer `Mutator::put` sends to the disk. There is
+    /// no intermediate state in which the name has changed and the
+    /// checksum has not.
+    pub fn relabel(&mut self, name: &[u8]) -> Result<(), MutateError<Transport<S>>> {
+        check_name_bytes(name, MAX_NAME_CLASSIC).map_err(|p| match p {
+            NameProblem::Empty => MutateError::NameEmpty,
+            NameProblem::TooLong { len, max } => MutateError::NameTooLong { len, max },
+            NameProblem::InvalidByte { byte, index } => {
+                MutateError::NameInvalidByte { byte, index }
+            }
+        })?;
+
+        let bs = self.bs();
+        let root = self.vol.root_lba();
+        let off = tail(bs, TL_ROOT_NAME);
+
+        let mut buf = self.get(root)?;
+        for b in buf[off..off + 1 + MAX_NAME_CLASSIC].iter_mut() {
+            *b = 0;
+        }
+        wr_bcpl(&mut buf, off, name);
+        if let Some(now) = self.clock {
+            wr_date(&mut buf, tail(bs, TL_ROOT_DISK_ALTERED), now);
+        }
+        self.put(root, &mut buf)?;
+
         self.flush()?;
         self.stamp_blocks_used()?;
         Ok(())
