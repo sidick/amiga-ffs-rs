@@ -6539,6 +6539,102 @@ fn dates_move_only_when_the_session_has_been_given_a_clock() {
     }
 }
 
+/// `relabel` changes the root block's own name field, not a directory
+/// entry: it round-trips on every variant, allocates nothing, recomputes
+/// the checksum, and — the same rule as every other mutation, this
+/// module's own "Dates" section — stamps `disk_altered` when the session
+/// has a clock and leaves it alone when it does not.
+#[test]
+fn relabel_renames_the_volume_and_stamps_disk_altered() {
+    let now = DateStamp {
+        days: 1111,
+        mins: 22,
+        ticks: 3,
+    };
+    for variant in ALL_VARIANTS {
+        let vol = mutable(variant, 512, 1760);
+        let before_altered = vol.root().disk_altered;
+        let before_alloc = {
+            let mut v = vol;
+            let s = allocated_set(&mut v);
+            v = mutating(v, |m| {
+                m.relabel(b"NewLabel").unwrap();
+            });
+            let after = allocated_set(&mut v);
+            assert_eq!(s, after, "{variant:?}: relabel allocated something");
+            v
+        };
+        let mut vol = before_alloc;
+        assert_eq!(vol.root().name, b"NewLabel");
+        // No clock: disk_altered is exactly as it was.
+        assert_eq!(vol.root().disk_altered, before_altered);
+        assert_clean(&mut vol, &format!("{variant:?} after an undated relabel"));
+
+        let mut vol = {
+            let mut m = Mutator::open(vol).unwrap().clock(now);
+            m.relabel(b"Dated").unwrap();
+            m.into_volume()
+        };
+        assert_eq!(vol.root().name, b"Dated");
+        assert_eq!(vol.root().disk_altered, now);
+        assert_clean(&mut vol, &format!("{variant:?} after a dated relabel"));
+    }
+}
+
+/// The root's name field is 30 bytes on *every* variant, long-name ones
+/// included — it never moved to the merged 112-byte layout a directory
+/// entry gets on `DOS\6`/`DOS\7`. A name that a long-name directory entry
+/// would happily accept, past 30 bytes, is still refused for the volume.
+#[test]
+fn relabel_uses_the_root_name_limit_not_the_variants_entry_limit() {
+    let vol = mutable(Variant::FfsIntlLongname, 512, 1760);
+    let mut m = Mutator::open(vol).unwrap();
+    assert_eq!(m.max_name_len(), MAX_NAME_LONG);
+
+    let over_root_limit = vec![b'x'; MAX_NAME_CLASSIC + 1];
+    assert!(matches!(
+        m.relabel(&over_root_limit),
+        Err(MutateError::NameTooLong {
+            len,
+            max: MAX_NAME_CLASSIC
+        }) if len == MAX_NAME_CLASSIC + 1
+    ));
+
+    let at_root_limit = vec![b'x'; MAX_NAME_CLASSIC];
+    m.relabel(&at_root_limit).unwrap();
+    let mut vol = m.into_volume();
+    assert_eq!(vol.root().name, at_root_limit);
+    assert_clean(&mut vol, "after relabel at the root's own limit");
+}
+
+/// Empty names and the two path-syntax bytes are refused before anything
+/// is written, the same rule [`check_name_bytes`] enforces for a
+/// directory entry's name.
+#[test]
+fn relabel_refuses_bad_names() {
+    let vol = mutable(Variant::FfsIntl, 512, 1760);
+    let before_name = vol.root().name.clone();
+    let mut m = Mutator::open(vol).unwrap();
+
+    assert!(matches!(m.relabel(b""), Err(MutateError::NameEmpty)));
+    assert!(matches!(
+        m.relabel(b"has/slash"),
+        Err(MutateError::NameInvalidByte { byte: b'/', .. })
+    ));
+    assert!(matches!(
+        m.relabel(b"colon:here"),
+        Err(MutateError::NameInvalidByte { byte: b':', .. })
+    ));
+
+    let mut vol = m.into_volume();
+    assert_eq!(
+        vol.root().name,
+        before_name,
+        "a refused relabel changed the name"
+    );
+    assert_clean(&mut vol, "after refused relabels");
+}
+
 /// Names and comments are checked against the variant's own limits before
 /// a block is allocated, so a refusal costs nothing and leaves nothing.
 #[test]
