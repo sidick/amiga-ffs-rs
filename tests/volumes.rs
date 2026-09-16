@@ -9233,6 +9233,54 @@ fn compact_dry_run_writes_nothing_and_reports_the_work() {
     );
 }
 
+/// `Mutator::require_clean` is off by default, so an inconsistent-but-
+/// bitmap-valid volume (an orphan: allocated, reached by nothing --
+/// `bitmap_flag` stays -1, so `Mutator::open` alone does not refuse it,
+/// per this module's own "What it will not touch" section) compacts
+/// without complaint unless a caller opts in.
+#[test]
+fn require_clean_refuses_compaction_on_an_unvalidated_volume() {
+    let mut b = Builder::new(Variant::FfsIntl, 512, 512, b"Leaky");
+    let root = b.root_lba();
+    let file = b.add_file(root, b"Payload", b"", &pattern(3000)).header;
+    b.add(root, b"Stray", b"", EntryKind::File, 0);
+    let slot = name_hash(b"Stray", Variant::FfsIntl.fold(), hash_table_size(512)) as usize;
+    b.poke(root, OFF_HASH_TABLE + slot * 4, 0);
+    b.add_bitmap(true);
+    let mut vol = Volume::open(b.finish(), None).unwrap();
+
+    // Confirm the fixture: `validate()` sees the orphan, `Mutator::open`
+    // does not refuse it.
+    assert!(!vol.validate().is_clean(), "test setup: must be dirty");
+
+    let mut m = Mutator::open(vol).unwrap().require_clean(true);
+    assert!(matches!(
+        m.compact(&CompactOptions::new()),
+        Err(CompactError::NotClean { .. })
+    ));
+    assert!(matches!(
+        m.defragment_file(file),
+        Err(CompactError::NotClean { .. })
+    ));
+    assert!(matches!(
+        m.relocate_header(file),
+        Err(CompactError::NotClean { .. })
+    ));
+
+    // A dry run writes nothing, so it is exempt -- it is exactly the
+    // tool a caller reaches for to decide whether to run `repair()`
+    // first.
+    m.compact(&CompactOptions::new().dry_run(true))
+        .expect("a dry run must not be refused by require_clean");
+
+    // Off by default: the same dirty volume compacts fine without
+    // opting in.
+    let vol = m.into_volume();
+    let mut m2 = Mutator::open(vol).unwrap();
+    m2.defragment_file(file)
+        .expect("require_clean is off by default");
+}
+
 #[test]
 fn tier2_relocates_a_file_header_and_everything_still_reads_ffs() {
     let mut vol = populated(Variant::FfsIntl, 512, 1760, |pop| {

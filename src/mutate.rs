@@ -771,6 +771,7 @@ pub struct Mutator<S: BlockMedium> {
     pub(crate) alloc: Allocator<Transport<S>>,
     clock: Option<DateStamp>,
     layout_policy: bool,
+    pub(crate) require_clean: bool,
 }
 
 impl<S: BlockMedium> Mutator<S> {
@@ -790,6 +791,7 @@ impl<S: BlockMedium> Mutator<S> {
             alloc,
             clock: None,
             layout_policy: true,
+            require_clean: false,
         })
     }
 
@@ -817,6 +819,43 @@ impl<S: BlockMedium> Mutator<S> {
     /// proxy for something else it actually means.
     pub fn layout_policy(mut self, enabled: bool) -> Self {
         self.layout_policy = enabled;
+        self
+    }
+
+    /// Require [`Volume::validate`](crate::Volume::validate) to report
+    /// clean immediately before [`Mutator::compact`]/
+    /// [`Mutator::compact_with`], [`Mutator::defragment_file`] or
+    /// [`Mutator::relocate_header`]/[`Mutator::relocate_header_to`] do any
+    /// writing, refusing with [`CompactError::NotClean`](crate::compact::CompactError::NotClean)
+    /// otherwise. Off by default.
+    ///
+    /// Scoped to those four entry points on purpose, not a blanket gate on
+    /// every `Mutator` operation: `Mutator::open`'s own `bitmap_flag`
+    /// check (this module's own documentation) is what every write
+    /// already requires, and it is enough for create/delete/write, whose
+    /// hard-checked reads (`entry_at`, `file_chain`, ...) already refuse
+    /// the moment they touch something that does not parse. Compaction is
+    /// different: it can relocate blocks a *soft* inconsistency
+    /// (`Finding::ParentMismatch`, an entry in the wrong hash slot, a
+    /// leaked block it never reads) would leave untouched but now
+    /// interleaved with freshly moved data, which is harder to reason
+    /// about after the fact than before it. A caller relocating a caller-
+    /// provided, already-`entry_at`-verified single header is unaffected
+    /// either way, since `entry_at` would already have refused a header
+    /// that does not parse; this flag is for the retroactive, whole-
+    /// volume policy `Mutator::compact` runs.
+    ///
+    /// A dry-run `compact_with` (`CompactOptions::dry_run`) is exempt —
+    /// it writes nothing, and previewing what compaction *would* do is
+    /// exactly the tool a caller reaches for to decide whether to run
+    /// [`Volume::repair`](crate::Volume::repair) first.
+    ///
+    /// `Volume::validate` walks every reachable block, so turning this on
+    /// makes each gated call cost roughly what one `validate()` costs on
+    /// top of its own work — paid once per `compact`/`compact_with` call,
+    /// not once per file or header it relocates internally.
+    pub fn require_clean(mut self, required: bool) -> Self {
+        self.require_clean = required;
         self
     }
 
