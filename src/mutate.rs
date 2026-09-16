@@ -1132,9 +1132,17 @@ impl<S: BlockMedium> Mutator<S> {
             .then(|| EntryKind::from_secondary_type(st))
             .flatten();
         let (link_kind, byte_size) = match kind {
-            Some(EntryKind::File) => (EntryKind::LinkFile, be32(&target_buf, tail(bs, TL_BYTE_SIZE))),
+            Some(EntryKind::File) => (
+                EntryKind::LinkFile,
+                be32(&target_buf, tail(bs, TL_BYTE_SIZE)),
+            ),
             Some(EntryKind::Directory) => (EntryKind::LinkDir, 0),
-            _ => return Err(MutateError::LinkTargetKind { lba: target, found: st }),
+            _ => {
+                return Err(MutateError::LinkTargetKind {
+                    lba: target,
+                    found: st,
+                })
+            }
         };
         let old_head = be32(&target_buf, tail(bs, TL_NEXT_LINK));
 
