@@ -1816,10 +1816,10 @@ impl<S: BlockMedium> Mutator<S> {
     ///
     /// One write: the field is cleared first (so a shorter new name
     /// leaves no old bytes past its length byte, the same reason
-    /// [`write_name_and_comment`] clears before writing), the new name
+    /// `write_name_and_comment` clears before writing), the new name
     /// is written in, the root's `disk_altered` is stamped from this
     /// session's clock if it has one, and the checksum is recomputed —
-    /// all in the one buffer [`Mutator::put`] sends to the disk. There is
+    /// all in the one buffer `Mutator::put` sends to the disk. There is
     /// no intermediate state in which the name has changed and the
     /// checksum has not.
     pub fn relabel(&mut self, name: &[u8]) -> Result<(), MutateError<Transport<S>>> {
