@@ -194,6 +194,18 @@ pub enum CompactError<E> {
         /// The root block.
         lba: u64,
     },
+    /// [`Mutator::require_clean`] is set and
+    /// [`crate::Volume::validate`] did not report clean immediately
+    /// before this call. Nothing was written; run
+    /// [`crate::Volume::repair`] (or otherwise resolve the findings) and
+    /// retry.
+    NotClean {
+        /// What [`crate::Volume::validate`] found. Boxed: a `Report`
+        /// carries a `Vec<Finding<E>>` inline in its own size (empty on
+        /// the success path every other variant here is sized for), and
+        /// this is the one variant that needs it.
+        report: alloc::boxed::Box<crate::validate::Report<E>>,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for CompactError<E> {
@@ -209,6 +221,12 @@ impl<E: fmt::Display> fmt::Display for CompactError<E> {
                 f,
                 "block {lba} is the volume root -- its position is derived, not chosen; \
                  relocate it through crate::resize instead"
+            ),
+            Self::NotClean { report } => write!(
+                f,
+                "refusing to compact: Volume::validate() found {} issue(s){}",
+                report.findings.len(),
+                if report.truncated { " (truncated)" } else { "" }
             ),
         }
     }
@@ -424,6 +442,30 @@ fn fetch_order(chain: &crate::FileChain, block_size: usize) -> Vec<(bool, u64)> 
 }
 
 // ---------------------------------------------------------------------------
+// The `require_clean` gate
+// ---------------------------------------------------------------------------
+
+impl<S: BlockMedium> Mutator<S> {
+    /// [`Mutator::require_clean`]'s check, run once per public entry
+    /// point rather than once per file or header it relocates
+    /// internally — see that method's own documentation for why the cost
+    /// of `Volume::validate` is paid at most once per call here.
+    fn refuse_unless_clean(&mut self) -> Result<(), CompactError<Transport<S>>> {
+        if !self.require_clean {
+            return Ok(());
+        }
+        let report = self.vol.validate();
+        if report.is_clean() {
+            Ok(())
+        } else {
+            Err(CompactError::NotClean {
+                report: alloc::boxed::Box::new(report),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1: file-data relocation
 // ---------------------------------------------------------------------------
 
@@ -447,6 +489,7 @@ impl<S: BlockMedium> Mutator<S> {
         &mut self,
         header_lba: u64,
     ) -> Result<FileDefragReport, CompactError<Transport<S>>> {
+        self.refuse_unless_clean()?;
         self.defragment_file_avoiding(header_lba, None)
     }
 
@@ -734,6 +777,7 @@ impl<S: BlockMedium> Mutator<S> {
         &mut self,
         lba: u64,
     ) -> Result<HeaderRelocateReport, CompactError<Transport<S>>> {
+        self.refuse_unless_clean()?;
         self.relocate_header_core(lba, DestPick::Auto, None)
     }
 
@@ -744,6 +788,7 @@ impl<S: BlockMedium> Mutator<S> {
         lba: u64,
         dest: u64,
     ) -> Result<HeaderRelocateReport, CompactError<Transport<S>>> {
+        self.refuse_unless_clean()?;
         self.relocate_header_core(lba, DestPick::Exact(dest), None)
     }
 
@@ -1358,6 +1403,14 @@ impl<S: BlockMedium> Mutator<S> {
         options: &CompactOptions,
         mut progress: F,
     ) -> Result<CompactReport, CompactError<Transport<S>>> {
+        // Checked once here, not once per file/header below (both of
+        // which call the unchecked `_avoiding`/`_core` primitives
+        // directly for exactly this reason) -- see
+        // `Mutator::require_clean`'s own documentation for why a dry run,
+        // which writes nothing, is exempt.
+        if !options.dry_run {
+            self.refuse_unless_clean()?;
+        }
         let survey = self.survey()?;
         let mut report = CompactReport {
             dry_run: options.dry_run,
@@ -1380,7 +1433,7 @@ impl<S: BlockMedium> Mutator<S> {
                         }
                     }
                 } else {
-                    let r = self.defragment_file(lba)?;
+                    let r = self.defragment_file_avoiding(lba, None)?;
                     report.runs_before_total += r.runs_before as u64;
                     report.runs_after_total += r.runs_after as u64;
                     if r.blocks_relocated > 0 {
@@ -1393,7 +1446,7 @@ impl<S: BlockMedium> Mutator<S> {
                 if options.dry_run {
                     report.headers_relocated += 1;
                 } else {
-                    let r = self.relocate_header(lba)?;
+                    let r = self.relocate_header_core(lba, DestPick::Auto, None)?;
                     report.headers_relocated += 1;
                     progress(CompactEvent::HeaderRelocated(r));
                 }
