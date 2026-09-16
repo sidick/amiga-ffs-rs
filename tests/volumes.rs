@@ -30,6 +30,9 @@ pub enum MemError {
     /// [`MemDisk::fail_read_once`]. Not proof of anything about the
     /// block's own bytes.
     Glitched { lba: u64 },
+    /// One call to [`ResizableMedium::set_block_count`] failed, injected
+    /// by [`MemDisk::fail_set_block_count_once`].
+    ResizeFailed,
 }
 
 impl std::fmt::Display for MemError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for MemError {
             Self::OutOfRange { lba, blocks } => write!(f, "lba {lba} of {blocks}"),
             Self::Crashed { lba } => write!(f, "the medium died writing lba {lba}"),
             Self::Glitched { lba } => write!(f, "a transient read failure on lba {lba}"),
+            Self::ResizeFailed => write!(f, "set_block_count failed"),
         }
     }
 }
@@ -69,6 +73,12 @@ pub struct MemDisk {
     /// distinct from [`MemDisk::fail_after`], which models the medium
     /// staying dead.
     fail_read_once: Option<u64>,
+    /// Fail the *next* [`ResizableMedium::set_block_count`] call once,
+    /// then behave again -- a resize ioctl or truncate() that failed
+    /// once and would succeed on retry, the case
+    /// [`Volume::resize_to`]'s own documentation says a caller should
+    /// recover from by calling it again.
+    fail_set_block_count_once: bool,
 }
 
 impl BlockSource for MemDisk {
@@ -149,6 +159,10 @@ impl BlockSink for MemDisk {
 /// opposed to a partition mapped onto geometry something else sizes.
 impl ResizableMedium for MemDisk {
     fn set_block_count(&mut self, new_block_count: u64) -> Result<(), MemError> {
+        if self.fail_set_block_count_once {
+            self.fail_set_block_count_once = false;
+            return Err(MemError::ResizeFailed);
+        }
         self.data.resize(new_block_count as usize * self.bs, 0);
         Ok(())
     }
@@ -164,6 +178,7 @@ impl MemDisk {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -177,6 +192,7 @@ impl MemDisk {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -204,6 +220,12 @@ impl MemDisk {
 
     pub fn clear_log(&mut self) {
         self.writes.clear();
+    }
+
+    /// Fail the next [`ResizableMedium::set_block_count`] call once, then
+    /// let it succeed if retried.
+    pub fn fail_set_block_count_once(&mut self) {
+        self.fail_set_block_count_once = true;
     }
 
     /// The blocks read since the last [`MemDisk::clear_read_log`], in
@@ -772,6 +794,7 @@ impl Builder {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -783,6 +806,7 @@ impl Builder {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 }
@@ -8068,6 +8092,53 @@ fn resize_to_shrinks_the_medium_after_shrinking_the_volume() {
         );
         assert_clean(&mut reopened, &format!("{variant:?} reopened after shrink"));
     }
+}
+
+/// `resize_to`'s own documentation: if
+/// [`ResizableMedium::set_block_count`] fails on the truncation *after* a
+/// successful shrink, the volume is already correctly resized in memory
+/// and the caller should retry the same `resize_to` call to finish the
+/// truncation. That retry has to work even though the volume's own
+/// `block_count()` now already equals `new_block_count` -- the truncation
+/// decision must be driven by the medium's actual, still-too-large size,
+/// not by comparing against the in-memory count a first, partially
+/// failed call already advanced.
+#[test]
+fn resize_to_retries_a_failed_truncation_to_completion() {
+    let bs = 512usize;
+    let adf = 1760u64;
+    let hdf_ish = 40_000u64;
+    let (mut vol, tree) = resizable(Variant::Ffs, bs, adf, 0xBEEF, 40_000);
+
+    vol.resize_to(hdf_ish)
+        .unwrap_or_else(|e| panic!("resize_to {hdf_ish}: {e}"));
+
+    vol.source_mut().fail_set_block_count_once();
+    vol.resize_to(adf)
+        .expect_err("the injected set_block_count failure should surface as an error");
+    // The shrink itself already went through -- only the medium
+    // truncation failed -- so the volume already reads at the new size.
+    assert_eq!(vol.block_count(), adf);
+    assert_eq!(
+        BlockSource::block_count(vol.source_mut()),
+        Some(hdf_ish),
+        "the medium is not yet truncated after the injected failure"
+    );
+
+    // Retrying the exact same call must finish the truncation, per
+    // `resize_to`'s documented idempotency -- not silently do nothing
+    // because `old_block_count` already reads `adf`.
+    vol.resize_to(adf)
+        .unwrap_or_else(|e| panic!("retry of resize_to {adf}: {e}"));
+    assert_eq!(
+        BlockSource::block_count(vol.source_mut()),
+        Some(adf),
+        "the retry should finish truncating the medium to the new size"
+    );
+
+    let root = vol.root_lba();
+    check_tree(&mut vol, root, &tree, "after resize_to retry-to-completion");
+    assert_clean(&mut vol, "after resize_to retry-to-completion");
 }
 
 /// A refused shrink must leave the medium exactly as plain `resize` would

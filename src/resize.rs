@@ -952,7 +952,16 @@ impl<S: BlockMedium + ResizableMedium> Volume<S> {
             }
         }
         let report = self.resize(new_block_count)?;
-        if new_block_count < old_block_count {
+        // Checked against the medium's own current size, not
+        // `old_block_count`: after a shrink whose `resize()` succeeded but
+        // whose truncation below failed, a retry lands here with the
+        // volume already at `new_block_count`, so `old_block_count` would
+        // equal `new_block_count` and a check against it would wrongly
+        // skip the truncation this retry exists to finish — leaving the
+        // medium too large forever, contrary to the idempotency promised
+        // above.
+        let have = BlockSource::block_count(self.source_mut()).unwrap_or(new_block_count);
+        if have > new_block_count {
             self.source_mut()
                 .set_block_count(new_block_count)
                 .map_err(ResizeError::Io)?;
