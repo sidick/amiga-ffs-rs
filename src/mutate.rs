@@ -522,6 +522,37 @@ pub enum MutateError<E> {
         /// The largest the format can record.
         max: u64,
     },
+    /// A soft link's path is longer than the block can hold. The field is
+    /// NUL-terminated, so the usable capacity is one byte less than
+    /// [`crate::layout::softlink_path_capacity`] reports.
+    SoftlinkPathTooLong {
+        /// The length offered.
+        len: usize,
+        /// The longest path this block size can store.
+        max: usize,
+    },
+    /// A soft link's path contains a NUL byte. The on-disk field is
+    /// NUL-terminated, so this would silently truncate the path a reader
+    /// gets back rather than store what the caller gave.
+    SoftlinkPathInvalidByte {
+        /// Where the NUL byte was.
+        index: usize,
+    },
+    /// [`Mutator::create_hardlink`]'s target is not a plain file or
+    /// directory header — it is a soft link, another hard link, or a
+    /// block this crate does not recognise as an entry at all. A hard
+    /// link always names the real object directly
+    /// ([`Entry::real_entry`](crate::read::Entry::real_entry)); chaining
+    /// one off another would make every consumer of `real_entry` — not
+    /// just this crate's own [`Volume::resolve_link`](crate::Volume::resolve_link)
+    /// — follow more than one hop for no gain any of the implementations
+    /// surveyed in [`Mutator::delete`]'s own documentation need.
+    LinkTargetKind {
+        /// The block offered as a target.
+        lba: u64,
+        /// Its secondary type.
+        found: i32,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for MutateError<E> {
@@ -590,6 +621,21 @@ impl<E: fmt::Display> fmt::Display for MutateError<E> {
                 f,
                 "a file of {size} bytes cannot be recorded: the format's byte_size field stops at \
                  {max}"
+            ),
+            Self::SoftlinkPathTooLong { len, max } => write!(
+                f,
+                "soft link path of {len} bytes exceeds this block size's {max}"
+            ),
+            Self::SoftlinkPathInvalidByte { index } => {
+                write!(
+                    f,
+                    "a NUL byte at index {index} would truncate the soft link path"
+                )
+            }
+            Self::LinkTargetKind { lba, found } => write!(
+                f,
+                "block {lba} (secondary type {found}) is not a file or directory, so it cannot be \
+                 a hard link's target"
             ),
         }
     }
@@ -995,6 +1041,124 @@ impl<S: BlockMedium> Mutator<S> {
         );
 
         self.emit(&prep, EntryKind::File, data.len() as u32, &mut hdr)
+    }
+
+    // -- links ---------------------------------------------------------------
+
+    /// Create a soft link in `parent` that stores `target_path` verbatim.
+    ///
+    /// A soft link is a header block with no content of its own — the
+    /// path lives where a directory keeps its hash table
+    /// ([`crate::layout::OFF_SOFTLINK_PATH`]), NUL-terminated, and resolving it is
+    /// the consumer's job (see [`Volume::read_softlink`] for why: it may
+    /// name another volume this crate has never heard of). Write order is
+    /// [`Mutator::create_dir`]'s: the header, path included, is complete
+    /// before the parent's hash slot names it, so an interruption leaks an
+    /// unreachable header rather than half-linking a name to nothing.
+    ///
+    /// # What it refuses
+    ///
+    /// A path too long for this block size's soft-link field
+    /// ([`MutateError::SoftlinkPathTooLong`]) and a path containing a NUL
+    /// byte ([`MutateError::SoftlinkPathInvalidByte`]), which the
+    /// NUL-terminated field cannot store without truncating.
+    pub fn create_softlink(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+        target_path: &[u8],
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let bs = self.bs();
+        let cap = softlink_path_capacity(bs);
+        if target_path.len() >= cap {
+            return Err(MutateError::SoftlinkPathTooLong {
+                len: target_path.len(),
+                max: cap - 1,
+            });
+        }
+        if let Some(index) = target_path.iter().position(|&b| b == 0) {
+            return Err(MutateError::SoftlinkPathInvalidByte { index });
+        }
+
+        let prep = self.prepare(parent, name, meta)?;
+        let mut hdr = vec![0u8; bs];
+        hdr[OFF_SOFTLINK_PATH..OFF_SOFTLINK_PATH + target_path.len()].copy_from_slice(target_path);
+
+        self.emit(&prep, EntryKind::SoftLink, 0, &mut hdr)
+    }
+
+    /// Create a hard link in `parent` naming the file or directory header
+    /// at `target`.
+    ///
+    /// `target` must already be a plain file or directory
+    /// ([`MutateError::LinkTargetKind`] otherwise) — never another hard
+    /// link, and never a soft link. [`Entry::real_entry`] always names the
+    /// real object directly; a link permitted to target another link would
+    /// make every reader that follows `real_entry` walk more than one hop
+    /// for a case none of the four implementations surveyed in
+    /// [`Mutator::delete`]'s own documentation need. A link to a
+    /// directory (`ST_LINKDIR`) carries no hash table of its own — the one
+    /// on `target` is what [`Volume::resolve_link`] reaches — and a link
+    /// to a file (`ST_LINKFILE`) records a copy of `target`'s current
+    /// `byte_size`, the field [`Volume::entry_at`] reads for either kind;
+    /// it is not kept in step with `target`'s size afterwards; matching
+    /// AmigaOS, whose own hard links carry no cache-refresh promise
+    /// either.
+    ///
+    /// Write order: the link's own header — `real_entry` naming `target`,
+    /// `next_link` copying whatever `target.next_link` already was — is
+    /// written and chained into `parent` exactly like
+    /// [`Mutator::create_dir`]'s directory-header write. Only *after* that
+    /// succeeds is `target`'s header rewritten, pointing its `next_link`
+    /// at the new link — head insertion into the link chain, the same
+    /// shape a hash chain's head already gets on every create. An
+    /// interruption before that last write leaves the new link's header
+    /// allocated and chained into `parent` but not yet reachable through
+    /// `target`'s own chain — [`Entry::next_link`] still says so, and a
+    /// listing of `parent` would show the link — while `target` itself is
+    /// unaffected; a crash after it leaves both halves consistent. Neither
+    /// state loses a block or frees one something still reaches.
+    pub fn create_hardlink(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        meta: &Metadata<'_>,
+        target: u64,
+    ) -> Result<u64, MutateError<Transport<S>>> {
+        let bs = self.bs();
+        let target_buf = self.get(target)?;
+        let st = be32(&target_buf, tail(bs, TL_SECONDARY_TYPE)) as i32;
+        let kind = (be32(&target_buf, OFF_TYPE) == T_HEADER)
+            .then(|| EntryKind::from_secondary_type(st))
+            .flatten();
+        let (link_kind, byte_size) = match kind {
+            Some(EntryKind::File) => (
+                EntryKind::LinkFile,
+                be32(&target_buf, tail(bs, TL_BYTE_SIZE)),
+            ),
+            Some(EntryKind::Directory) => (EntryKind::LinkDir, 0),
+            _ => {
+                return Err(MutateError::LinkTargetKind {
+                    lba: target,
+                    found: st,
+                })
+            }
+        };
+        let old_head = be32(&target_buf, tail(bs, TL_NEXT_LINK));
+
+        let prep = self.prepare(parent, name, meta)?;
+        let mut hdr = vec![0u8; bs];
+        wr32(&mut hdr, tail(bs, TL_REAL_ENTRY), target as u32);
+        wr32(&mut hdr, tail(bs, TL_NEXT_LINK), old_head);
+
+        let lba = self.emit(&prep, link_kind, byte_size, &mut hdr)?;
+
+        let mut target_hdr = self.get(target)?;
+        wr32(&mut target_hdr, tail(bs, TL_NEXT_LINK), lba as u32);
+        self.put(target, &mut target_hdr)?;
+
+        Ok(lba)
     }
 
     // -- file contents -----------------------------------------------------

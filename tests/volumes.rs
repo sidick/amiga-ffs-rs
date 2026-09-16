@@ -4038,6 +4038,114 @@ fn a_host_timestamp_maps_onto_the_amigados_epoch() {
 }
 
 // ---------------------------------------------------------------------------
+// Populator: link creation
+// ---------------------------------------------------------------------------
+
+/// A `Populator` can create both link kinds, on every variant and both
+/// block sizes: a soft link storing a path verbatim, and hard links to a
+/// file and to a directory whose `next_link` chain threads correctly and
+/// whose `real_entry` resolves through [`Volume::resolve_link`].
+#[test]
+fn populator_creates_soft_and_hard_links_that_resolve_and_validate_clean() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut file_hdr = 0u64;
+            let mut dir_hdr = 0u64;
+            let mut vol = populated(variant, bs, nblocks, |pop| {
+                let root = pop.root_lba();
+                let meta = amiga_ffs::Metadata::new();
+                file_hdr = pop.create_file(root, b"Original", &meta, b"hello").unwrap();
+                dir_hdr = pop.create_dir(root, b"RealDir", &meta).unwrap();
+                pop.create_file(dir_hdr, b"Inside", &meta, b"x").unwrap();
+
+                pop.create_softlink(root, b"Elsewhere", &meta, b"Work:Tools/Ed")
+                    .unwrap();
+                pop.create_hardlink(root, b"FileAlias", &meta, file_hdr)
+                    .unwrap();
+                pop.create_hardlink(root, b"FileAlias2", &meta, file_hdr)
+                    .unwrap();
+                pop.create_hardlink(root, b"DirAlias", &meta, dir_hdr)
+                    .unwrap();
+            });
+
+            let root = vol.root_lba();
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} with links"));
+
+            let soft = vol.lookup(root, b"Elsewhere").unwrap().unwrap();
+            assert_eq!(soft.kind, EntryKind::SoftLink);
+            assert_eq!(vol.read_softlink(soft.lba).unwrap(), b"Work:Tools/Ed");
+
+            let alias = vol.lookup(root, b"FileAlias").unwrap().unwrap();
+            let alias2 = vol.lookup(root, b"FileAlias2").unwrap().unwrap();
+            assert_eq!(alias.kind, EntryKind::LinkFile);
+            assert_eq!(alias.real_entry as u64, file_hdr);
+            assert_eq!(vol.resolve_link(&alias).unwrap().lba, file_hdr);
+            assert_eq!(vol.read_file(alias.real_entry as u64).unwrap(), b"hello");
+            // Head insertion: the second alias is the newer link and sits
+            // first in the target's own chain.
+            let target = vol.entry_at(file_hdr).unwrap();
+            assert_eq!(target.next_link as u64, alias2.lba);
+            assert_eq!(
+                vol.entry_at(alias2.lba).unwrap().next_link as u64,
+                alias.lba
+            );
+            assert_eq!(vol.entry_at(alias.lba).unwrap().next_link, 0);
+
+            let dalias = vol.lookup(root, b"DirAlias").unwrap().unwrap();
+            assert_eq!(dalias.kind, EntryKind::LinkDir);
+            let resolved_dir = vol.resolve_link(&dalias).unwrap();
+            assert_eq!(resolved_dir.lba, dir_hdr);
+            assert_eq!(
+                names(&vol.read_dir(resolved_dir.lba).unwrap()),
+                vec![b"Inside".to_vec()]
+            );
+        }
+    }
+}
+
+/// The refusals: a target that is not already a plain file or directory
+/// header, and a path the on-disk field cannot store.
+#[test]
+fn populator_link_creation_refuses_bad_targets_and_bad_paths() {
+    use amiga_ffs::PopulateError;
+
+    let nblocks = 1760;
+    let disk = MemDisk::filled(512, nblocks, 0xA5);
+    let opts = FormatOptions::new(Variant::FfsIntl, nblocks, b"Target");
+    let mut pop = Populator::new(disk, &opts).expect("format");
+    let root = pop.root_lba();
+    let meta = amiga_ffs::Metadata::new();
+    let file = pop.create_file(root, b"Real", &meta, b"x").unwrap();
+    let link = pop.create_hardlink(root, b"Alias", &meta, file).unwrap();
+
+    // A hard link may not target another hard link.
+    assert!(matches!(
+        pop.create_hardlink(root, b"AliasOfAlias", &meta, link),
+        Err(PopulateError::LinkTargetKind { lba, .. }) if lba == link
+    ));
+    // ...nor a soft link.
+    let soft = pop
+        .create_softlink(root, b"Soft", &meta, b"Anywhere:")
+        .unwrap();
+    assert!(matches!(
+        pop.create_hardlink(root, b"AliasOfSoft", &meta, soft),
+        Err(PopulateError::LinkTargetKind { lba, .. }) if lba == soft
+    ));
+
+    let cap = amiga_ffs::layout::softlink_path_capacity(512);
+    let too_long = vec![b'x'; cap];
+    assert!(matches!(
+        pop.create_softlink(root, b"TooLong", &meta, &too_long),
+        Err(PopulateError::SoftlinkPathTooLong { len, .. }) if len == cap
+    ));
+    assert!(matches!(
+        pop.create_softlink(root, b"HasNul", &meta, b"foo\0bar"),
+        Err(PopulateError::SoftlinkPathInvalidByte { index: 3 })
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // The allocator
 // ---------------------------------------------------------------------------
 
@@ -5612,8 +5720,12 @@ fn delete_refuses_a_directory_with_anything_in_it() {
 
 #[test]
 fn delete_refuses_a_hard_links_target_and_frees_the_links_themselves() {
-    // A volume with a hard link, built by hand: the crate has no
-    // link-creating API yet, and what is under test is the refusal.
+    // A volume with a hard link, built by hand rather than through
+    // `Mutator::create_hardlink`/`create_softlink`: what is under test
+    // here is `delete`'s refusal on links this crate did not itself
+    // create, so a hand-built fixture is the more honest starting point.
+    // `mutator_creates_soft_and_hard_links_that_resolve_and_validate_clean`
+    // below covers the creation API's own round trip.
     let nblocks = 1760;
     let mut b = Builder::new(Variant::FfsIntl, 512, nblocks, b"Linked");
     let root_lba = b.root_lba();
@@ -5650,6 +5762,171 @@ fn delete_refuses_a_hard_links_target_and_frees_the_links_themselves() {
         "after deleting a link, its target and a soft link",
     );
     assert!(vol.read_dir(root).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Mutator: link creation
+// ---------------------------------------------------------------------------
+
+/// `Mutator::create_softlink`/`create_hardlink` in a volume this crate did
+/// not itself write, on every variant and both block sizes: the created
+/// links resolve through [`Volume::resolve_link`]/[`Volume::read_softlink`],
+/// the `next_link` chain threads head-first, and the volume validates
+/// clean afterwards.
+#[test]
+fn mutator_creates_soft_and_hard_links_that_resolve_and_validate_clean() {
+    for variant in ALL_VARIANTS {
+        for bs in [512usize, 4096] {
+            let nblocks = 8 * 1024 * 1024 / bs as u64;
+            let mut vol = mutable(variant, bs, nblocks);
+            let root = vol.root_lba();
+            let devs = vol.lookup(root, b"Devs").unwrap().unwrap().lba;
+            let file = vol
+                .lookup(devs, b"system-configuration")
+                .unwrap()
+                .unwrap()
+                .lba;
+
+            let mut alias = 0u64;
+            let mut alias2 = 0u64;
+            let mut dalias = 0u64;
+            let mut vol = mutating(vol, |m| {
+                let meta = Metadata::new().comment(b"a link");
+                m.create_softlink(root, b"Elsewhere", &meta, b"Work:Tools/Ed")
+                    .unwrap();
+                alias = m.create_hardlink(root, b"FileAlias", &meta, file).unwrap();
+                alias2 = m.create_hardlink(root, b"FileAlias2", &meta, file).unwrap();
+                dalias = m.create_hardlink(root, b"DirAlias", &meta, devs).unwrap();
+            });
+
+            assert_clean(&mut vol, &format!("{variant:?} @{bs} after creating links"));
+
+            let soft = vol.lookup(root, b"Elsewhere").unwrap().unwrap();
+            assert_eq!(soft.kind, EntryKind::SoftLink);
+            assert_eq!(vol.read_softlink(soft.lba).unwrap(), b"Work:Tools/Ed");
+            assert_eq!(vol.comment(&soft).unwrap(), b"a link");
+
+            let a = vol.entry_at(alias).unwrap();
+            assert_eq!(a.kind, EntryKind::LinkFile);
+            assert_eq!(a.real_entry as u64, file);
+            let resolved = vol.resolve_link(&a).unwrap();
+            assert_eq!(resolved.lba, file);
+            assert_eq!(
+                vol.read_file(resolved.lba).unwrap(),
+                vol.read_file(file).unwrap()
+            );
+            // Head insertion into the target's own chain: the second
+            // alias created is the newer link and sits first.
+            let target = vol.entry_at(file).unwrap();
+            assert_eq!(target.next_link as u64, alias2);
+            assert_eq!(vol.entry_at(alias2).unwrap().next_link as u64, alias);
+            assert_eq!(vol.entry_at(alias).unwrap().next_link, 0);
+
+            let d = vol.entry_at(dalias).unwrap();
+            assert_eq!(d.kind, EntryKind::LinkDir);
+            let resolved_dir = vol.resolve_link(&d).unwrap();
+            assert_eq!(resolved_dir.lba, devs);
+            assert_eq!(
+                names(&vol.read_dir(resolved_dir.lba).unwrap()),
+                names(&vol.read_dir(devs).unwrap())
+            );
+
+            // The rest of the tree that was already there is untouched.
+            assert_tree_intact(&mut vol);
+        }
+    }
+}
+
+/// A link created through the API behaves exactly like the hand-built one
+/// [`delete_refuses_a_hard_links_target_and_frees_the_links_themselves`]
+/// exercises: the target refuses to delete while linked, deleting the
+/// link first clears the target's `next_link`, and the target becomes
+/// deletable.
+#[test]
+fn create_hardlink_then_delete_matches_the_hand_built_behavior() {
+    let vol = mutable(Variant::FfsIntl, 512, 1760);
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+    let file = m
+        .volume()
+        .lookup(devs, b"system-configuration")
+        .unwrap()
+        .unwrap()
+        .lba;
+    let meta = Metadata::new();
+    m.create_hardlink(root, b"Alias", &meta, file).unwrap();
+
+    assert!(matches!(
+        m.delete(devs, b"system-configuration"),
+        Err(MutateError::LinkedTo { .. })
+    ));
+
+    m.delete(root, b"Alias").unwrap();
+    assert_eq!(
+        m.volume()
+            .lookup(devs, b"system-configuration")
+            .unwrap()
+            .unwrap()
+            .next_link,
+        0
+    );
+    // Freed of its one link, the file is now deletable, same as ever.
+    m.delete(devs, b"system-configuration").unwrap();
+    m.delete(root, b"Devs").unwrap();
+
+    let mut vol = m.into_volume();
+    assert_clean(
+        &mut vol,
+        "after create_hardlink, delete-refuse, delete-link, delete-target",
+    );
+}
+
+/// The refusals: a target that is not a plain file or directory header,
+/// and a soft link path the block cannot store.
+#[test]
+fn mutator_link_creation_refuses_bad_targets_and_bad_paths() {
+    let vol = mutable(Variant::FfsIntl, 512, 1760);
+    let root = vol.root_lba();
+    let mut m = Mutator::open(vol).unwrap();
+    let devs = m.volume().lookup(root, b"Devs").unwrap().unwrap().lba;
+    let meta = Metadata::new();
+    let link = m.create_hardlink(root, b"Alias", &meta, devs).unwrap();
+    let soft = m
+        .create_softlink(root, b"Soft", &meta, b"Anywhere:")
+        .unwrap();
+
+    // A hard link may not target another hard link, nor a soft link.
+    assert!(matches!(
+        m.create_hardlink(root, b"AliasOfAlias", &meta, link),
+        Err(MutateError::LinkTargetKind { lba, .. }) if lba == link
+    ));
+    assert!(matches!(
+        m.create_hardlink(root, b"AliasOfSoft", &meta, soft),
+        Err(MutateError::LinkTargetKind { lba, .. }) if lba == soft
+    ));
+    // ...nor the root block, which this crate does not recognise as an
+    // entry at all (`ST_ROOT` has no `EntryKind`) — still LinkTargetKind,
+    // not a raw read error leaking through.
+    assert!(matches!(
+        m.create_hardlink(root, b"AliasOfRoot", &meta, root),
+        Err(MutateError::LinkTargetKind { lba, .. }) if lba == root
+    ));
+
+    let cap = amiga_ffs::layout::softlink_path_capacity(512);
+    let too_long = vec![b'x'; cap];
+    assert!(matches!(
+        m.create_softlink(root, b"TooLong", &meta, &too_long),
+        Err(MutateError::SoftlinkPathTooLong { len, .. }) if len == cap
+    ));
+    assert!(matches!(
+        m.create_softlink(root, b"HasNul", &meta, b"foo\0bar"),
+        Err(MutateError::SoftlinkPathInvalidByte { index: 3 })
+    ));
+
+    // Every refusal above changed nothing.
+    let mut vol = m.into_volume();
+    assert_clean(&mut vol, "after every link-creation refusal");
 }
 
 // ---------------------------------------------------------------------------
