@@ -1125,21 +1125,20 @@ impl<S: BlockMedium> Mutator<S> {
         meta: &Metadata<'_>,
         target: u64,
     ) -> Result<u64, MutateError<Transport<S>>> {
-        let target_entry = self.vol.entry_at(target)?;
-        let (link_kind, byte_size) = match target_entry.kind {
-            EntryKind::File => (EntryKind::LinkFile, target_entry.byte_size),
-            EntryKind::Directory => (EntryKind::LinkDir, 0),
-            _ => {
-                return Err(MutateError::LinkTargetKind {
-                    lba: target,
-                    found: target_entry.kind.secondary_type(),
-                })
-            }
+        let bs = self.bs();
+        let target_buf = self.get(target)?;
+        let st = be32(&target_buf, tail(bs, TL_SECONDARY_TYPE)) as i32;
+        let kind = (be32(&target_buf, OFF_TYPE) == T_HEADER)
+            .then(|| EntryKind::from_secondary_type(st))
+            .flatten();
+        let (link_kind, byte_size) = match kind {
+            Some(EntryKind::File) => (EntryKind::LinkFile, be32(&target_buf, tail(bs, TL_BYTE_SIZE))),
+            Some(EntryKind::Directory) => (EntryKind::LinkDir, 0),
+            _ => return Err(MutateError::LinkTargetKind { lba: target, found: st }),
         };
-        let old_head = target_entry.next_link;
+        let old_head = be32(&target_buf, tail(bs, TL_NEXT_LINK));
 
         let prep = self.prepare(parent, name, meta)?;
-        let bs = self.bs();
         let mut hdr = vec![0u8; bs];
         wr32(&mut hdr, tail(bs, TL_REAL_ENTRY), target as u32);
         wr32(&mut hdr, tail(bs, TL_NEXT_LINK), old_head);

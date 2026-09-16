@@ -5871,6 +5871,13 @@ fn mutator_link_creation_refuses_bad_targets_and_bad_paths() {
         m.create_hardlink(root, b"AliasOfSoft", &meta, soft),
         Err(MutateError::LinkTargetKind { lba, .. }) if lba == soft
     ));
+    // ...nor the root block, which this crate does not recognise as an
+    // entry at all (`ST_ROOT` has no `EntryKind`) — still LinkTargetKind,
+    // not a raw read error leaking through.
+    assert!(matches!(
+        m.create_hardlink(root, b"AliasOfRoot", &meta, root),
+        Err(MutateError::LinkTargetKind { lba, .. }) if lba == root
+    ));
 
     let cap = amiga_ffs::layout::softlink_path_capacity(512);
     let too_long = vec![b'x'; cap];
