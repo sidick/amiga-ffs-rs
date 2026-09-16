@@ -140,7 +140,12 @@
 //!
 //! Beyond the milestones: [`Volume::resize`] grows and shrinks a volume
 //! in place (idempotent on retry, with `resize_evacuating` moving what
-//! blocks the way); [`Mutator::compact`], `defragment_file`,
+//! blocks the way); [`Volume::resize_to`] does the same for a medium that
+//! implements [`ResizableMedium`] — one that owns its own storage rather
+//! than being sized by an outside authority — by growing or truncating
+//! the medium itself as part of the one call, instead of a caller
+//! extending raw bytes and reopening at the old size by hand;
+//! [`Mutator::compact`], `defragment_file`,
 //! `relocate_header` and `make_room` reorganise existing volumes; and
 //! the allocator's [`Intent`] vocabulary carries a measured layout
 //! policy — metadata clustered at the root where directory walks pay,
@@ -203,7 +208,7 @@ pub use format::{format, FormatError, FormatLayout, FormatOptions, BOOT_AREA_LEN
 pub use mutate::{MetaUpdate, MutateError, Mutator, MutatorVolume};
 pub use populate::{Metadata, PopulateError, Populator};
 pub use repair::{Action, RepairOptions, RepairReport};
-pub use resize::{ResizeError, ResizeReport};
+pub use resize::{ResizableMedium, ResizeError, ResizeReport};
 pub use validate::{DircacheDiscrepancy, Finding, Report, Summary};
 
 /// Anything that can produce fixed-size blocks by LBA.

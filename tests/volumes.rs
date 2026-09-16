@@ -30,6 +30,9 @@ pub enum MemError {
     /// [`MemDisk::fail_read_once`]. Not proof of anything about the
     /// block's own bytes.
     Glitched { lba: u64 },
+    /// One call to [`ResizableMedium::set_block_count`] failed, injected
+    /// by [`MemDisk::fail_set_block_count_once`].
+    ResizeFailed,
 }
 
 impl std::fmt::Display for MemError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for MemError {
             Self::OutOfRange { lba, blocks } => write!(f, "lba {lba} of {blocks}"),
             Self::Crashed { lba } => write!(f, "the medium died writing lba {lba}"),
             Self::Glitched { lba } => write!(f, "a transient read failure on lba {lba}"),
+            Self::ResizeFailed => write!(f, "set_block_count failed"),
         }
     }
 }
@@ -69,6 +73,12 @@ pub struct MemDisk {
     /// distinct from [`MemDisk::fail_after`], which models the medium
     /// staying dead.
     fail_read_once: Option<u64>,
+    /// Fail the *next* [`ResizableMedium::set_block_count`] call once,
+    /// then behave again -- a resize ioctl or truncate() that failed
+    /// once and would succeed on retry, the case
+    /// [`Volume::resize_to`]'s own documentation says a caller should
+    /// recover from by calling it again.
+    fail_set_block_count_once: bool,
 }
 
 impl BlockSource for MemDisk {
@@ -144,6 +154,20 @@ impl BlockSink for MemDisk {
     }
 }
 
+/// `Volume::resize_to`'s own seam: `MemDisk` owns its storage outright (a
+/// plain `Vec<u8>`), which is exactly the case that trait exists for, as
+/// opposed to a partition mapped onto geometry something else sizes.
+impl ResizableMedium for MemDisk {
+    fn set_block_count(&mut self, new_block_count: u64) -> Result<(), MemError> {
+        if self.fail_set_block_count_once {
+            self.fail_set_block_count_once = false;
+            return Err(MemError::ResizeFailed);
+        }
+        self.data.resize(new_block_count as usize * self.bs, 0);
+        Ok(())
+    }
+}
+
 impl MemDisk {
     /// An image of nothing: what a formatter is handed.
     pub fn blank(bs: usize, nblocks: u64) -> Self {
@@ -154,6 +178,7 @@ impl MemDisk {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -167,6 +192,7 @@ impl MemDisk {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -194,6 +220,12 @@ impl MemDisk {
 
     pub fn clear_log(&mut self) {
         self.writes.clear();
+    }
+
+    /// Fail the next [`ResizableMedium::set_block_count`] call once, then
+    /// let it succeed if retried.
+    pub fn fail_set_block_count_once(&mut self) {
+        self.fail_set_block_count_once = true;
     }
 
     /// The blocks read since the last [`MemDisk::clear_read_log`], in
@@ -762,6 +794,7 @@ impl Builder {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 
@@ -773,6 +806,7 @@ impl Builder {
             reads: Vec::new(),
             fail_after: None,
             fail_read_once: None,
+            fail_set_block_count_once: false,
         }
     }
 }
@@ -8049,6 +8083,219 @@ fn resize_grows_and_shrinks_every_variant_and_block_size() {
             assert_bitmap_and_lnfs_fields_agree(&mut vol, "after shrink");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// resize_to() / ResizableMedium
+// ---------------------------------------------------------------------------
+
+/// `Volume::resize_to` growing an ADF-sized floppy volume up to an
+/// HDF-ish size, with no raw-byte extension of the medium done by the
+/// test itself -- the whole point of the trait. Contents survive, the
+/// bitmap and LNFS fields agree, and the medium's own reported block
+/// count lands exactly on `new_block_count`, not merely "big enough".
+#[test]
+fn resize_to_grows_the_medium_before_growing_the_volume() {
+    for variant in ALL_VARIANTS {
+        let bs = 512usize;
+        let adf = 1760u64; // A stock DD floppy.
+        let hdf_ish = 40_000u64; // Comfortably past the ADF/HDF line.
+        let (mut vol, tree) = resizable(variant, bs, adf, 0xF00D, 40_000);
+        let root = vol.root_lba();
+        check_tree(&mut vol, root, &tree, "before grow");
+
+        assert_eq!(
+            BlockSource::block_count(vol.source_mut()),
+            Some(adf),
+            "{variant:?}: medium should not already have HDF-sized room"
+        );
+
+        let report = vol
+            .resize_to(hdf_ish)
+            .unwrap_or_else(|e| panic!("{variant:?} resize_to {hdf_ish}: {e}"));
+        assert_eq!(report.old_block_count, adf);
+        assert_eq!(report.new_block_count, hdf_ish);
+        assert_eq!(
+            BlockSource::block_count(vol.source_mut()),
+            Some(hdf_ish),
+            "{variant:?}: the medium itself should now report the new size exactly"
+        );
+        assert_eq!(vol.block_count(), hdf_ish);
+        assert_eq!(vol.root_lba(), canonical_root_lba(hdf_ish, 2).unwrap());
+
+        let root = vol.root_lba();
+        check_tree(&mut vol, root, &tree, "after grow via resize_to");
+        assert_clean(&mut vol, &format!("{variant:?} after resize_to grow"));
+        assert_bitmap_and_lnfs_fields_agree(&mut vol, "after resize_to grow");
+
+        // Re-open from scratch over the same medium, proving the grown
+        // volume is not an artefact of the in-memory `Volume` that grew
+        // it.
+        let disk = vol.into_inner();
+        let mut reopened = Volume::open(disk, Some(variant)).expect("re-open after grow");
+        let root = reopened.root_lba();
+        check_tree(&mut reopened, root, &tree, "reopened after resize_to grow");
+        assert_clean(&mut reopened, &format!("{variant:?} reopened after grow"));
+    }
+}
+
+/// The other half of the round trip: growing then shrinking straight back
+/// via `resize_to` alone truncates the medium itself down to exactly
+/// `new_block_count`, so nothing downstream has to read the volume back a
+/// block at a time to know how much of the old medium is still current.
+#[test]
+fn resize_to_shrinks_the_medium_after_shrinking_the_volume() {
+    for variant in ALL_VARIANTS {
+        let bs = 512usize;
+        let adf = 1760u64;
+        let hdf_ish = 40_000u64;
+        let (mut vol, tree) = resizable(variant, bs, adf, 0xBEEF, 40_000);
+
+        vol.resize_to(hdf_ish)
+            .unwrap_or_else(|e| panic!("{variant:?} resize_to {hdf_ish}: {e}"));
+
+        let report = vol
+            .resize_to(adf)
+            .unwrap_or_else(|e| panic!("{variant:?} resize_to {adf}: {e}"));
+        assert_eq!(report.old_block_count, hdf_ish);
+        assert_eq!(report.new_block_count, adf);
+        assert_eq!(
+            BlockSource::block_count(vol.source_mut()),
+            Some(adf),
+            "{variant:?}: the medium should be truncated to exactly the new size"
+        );
+        assert_eq!(vol.block_count(), adf);
+        assert_eq!(vol.root_lba(), canonical_root_lba(adf, 2).unwrap());
+
+        let root = vol.root_lba();
+        check_tree(&mut vol, root, &tree, "after resize_to shrink");
+        assert_clean(&mut vol, &format!("{variant:?} after resize_to shrink"));
+        assert_bitmap_and_lnfs_fields_agree(&mut vol, "after resize_to shrink");
+
+        let disk = vol.into_inner();
+        assert_eq!(
+            BlockSource::block_count(&disk),
+            Some(adf),
+            "{variant:?}: the saved medium is exactly the new, smaller size"
+        );
+        let mut reopened = Volume::open(disk, Some(variant)).expect("re-open after shrink");
+        let root = reopened.root_lba();
+        check_tree(
+            &mut reopened,
+            root,
+            &tree,
+            "reopened after resize_to shrink",
+        );
+        assert_clean(&mut reopened, &format!("{variant:?} reopened after shrink"));
+    }
+}
+
+/// `resize_to`'s own documentation: if
+/// [`ResizableMedium::set_block_count`] fails on the truncation *after* a
+/// successful shrink, the volume is already correctly resized in memory
+/// and the caller should retry the same `resize_to` call to finish the
+/// truncation. That retry has to work even though the volume's own
+/// `block_count()` now already equals `new_block_count` -- the truncation
+/// decision must be driven by the medium's actual, still-too-large size,
+/// not by comparing against the in-memory count a first, partially
+/// failed call already advanced.
+#[test]
+fn resize_to_retries_a_failed_truncation_to_completion() {
+    let bs = 512usize;
+    let adf = 1760u64;
+    let hdf_ish = 40_000u64;
+    let (mut vol, tree) = resizable(Variant::Ffs, bs, adf, 0xBEEF, 40_000);
+
+    vol.resize_to(hdf_ish)
+        .unwrap_or_else(|e| panic!("resize_to {hdf_ish}: {e}"));
+
+    vol.source_mut().fail_set_block_count_once();
+    vol.resize_to(adf)
+        .expect_err("the injected set_block_count failure should surface as an error");
+    // The shrink itself already went through -- only the medium
+    // truncation failed -- so the volume already reads at the new size.
+    assert_eq!(vol.block_count(), adf);
+    assert_eq!(
+        BlockSource::block_count(vol.source_mut()),
+        Some(hdf_ish),
+        "the medium is not yet truncated after the injected failure"
+    );
+
+    // Retrying the exact same call must finish the truncation, per
+    // `resize_to`'s documented idempotency -- not silently do nothing
+    // because `old_block_count` already reads `adf`.
+    vol.resize_to(adf)
+        .unwrap_or_else(|e| panic!("retry of resize_to {adf}: {e}"));
+    assert_eq!(
+        BlockSource::block_count(vol.source_mut()),
+        Some(adf),
+        "the retry should finish truncating the medium to the new size"
+    );
+
+    let root = vol.root_lba();
+    check_tree(&mut vol, root, &tree, "after resize_to retry-to-completion");
+    assert_clean(&mut vol, "after resize_to retry-to-completion");
+}
+
+/// A refused shrink must leave the medium exactly as plain `resize` would
+/// -- untouched -- since `resize_to`'s truncation only ever runs after
+/// `resize` has already returned `Ok`. Built the same deterministic way
+/// `resize_shrink_refuses_user_data_past_the_cut_and_minimum_size_agrees`
+/// is: a big filler deleted afterwards and a small straggler, so the
+/// refusal is unambiguously `UserDataPastCut` and never
+/// `RootTargetOccupied`.
+#[test]
+fn resize_to_leaves_the_medium_untouched_on_a_refused_shrink() {
+    let bs = 512usize;
+    let nblocks = 20_000u64;
+    let mut vol = populated(Variant::Ffs, bs, nblocks, |pop| {
+        let root = pop.root_lba();
+        pop.create_file(
+            root,
+            b"Filler",
+            &amiga_ffs::Metadata::new(),
+            &pattern(400_000),
+        )
+        .unwrap();
+        pop.create_file(
+            root,
+            b"Straggler",
+            &amiga_ffs::Metadata::new(),
+            &pattern(2000),
+        )
+        .unwrap();
+    });
+    let mut m = Mutator::open(vol).unwrap();
+    let root = m.volume().root_lba();
+    m.delete(root, b"Filler").unwrap();
+    vol = m.into_volume();
+    assert_clean(&mut vol, "after deleting the filler");
+
+    let min = vol.minimum_size().unwrap();
+    assert!(min > 2 && min < nblocks, "sanity: min={min}");
+
+    let err = vol
+        .resize_to(min - 1)
+        .expect_err("one block short of the minimum must refuse");
+    assert!(
+        matches!(err, ResizeError::UserDataPastCut { .. }),
+        "unexpected refusal: {err}"
+    );
+    assert_eq!(
+        BlockSource::block_count(vol.source_mut()),
+        Some(nblocks),
+        "a refused shrink must not truncate the medium"
+    );
+    assert_eq!(vol.block_count(), nblocks);
+
+    // And exactly the minimum succeeds, truncating the medium down to it.
+    vol.resize_to(min)
+        .unwrap_or_else(|e| panic!("resize_to minimum_size {min}: {e}"));
+    assert_eq!(BlockSource::block_count(vol.source_mut()), Some(min));
+    assert_clean(&mut vol, "at minimum_size via resize_to");
+    let root = vol.root_lba();
+    let straggler = vol.lookup(root, b"Straggler").unwrap().expect("Straggler");
+    assert_eq!(vol.read_file(straggler.lba).unwrap(), pattern(2000));
 }
 
 /// Resizing to the size a volume already is writes nothing at all.

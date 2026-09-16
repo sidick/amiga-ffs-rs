@@ -1382,6 +1382,57 @@ observe.
         `resize_does_not_invent_a_boot_checksum_on_an_ordinary_volume`
         (an ordinary volume's checksum longword stays zero through a
         resize that still updates the pointer).
+- [x] **`ResizableMedium` and `Volume::resize_to`** (2026-09-16, an
+      ergonomics pass, motivated by amidisk's `resize` command in
+      sidick/amiga-tools). `Volume::resize` never extends the backing
+      medium — it only ever writes blocks up to whatever size the medium
+      already reports — and `Volume::open`/`Volume::open_with` fix a
+      volume's `block_count` at open time, so a consumer growing an
+      in-memory or file-backed image had to do three things by hand, in
+      order: pre-extend the raw bytes with zeros, open at the *old*
+      `block_count` over the now-larger buffer via `open_with` (`open`
+      alone reads the medium's new, bigger size straight back as the
+      volume's own — the wrong value for `resize` to treat as "before"),
+      resize, then read back exactly `new_block_count` blocks into a
+      fresh buffer to save, since `resize` never shrinks the medium
+      either. Folklore living in every caller's own module doc rather
+      than in this crate, and precisely the workaround amidisk's
+      `tools/amidisk/src/commands/resize.rs` documents and implements.
+      `Volume::resize` and `Volume::open`/`open_with` are otherwise
+      exactly right for a medium sized by an outside authority (an RDB
+      entry, a partition on a real device) — this crate must never be
+      the one deciding how big a real device is — so the fix is not a
+      redesign of either; it is a new opt-in seam for the other case, a
+      medium that *is* its own storage. `ResizableMedium` in
+      `src/resize.rs`, a `BlockSource` extension trait with one method,
+      `set_block_count(&mut self, new_block_count) -> Result<(), Self::Error>`,
+      documented to zero-fill on grow (the same stance this crate's
+      write side already takes on a file grown past its old end) and to
+      discard on shrink; `Volume::resize_to` composes it with the
+      existing, unchanged `Volume::resize`: extend first when growing
+      and only when the medium does not already report enough room,
+      run `resize`, then truncate after a successful shrink. Every
+      refusal `resize` itself can still make is unchanged — `resize_to`
+      leaves the medium and the volume exactly where plain `resize`
+      would on any error, since a grow's extension only ever adds unused
+      capacity before `resize`'s own checks run and a shrink's
+      truncation only happens after `resize` has already returned `Ok`.
+      Tested in `tests/volumes.rs`: `MemDisk` (the test harness's
+      in-memory `BlockSource`/`BlockSink`) gained a `ResizableMedium`
+      impl, and `resize_to_grows_the_medium_before_growing_the_volume`
+      /`resize_to_shrinks_the_medium_after_shrinking_the_volume` cover an
+      ADF-sized floppy grown past a raw-byte-extension workaround would
+      ever need to think about (past the HDF-sized end this milestone's
+      other tests already exercise) and shrunk back, contents
+      byte-identical and `validate()` clean throughout, with the
+      medium's own reported block count asserted to match
+      `new_block_count` exactly on both sides of the round trip — the
+      one thing the hand-rolled workaround had to get right for itself
+      that this call now guarantees. A third test
+      (`resize_to_leaves_the_medium_untouched_on_a_refused_shrink`)
+      pins the "leaves things exactly as plain `resize` would" claim
+      directly: a shrink refused with `UserDataPastCut` leaves the
+      medium's block count unchanged.
 
 ## Milestone 5 — block layout policy and compaction
 

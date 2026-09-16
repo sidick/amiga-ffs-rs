@@ -143,6 +143,33 @@
 //!   Shrinking the partition first would place blocks this crate still
 //!   considers part of the volume (however briefly) outside what the
 //!   medium reports, which is the same hazard from the other direction.
+//!
+//! # A medium that owns its own storage
+//!
+//! The ordering rule above presumes an outside authority — an RDB entry,
+//! a partition table — whose job it already is to change how big the
+//! medium is. Plenty of callers have no such thing: an in-memory image, a
+//! disk file a tool reads and rewrites whole, anything where the medium
+//! *is* its own storage rather than a window onto fixed geometry. For
+//! those, growing has always meant three manual steps in a specific
+//! order — extend the raw bytes with zeros, open at the *old*
+//! `block_count` over the now-larger buffer via [`Volume::open_with`]
+//! (opening the ordinary way, [`Volume::open`], reads the medium's *new*
+//! size straight back as the volume's own, which is the wrong old value
+//! for [`Volume::resize`] to treat as "before") — and, after a shrink,
+//! read back exactly `new_block_count` blocks and hand only those to
+//! whatever saves the image, since [`Volume::resize`] only ever writes
+//! blocks and never changes how many the medium holds.
+//!
+//! [`ResizableMedium`] and [`Volume::resize_to`] make that first-class
+//! instead of folklore: implement [`ResizableMedium::set_block_count`]
+//! for a backend that owns its storage, and [`Volume::resize_to`] grows
+//! the medium before growing the volume, and truncates it after shrinking
+//! the volume, in the one call. [`Volume::open`]/[`Volume::open_with`] and
+//! plain [`Volume::resize`] are unchanged and remain the right tools for a
+//! medium something else sizes — a partition, a fixed-size device — where
+//! this crate must never be the one deciding how big the underlying
+//! storage is.
 
 use alloc::collections::BTreeSet;
 use alloc::vec;
@@ -348,6 +375,46 @@ pub struct ResizeReport {
     /// The [`Volume::repair`] call this operation ends with — the bitmap
     /// rebuild, in full.
     pub repair: RepairReport,
+}
+
+// ---------------------------------------------------------------------------
+// A medium that owns its own storage
+// ---------------------------------------------------------------------------
+
+/// A medium that owns its own storage and can be grown or shrunk to hold
+/// exactly `new_block_count` blocks — the missing half of
+/// [`BlockSource::block_count`]/[`crate::BlockSink::block_count`], which
+/// only ever *report* a size, never change one.
+///
+/// See this module's documentation ("A medium that owns its own storage")
+/// for why this exists: [`Volume::resize`] only ever moves blocks around
+/// inside whatever the medium already is, which is correct for a medium
+/// something else sizes (a partition, a fixed-size device) and a sharp
+/// edge for one that is its own storage and has no such outside
+/// authority. Implementing this trait for such a backend — an in-memory
+/// image, a file a caller reads and rewrites whole — is what lets
+/// [`Volume::resize_to`] handle the medium's own extent as part of the
+/// same call, rather than the caller extending raw bytes and reopening at
+/// the old size by hand.
+///
+/// A backend whose size is fixed by something outside this crate's
+/// control (a real block device, a partition bounded by an RDB entry)
+/// should not implement this: there is nothing here for it to do, and
+/// [`Volume::resize`] alone is already the right tool.
+pub trait ResizableMedium: BlockSource {
+    /// Grow or shrink so [`BlockSource::block_count`] reports exactly
+    /// `new_block_count` afterward.
+    ///
+    /// Growing must zero-fill the new blocks — the same stance this
+    /// crate's write side takes on a file grown past its old end (see
+    /// [`crate::mutate::Mutator::write_file`]'s documentation), and for
+    /// the same reason: bytes some earlier, unrelated use of this storage
+    /// left behind are not this volume's to hand back through a block
+    /// [`Volume::resize`] is about to treat as part of it. Shrinking
+    /// discards whatever was in the blocks at or past `new_block_count`;
+    /// a caller that still wants those bytes reads them before calling
+    /// this.
+    fn set_block_count(&mut self, new_block_count: u64) -> Result<(), Self::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +894,79 @@ impl<S: BlockMedium> Volume<S> {
             blocks_freed,
             repair,
         })
+    }
+}
+
+impl<S: BlockMedium + ResizableMedium> Volume<S> {
+    /// [`Volume::resize`], but for a medium that implements
+    /// [`ResizableMedium`] — one that owns its own storage rather than
+    /// being sized by something outside this crate's control.
+    ///
+    /// Growing extends the medium first, via
+    /// [`ResizableMedium::set_block_count`], to at least
+    /// `new_block_count` blocks — only when it does not already report
+    /// enough, so calling this repeatedly, or on a medium that already
+    /// has headroom, never truncates capacity it did not ask to touch —
+    /// so [`Volume::resize`]'s own writes near the new end land
+    /// somewhere real instead of failing with
+    /// [`ResizeError::SinkTooSmall`]. A successful shrink is followed by
+    /// truncating the medium down to exactly `new_block_count`, so the
+    /// caller never reads the resized volume back out a block at a time
+    /// to find out how much of the old medium is still current. Nothing
+    /// about [`Volume::resize`]'s own algorithm, ordering or crash
+    /// behaviour changes; this only automates the "make the medium the
+    /// right size" step that used to sit outside it, by hand, on both
+    /// sides of the call.
+    ///
+    /// If [`Volume::resize`] itself refuses — any [`ResizeError`] variant,
+    /// including [`ResizeError::RootTargetOccupied`], which
+    /// [`Volume::resize_evacuating`] exists to retry — the volume and its
+    /// medium are left exactly as [`Volume::resize`] alone would have left
+    /// them: a grow's extension only ever adds unused, harmless capacity
+    /// before the refusal is discovered (`resize` never writes past the
+    /// old `block_count` until its own checks pass), and a shrink is never
+    /// truncated because the truncation happens only *after*
+    /// [`Volume::resize`] has already returned `Ok`.
+    ///
+    /// If [`ResizableMedium::set_block_count`] itself fails, the error
+    /// comes back as [`ResizeError::Io`] — on the grow side before
+    /// [`Volume::resize`] runs at all, on the shrink side after it has
+    /// already succeeded (so the volume is correctly resized in memory
+    /// and the medium is left at its old, larger extent rather than a
+    /// partially truncated one, since [`ResizableMedium::set_block_count`]
+    /// is documented to either fully succeed or leave its target
+    /// unspecified — a caller whose implementation can fail partway
+    /// through a shrink should retry the same call, which is idempotent
+    /// for this reason).
+    pub fn resize_to(
+        &mut self,
+        new_block_count: u64,
+    ) -> Result<ResizeReport, ResizeError<Transport<S>>> {
+        let old_block_count = self.block_count();
+        if new_block_count > old_block_count {
+            let have = BlockSource::block_count(self.source_mut()).unwrap_or(0);
+            if new_block_count > have {
+                self.source_mut()
+                    .set_block_count(new_block_count)
+                    .map_err(ResizeError::Io)?;
+            }
+        }
+        let report = self.resize(new_block_count)?;
+        // Checked against the medium's own current size, not
+        // `old_block_count`: after a shrink whose `resize()` succeeded but
+        // whose truncation below failed, a retry lands here with the
+        // volume already at `new_block_count`, so `old_block_count` would
+        // equal `new_block_count` and a check against it would wrongly
+        // skip the truncation this retry exists to finish — leaving the
+        // medium too large forever, contrary to the idempotency promised
+        // above.
+        let have = BlockSource::block_count(self.source_mut()).unwrap_or(new_block_count);
+        if have > new_block_count {
+            self.source_mut()
+                .set_block_count(new_block_count)
+                .map_err(ResizeError::Io)?;
+        }
+        Ok(report)
     }
 }
 
